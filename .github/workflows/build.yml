@@ -23,6 +23,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.x'
+          cache-dependency-path: worker/go.sum
       - name: 构建 Go 运行时二进制
         shell: bash
         run: |
