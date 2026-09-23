@@ -56,6 +56,10 @@ export function buildRecreatedVmRecord(prev, generated) {
     : []
   const timezone = validTimezone(prev.timezone) || normalizeTimezone(pack.timezone)
   const locale = prev.locale || pack.locale
+  const manualTier =
+    prev?.claude?.account_tier_mode === 'manual' && ['pro', 'max'].includes(prev?.claude?.account_tier)
+      ? { account_tier_mode: 'manual', account_tier: prev.claude.account_tier }
+      : {}
   const next = {
     id: prev.id,
     name: prev.name,
@@ -76,7 +80,7 @@ export function buildRecreatedVmRecord(prev, generated) {
       inflight: 0,
       ...(allowed.length ? { allowed_models: allowed } : {}),
     },
-    claude: {},
+    claude: manualTier,
     fingerprint: applyGeneratedFingerprint({}, { ...pack, timezone, locale, reset_at: now }),
     stats: {},
     created_at: prev.created_at || now,

@@ -21,6 +21,7 @@ import {
   materializeOfficialClaudeCredentials,
 } from './official-cc-bootstrap.mjs'
 import { normalizeTiers } from '../pool/quota-tiers.mjs'
+import { normalizeAccountTierMode } from '../pool/claude-tier.mjs'
 
 export function createImportCommit(ctx) {
   function routing() {
@@ -114,8 +115,12 @@ export function createImportCommit(ctx) {
           const vm = getVm(ctx.cfg.paths.project, vmId)
           if (vm && !vm.policy?.concurrencyOverride) {
             const routingConfig = routing()
+            const policyTier =
+              normalizeAccountTierMode(vm.claude?.account_tier_mode) === 'manual'
+                ? vm.claude?.account_tier
+                : stats.account_tier
             const next = Number(
-              normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)[stats.account_tier]
+              normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)[policyTier]
                 ?.max_concurrency ?? 2,
             )
             if (Number(vm.policy?.maxConcurrency) !== next) {

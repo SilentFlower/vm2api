@@ -34,6 +34,7 @@ test('user can manage owned vm/proxy/key surfaces and nothing else', () => {
   assert.equal(authorizePanelRoute('GET', '/api/panel/vms/vm-01', 'user').ok, true)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/create', 'user').ok, true)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/schedulable', 'user').ok, true)
+  assert.equal(authorizePanelRoute('POST', '/api/panel/vms/vm-01/account-tier', 'user').ok, true)
   assert.equal(authorizePanelRoute('POST', '/api/panel/vms/import', 'user').ok, true)
   assert.equal(authorizePanelRoute('DELETE', '/api/panel/vms/vm-01', 'user').ok, true)
   assert.equal(authorizePanelRoute('GET', '/api/panel/proxies', 'user').ok, true)

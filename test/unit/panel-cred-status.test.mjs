@@ -503,6 +503,23 @@ test('Claude tier: no token is none, plan denied is Pro, Fable window is Max', (
   assert.equal(inferClaudeTier({ has_token: true }).key, 'unknown')
 })
 
+test('Claude tier: manual selection overrides automatic capability evidence', () => {
+  assert.equal(
+    inferClaudeTier(
+      { has_token: true, account_tier: 'pro', account_tier_mode: 'manual' },
+      { usage_has_fable: true, utilization_7d_oi: 0.2 },
+    ).key,
+    'pro',
+  )
+  assert.equal(
+    inferClaudeTier(
+      { has_token: true, account_tier: 'max', account_tier_mode: 'manual' },
+      { account_tier: 'pro', fable: { plan_denied: true, status: 403 } },
+    ).key,
+    'max',
+  )
+})
+
 test('setup-token Extra-only row is not leftover/seed and is findable', () => {
   const acc = {
     account_id: 'vm-01',

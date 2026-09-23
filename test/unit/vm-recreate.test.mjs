@@ -59,6 +59,14 @@ test('recreated record keeps slot identity and drops credentials', () => {
   assert.equal(next.persona_preset, 'zero')
 })
 
+test('recreated record preserves a manual account tier without credentials', () => {
+  const next = buildRecreatedVmRecord({
+    id: 'vm-08',
+    claude: { account_tier_mode: 'manual', account_tier: 'max', has_access: true },
+  })
+  assert.deepEqual(next.claude, { account_tier_mode: 'manual', account_tier: 'max' })
+})
+
 test('recreated records preserve and normalize non-US timezones', () => {
   for (const timezone of ['Asia/Tokyo', ' asia/tokyo ']) {
     const next = buildRecreatedVmRecord({ id: 'vm-07', timezone })

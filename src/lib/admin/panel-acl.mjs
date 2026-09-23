@@ -157,6 +157,7 @@ function userVmPathAllowed(method, path) {
     return (
       rest === 'schedulable' ||
       rest === 'cooldown/clear' ||
+      rest === 'account-tier' ||
       rest === 'probe' ||
       rest === 'test-chat' ||
       rest === 'count-tokens' ||

@@ -22,6 +22,25 @@ test('ensure seeds account and is idempotent', () => {
   assert.equal(acc.unified['5h'].status, 'active')
 })
 
+test('only a manual VM tier selects policy ahead of an observed account tier', () => {
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    config: {
+      tiers: {
+        default: { max_concurrency: 2 },
+        pro: { max_concurrency: 4 },
+        max: { max_concurrency: 16 },
+      },
+    },
+  })
+  q.ensure({ account_id: 'a-tier' })
+  q.setAccountTier('a-tier', 'pro')
+  const account = q.repo.get('a-tier')
+  assert.equal(q.policyFor(account).max_concurrency, 4)
+  assert.equal(q.policyFor(account, { tier: 'max' }).max_concurrency, 4)
+  assert.equal(q.policyFor(account, { tier: 'max', tierMode: 'manual' }).max_concurrency, 16)
+})
+
 test('a model entitlement rejection is persisted for that account and model', () => {
   const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
   q.ensure({ account_id: 'a-denied' })

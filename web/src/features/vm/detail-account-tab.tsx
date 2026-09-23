@@ -20,6 +20,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { StatusMark } from '@/components/status-mark'
+import { AccountTierEditor } from '@/features/vm/account-tier-editor'
 import { AllowedModelsCard } from '@/features/vm/allowed-models-card'
 import { AuthSchemeEditor } from '@/features/vm/auth-scheme-editor'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
@@ -121,15 +122,16 @@ export function VmAccountTab(props: VmAccountTabProps) {
               <Field label='状态' compact>
                 <StatusMark tone={credExpiry(vm)} variant='pill' />
               </Field>
-              {claudeTier(vm).key !== 'none' ? (
-                <Field label='套餐' compact>
-                  {gpt ? (
-                    <OpenaiPlanBadge vm={vm} />
-                  ) : (
+              <Field label='套餐' compact>
+                {gpt ? (
+                  <OpenaiPlanBadge vm={vm} />
+                ) : (
+                  <div className='flex items-center gap-2'>
                     <StatusMark tone={claudeTier(vm)} variant='pill' />
-                  )}
-                </Field>
-              ) : null}
+                    <AccountTierEditor vm={vm} />
+                  </div>
+                )}
+              </Field>
               {credType === 'apikey' ? (
                 <Field label='Key' compact>
                   {vm.has_token ? '已写入' : '—'}

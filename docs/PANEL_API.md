@@ -37,6 +37,7 @@
 | POST | `/vms/:id/cooldown/clear` | 清账号/模型冷却、粘性钉和 `/usage` 429 旗标，重新入池 |
 | POST | `/vms/:id/test-chat` | loopback `POST /v1/messages`，master 可钉槽；官方 CC 入站 + 4 块 system。默认 prompt `hello` |
 | POST | `/vms/:id/count-tokens` | Setup Token / Console API Key 经槽 Go worker SOCKS 打官方 `POST /v1/messages/count_tokens`。body `{ model, messages, system?, tools? }`。完整 OAuth 400 `count_tokens_unsupported`。成功 `{ input_tokens, model, credential_mode, vm_id }` |
+| POST | `/vms/:id/account-tier` | 切换 Claude 套餐识别。自动：`{ account_tier_mode: "auto" }`；手动：`{ account_tier_mode: "manual", account_tier: "pro" | "max" }`。手动值不会被后续探测覆盖。 |
 | POST | `/vms/:id/oauth/refresh` | 只转发 worker `Ensure`，不回 token |
 | POST | `/vms/:id/oauth/to-setup-token` | 把当前完整 OAuth 活票改成 Setup Token（保留 refresh/过期）。已是 setup-token 则幂等 |
 | POST | `/vms/:id/oauth/generate-auth-url` | PKCE 授权链接；无 SOCKS5 拒绝。`{ flavor: "claude_code" }` 为官方 Claude Code 授权页。`{ flavor: "setup_token" }` 为 inference-only PKCE，不启槽内 CLI |
@@ -71,6 +72,8 @@
 | GET | `/oauth` | 全槽脱敏 credential |
 
 `cred_status`：`无凭证` / `可用` / `5h 警告` / `5h 限制` / `7d 警告` / `7d 限制` / `普通限制` / `不可用` / `被吊销` / `探测失败`。Fable 不可用 / 7d_oi / 家族冷却不抬账号级限制。等级：官方 `/usage` 有 Fable 模型或真实 7d_oi = Max；无 Fable 的 `plan_denied` = Pro。落盘 pro 不能盖掉 usage 里的 Fable。
+
+创建 Claude 槽可同时提交 `account_tier_mode` 与 `account_tier`。缺省或 `auto` 保持自动识别；`manual` 必须搭配 `pro` 或 `max`，并作为调度、并发和模型准入所使用的套餐等级。能力探测结果仍单独保留，用于展示 Fable 不可用等运行状态。
 
 `account.runtime_window`：`rate_limited_at` / `rate_limit_reset_at` / `overload_until` / `session_window_start|end|status`。
 

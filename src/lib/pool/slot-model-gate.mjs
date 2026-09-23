@@ -91,19 +91,32 @@ export function parseAllowedModelsPatch(raw, opts = {}) {
 function quotaView(vm, account) {
   const unified = account?.unified && typeof account.unified === 'object' ? account.unified : {}
   const fable = unified.fable || vm?.claude?.fable || vm?.fable || {}
+  const tierMode = vm?.claude?.account_tier_mode || vm?.account_tier_mode || 'auto'
+  const manualTier = vm?.claude?.account_tier || vm?.account_tier
   return {
     fable,
     utilization_7d_oi: unified.utilization_7d_oi ?? unified['7d_oi']?.utilization ?? vm?.utilization_7d_oi,
     reset_7d_oi: unified.reset_7d_oi || unified['7d_oi']?.reset || vm?.reset_7d_oi,
     status_7d_oi: unified.status_7d_oi || unified['7d_oi']?.status || vm?.status_7d_oi,
     '7d_oi': unified['7d_oi'],
-    account_tier: unified.account_tier || vm?.claude?.account_tier || vm?.account_tier,
+    account_tier: tierMode === 'manual' ? manualTier : unified.account_tier || manualTier,
+    account_tier_mode: tierMode,
     usage_has_fable: unified.usage_has_fable === true || vm?.usage_has_fable === true,
   }
 }
 
 export function resolveSlotTier(vm, account = null) {
   const quota = quotaView(vm, account)
+  if (quota.account_tier_mode === 'manual') {
+    return inferClaudeTier(
+      {
+        has_token: true,
+        account_tier: quota.account_tier,
+        account_tier_mode: 'manual',
+      },
+      quota,
+    ).key
+  }
   // An explicit Pro classification must veto stale Max usage evidence. The
   // latter can survive a credential change or a Fable entitlement rejection.
   if (
@@ -116,6 +129,7 @@ export function resolveSlotTier(vm, account = null) {
     {
       has_token: true,
       account_tier: quota.account_tier,
+      account_tier_mode: quota.account_tier_mode,
       fable: quota.fable,
       utilization_7d_oi: quota.utilization_7d_oi,
       reset_7d_oi: quota.reset_7d_oi,

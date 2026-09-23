@@ -103,11 +103,13 @@ import {
   persistVmScheduleLevel,
   persistVmOwner,
   persistVmTimezone,
+  persistAccountTierPreference,
 } from '../vm/vm-registry.mjs'
 import { syncVmTimezoneFromProxy } from '../vm/proxy-timezone.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import { stampVmKind, isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
+import { parseAccountTierPreference } from '../pool/claude-tier.mjs'
 import { parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import {
   normalizeInferenceConfig,
@@ -2217,6 +2219,10 @@ export function createPanelHandler(ctx) {
       // POST /api/panel/vms/create — configurable seed VM + pure Claude Code home
       if (req.method === 'POST' && p === '/api/panel/vms/create') {
         const body = await readBody(req, 32 * 1024)
+        const tierPreference = parseAccountTierPreference(body)
+        if (!tierPreference.ok) {
+          return json(res, 400, { ok: false, error: { code: 'invalid_account_tier', message: tierPreference.error } })
+        }
         const existing = listVms(cfg.paths.project)
         const idx = nextNumericIndex(existing)
         const rawId = body.id || 'vm-' + padVm(idx)
@@ -2273,7 +2279,10 @@ export function createPanelHandler(ctx) {
             weight: Math.max(1, Math.min(100, Number(body.weight ?? 1))),
             inflight: 0,
           },
-          claude: {},
+          claude: {
+            account_tier_mode: tierPreference.mode,
+            ...(tierPreference.tier ? { account_tier: tierPreference.tier } : {}),
+          },
           fingerprint: applyGeneratedFingerprint({}, generated),
           stats: {},
           created_at: new Date().toISOString(),
@@ -2351,6 +2360,30 @@ export function createPanelHandler(ctx) {
             ...(startError ? { start_error: startError } : {}),
           }),
         )
+      }
+      // POST /api/panel/vms/:id/account-tier — 切换自动识别或手动 Pro / Max。
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/account-tier$/.test(p)) {
+        const id = p.split('/')[4]
+        const current = getVm(cfg.paths.project, id)
+        if (!current) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        if (isCodexVm(current)) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'claude_tier_only', message: '只有 Claude 槽支持 Pro / Max 套餐选择' },
+          })
+        }
+        const body = await readBody(req, 4096).catch(() => ({}))
+        const preference = parseAccountTierPreference(body)
+        if (!preference.ok) {
+          return json(res, 400, {
+            ok: false,
+            error: { code: 'invalid_account_tier', message: preference.error },
+          })
+        }
+        const vm = persistAccountTierPreference(cfg.paths.project, id, preference)
+        if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+        ctx.poolScheduler?.notifyCapacity?.()
+        return json(res, 200, panel.ok({ vm: summarizeVm(vm) }))
       }
       // POST /api/panel/vms/:id/start
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/start$/.test(p)) {

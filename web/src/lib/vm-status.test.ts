@@ -221,6 +221,31 @@ describe('health probe must not paint a live ticket unavailable', () => {
 })
 
 describe('claudeTier follows usage Fable presence', () => {
+  it('keeps a manual tier ahead of automatic evidence', () => {
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'pro',
+          account_tier_mode: 'manual',
+          usage_has_fable: true,
+        })
+      ).key
+    ).toBe('pro')
+    expect(
+      claudeTier(
+        liveVm({
+          account_tier: 'max',
+          account_tier_mode: 'manual',
+          fable: { plan_denied: true, status: 403 },
+        })
+      ).key
+    ).toBe('max')
+  })
+
+  it('shows unknown instead of Pro without tier evidence', () => {
+    expect(claudeTier(liveVm({ account_tier: undefined })).key).toBe('unknown')
+  })
+
   it('treats usage Fable as Max even when stored Pro and hop denied', () => {
     expect(
       claudeTier(

@@ -451,20 +451,23 @@ export class AccountQuota {
    * Pre-flight check: can this account take another request?
    * @returns {{ ok: true } | { ok: false, reason, detail }}
    */
-  policyFor(acc, { tier } = {}) {
+  policyFor(acc, { tier, tierMode = 'auto' } = {}) {
+    // 自动模式继续信任较新的账号探测结果；仅手动模式覆盖探测套餐。
+    const accountTier = acc?.unified?.account_tier || acc?.account_tier
+    const policyTier = tierMode === 'manual' ? tier || accountTier : accountTier || tier
     return resolveTierPolicy(
       {
         tiers: this.tiers,
         quota: this.config,
         concurrency: this.concurrency,
       },
-      acc?.unified?.account_tier || acc?.account_tier || tier,
+      policyTier,
     )
   }
 
-  canAccept(accountId, { sessionKey = null, tier = null } = {}) {
+  canAccept(accountId, { sessionKey = null, tier = null, tierMode = 'auto' } = {}) {
     const acc = this.ensure({ account_id: accountId })
-    const policy = this.policyFor(acc, { tier })
+    const policy = this.policyFor(acc, { tier, tierMode })
     const ratio = Number(policy.limit_5h ?? policy.safety_ratio ?? this.config.safety_ratio ?? 0.85)
     const weeklyRatio = Number(
       policy.limit_7d ?? policy.weekly_safety_ratio ?? this.config.weekly_safety_ratio ?? ratio,
@@ -585,7 +588,7 @@ export class AccountQuota {
     }
     const acc = this.ensure({ account_id: accountId })
     const inflight = this.inflight.get(accountId) || 0
-    const limit = this.limitFor(acc, this.policyFor(acc, { tier: opts.tier }))
+    const limit = this.limitFor(acc, this.policyFor(acc, { tier: opts.tier, tierMode: opts.tierMode }))
     if (inflight >= limit) {
       return { ok: false, reason: 'concurrency_limit', detail: { inflight, max: limit, source: 'quota-reservation' } }
     }

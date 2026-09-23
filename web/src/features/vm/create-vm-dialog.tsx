@@ -43,6 +43,7 @@ import { TimezonePicker } from '@/features/vm/timezone-picker'
 
 /** 「之后」的 5 档，对齐 index.html `createVmFromPage()` 的派生逻辑。 */
 export type CreateVmAfter = 'idle' | 'start' | 'proxy' | 'active' | 'full'
+type AccountTierChoice = 'auto' | 'pro' | 'max'
 
 const DEFAULT_TEMPLATE = VM_TEMPLATES[0]
 
@@ -108,6 +109,7 @@ export function CreateVmFields({
   const [locale, setLocale] = useState<string>(DEFAULT_TEMPLATE.locale)
   const [conc, setConc] = useState<number>(DEFAULT_TEMPLATE.conc)
   const [weight, setWeight] = useState<number>(DEFAULT_TEMPLATE.weight)
+  const [accountTier, setAccountTier] = useState<AccountTierChoice>('auto')
   const [advOpen, setAdvOpen] = useState(false)
 
   // 名称留空时按已占用序号推下一个可用值，仅作为 placeholder 提示与提交兜底。
@@ -148,6 +150,8 @@ export function CreateVmFields({
           ...deriveAfter(after),
           platform: 'anthropic',
           family: 'claude',
+          account_tier_mode: accountTier === 'auto' ? 'auto' : 'manual',
+          account_tier: accountTier === 'auto' ? undefined : accountTier,
         }),
       })
       return {
@@ -201,6 +205,26 @@ export function CreateVmFields({
           onChange={(e) => setName(e.target.value)}
           placeholder={suggested}
         />
+      </div>
+
+      <div className='space-y-1'>
+        <Label>账号类型</Label>
+        <Select
+          value={accountTier}
+          onValueChange={(value) => setAccountTier(value as AccountTierChoice)}
+        >
+          <SelectTrigger>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value='auto'>自动识别</SelectItem>
+            <SelectItem value='pro'>Pro</SelectItem>
+            <SelectItem value='max'>Max</SelectItem>
+          </SelectContent>
+        </Select>
+        <p className='text-xs text-muted-foreground'>
+          Setup Token 无法读取套餐时可手动指定，创建后仍可切换。
+        </p>
       </div>
 
       <div className='space-y-1'>

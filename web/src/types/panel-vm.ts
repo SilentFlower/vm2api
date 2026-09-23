@@ -164,6 +164,8 @@ export type Vm = {
   fable?: Record<string, unknown>
   weekly_split?: Record<string, unknown>
   account_tier?: string
+  /** auto 跟随探测结果；manual 使用运营者选择的 Pro / Max。 */
+  account_tier_mode?: 'auto' | 'manual' | null
   /** Official /usage listed a Fable model. Overrides leftover Pro stamps. */
   usage_has_fable?: boolean
   /** anthropic | openai。缺省按 Claude 槽展示。 */

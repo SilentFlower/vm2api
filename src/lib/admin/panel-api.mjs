@@ -744,6 +744,7 @@ export async function buildProbeOne({ cfg, accountQuota, id, force = false, usag
   })
   const acc = accountQuota.repo.get(accountId)
   const q = quotaFromAccount(acc)
+  const tierMode = vm.claude?.account_tier_mode || 'auto'
   const storedTier = vm.claude?.account_tier || acc?.unified?.account_tier || q.account_tier || null
   const includeFable = shouldProbeFable({
     fable: q.fable || acc?.unified?.fable || {},
@@ -775,7 +776,8 @@ export async function buildProbeOne({ cfg, accountQuota, id, force = false, usag
   const tier = inferClaudeTier(
     {
       has_token: true,
-      account_tier: after?.unified?.account_tier || storedTier,
+      account_tier: tierMode === 'manual' ? vm.claude?.account_tier : after?.unified?.account_tier || storedTier,
+      account_tier_mode: tierMode,
       fable: qAfter.fable,
       utilization_7d_oi: qAfter.utilization_7d_oi,
       reset_7d_oi: qAfter.reset_7d_oi,
@@ -784,7 +786,7 @@ export async function buildProbeOne({ cfg, accountQuota, id, force = false, usag
     },
     qAfter,
   ).key
-  if (tier === 'pro' || tier === 'max') {
+  if (tierMode !== 'manual' && (tier === 'pro' || tier === 'max')) {
     accountQuota.setAccountTier(accountId, tier)
     persistAccountTier(cfg.paths.project, id, tier)
   }
@@ -1253,6 +1255,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         {
           has_token: hasToken,
           account_tier: v.account_tier || q.account_tier,
+          account_tier_mode: v.account_tier_mode || 'auto',
           fable: q.fable,
           utilization_7d_oi: q.utilization_7d_oi,
           reset_7d_oi: q.reset_7d_oi,
@@ -1414,6 +1417,7 @@ function enrichVm(v, accountQuota, active, extras = {}) {
         }
       : null,
     account_tier: tierKey,
+    account_tier_mode: isCodex ? null : v.account_tier_mode || 'auto',
     usage_has_fable: isCodex ? false : !!q.usage_has_fable,
     availability,
     cred_status: credStatusFromAvailability(availability),

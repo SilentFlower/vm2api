@@ -28,6 +28,7 @@ import {
 
 import { summarizeCodexSlot } from './codex-slot.mjs'
 import { evaluateCodexQuotaSchedule } from '../pool/codex-slot-pool.mjs'
+import { normalizeAccountTierMode } from '../pool/claude-tier.mjs'
 
 export { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 
@@ -84,6 +85,7 @@ export function summarizeVm(vm, projectRoot = null) {
     has_refresh: kind.kind === 'codex' ? !!codex?.has_refresh : hasRefreshPresence(vm.claude),
     refresh_error: kind.kind === 'codex' ? null : vm.claude?.refresh_error || null,
     account_tier: kind.kind === 'codex' ? 'codex' : vm.claude?.account_tier || null,
+    account_tier_mode: kind.kind === 'codex' ? null : normalizeAccountTierMode(vm.claude?.account_tier_mode),
     has_session_key: false,
     max_concurrency: vm.policy?.maxConcurrency ?? 2,
     max_rpm: vm.policy?.maxRpm ?? 0,
@@ -143,8 +145,33 @@ export function persistAccountTier(projectRoot, vmId, tier) {
   if (!fs.existsSync(file)) return null
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   vm.claude = vm.claude || {}
+  // 自动探测只能更新自动模式，不能覆盖运营者手动指定的套餐。
+  if (normalizeAccountTierMode(vm.claude.account_tier_mode) === 'manual') return vm
   if (vm.claude.account_tier === key) return vm
   vm.claude.account_tier = key
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
+/**
+ * 保存槽位套餐选择；切回自动模式时清除旧的手动等级。
+ * @param {string} projectRoot 项目根目录。
+ * @param {string} vmId 槽位 ID。
+ * @param {{ mode: 'auto'|'manual', tier?: 'pro'|'max'|null }} preference 套餐偏好。
+ * @return {object|null} 更新后的槽位，槽位不存在或参数无效时返回 null。
+ */
+export function persistAccountTierPreference(projectRoot, vmId, preference) {
+  const mode = normalizeAccountTierMode(preference?.mode)
+  const tier = String(preference?.tier || '').toLowerCase()
+  if (mode === 'manual' && tier !== 'pro' && tier !== 'max') return null
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  if (!fs.existsSync(file)) return null
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.claude = vm.claude || {}
+  vm.claude.account_tier_mode = mode
+  if (mode === 'manual') vm.claude.account_tier = tier
+  else delete vm.claude.account_tier
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
   return vm

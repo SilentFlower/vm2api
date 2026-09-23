@@ -56,6 +56,26 @@ test('import-style create succeeds without seed_policy or SOCKS5', async () => {
   }
 })
 
+test('create persists a manually selected Max account tier', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-tier-'))
+  try {
+    const { handlePanel, response } = makeCreateHandler(root, {
+      name: 'max-slot',
+      start: false,
+      account_tier_mode: 'manual',
+      account_tier: 'max',
+    })
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+    assert.equal(response.status, 200, response.body?.error?.message || JSON.stringify(response.body))
+    const id = response.body?.data?.vm?.id
+    const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${id}.json`), 'utf8'))
+    assert.equal(saved.claude.account_tier_mode, 'manual')
+    assert.equal(saved.claude.account_tier, 'max')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('create preserves Tokyo in the slot, fingerprint and settings', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-tokyo-'))
   try {

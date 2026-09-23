@@ -65,6 +65,23 @@ test('explicit Pro tier and recent model denial override stale Max usage', () =>
   assert.deepEqual(slotAllowsModel({ vm: maxVm, account: denied, model: 'claude-sonnet-5' }), { ok: true })
 })
 
+test('manual Max tier overrides an observed Pro tier but keeps capability cooldowns', () => {
+  const vm = { claude: { account_tier: 'max', account_tier_mode: 'manual' }, policy: {} }
+  const observedPro = { unified: { account_tier: 'pro', fable: { plan_denied: true, status: 403 } } }
+  assert.deepEqual(slotAllowsModel({ vm, account: observedPro, model: 'claude-fable-5' }), { ok: true })
+
+  const denied = {
+    unified: {
+      account_tier: 'pro',
+      model_denied_until: { 'claude-fable-5': Date.now() + 60_000 },
+    },
+  }
+  assert.deepEqual(slotAllowsModel({ vm, account: denied, model: 'claude-fable-5' }), {
+    ok: false,
+    reason: 'model_not_supported',
+  })
+})
+
 test('legacy Fable 5.1 allowlists accept the corrected id without allowing Fable 5', () => {
   assert.equal(modelMatchesAllowlist('claude-fable-5-1', ['claude-fable-5.1']), true)
   assert.equal(modelMatchesAllowlist('claude-fable-5.1', ['claude-fable-5-1']), true)

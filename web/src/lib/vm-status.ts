@@ -524,6 +524,18 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
   const fb = vm.fable || {}
   const raw = String(vm.account_tier || '').toLowerCase()
+  if (vm.account_tier_mode === 'manual') {
+    if (raw === 'max')
+      return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
+    if (raw === 'pro')
+      return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
+    return {
+      key: 'unknown',
+      label: '待识别',
+      cls: 'none',
+      text: '待识别',
+    }
+  }
   const oi = vm.utilization_7d_oi
   const oiN =
     oi == null ? null : Number(oi) > 1.5 ? Number(oi) / 100 : Number(oi)
@@ -536,7 +548,12 @@ export function claudeTier(vm: Vm | undefined): StatusTone {
     return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
   if (raw === 'pro' || fablePlanDenied(fb))
     return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-  return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
+  return {
+    key: 'unknown',
+    label: '待识别',
+    cls: 'none',
+    text: '待识别',
+  }
 }
 
 export function vmBuckets(vms: Vm[]) {
