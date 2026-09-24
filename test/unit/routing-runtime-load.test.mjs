@@ -75,13 +75,15 @@ test('persistRoutingPatch 保存移植功能并热更新峰值预热', () => {
     })
     runtime.persistRoutingPatch({
       client_access: { enabled: true, allowed_claude_code_versions: '2.1.*' },
-      warmup_intercept: { title_enabled: true },
+      warmup_intercept: { title_enabled: true, auto_mode_classifier_stage1_mode: 'mock_block' },
       peak_prime: { enabled: true, hours: [6, 4], minute: 10 },
       quota: { fable_weekly_limit: { enabled: true, percent: 50 } },
     })
     const saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
     assert.equal(saved.client_access.enabled, true)
     assert.equal(saved.warmup_intercept.title_enabled, true)
+    assert.equal(saved.warmup_intercept.auto_mode_classifier_stage1_mode, 'mock_block')
+    assert.equal(saved.warmup_intercept.auto_mode_classifier_stage2_mode, 'passthrough')
     assert.deepEqual(saved.peak_prime.hours, [4, 6])
     assert.deepEqual(activePrime, saved.peak_prime)
     assert.deepEqual(saved.quota.fable_weekly_limit, { enabled: true, percent: 50 })

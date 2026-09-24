@@ -112,6 +112,7 @@ import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
 import { parseAccountTierPreference } from '../pool/claude-tier.mjs'
 import { normalizeFableWeeklyLimit } from '../pool/account-quota.mjs'
 import { normalizeClientAccess } from '../protocol/client-access-policy.mjs'
+import { normalizeWarmupIntercept } from '../protocol/warmup-intercept.mjs'
 import { normalizePeakPrimeConfig } from './peak-prime.mjs'
 import { parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import {
@@ -3192,6 +3193,7 @@ export function createPanelHandler(ctx) {
         let addonProblem = false
         try {
           if (body.client_access) normalizeClientAccess(body.client_access)
+          if (body.warmup_intercept) normalizeWarmupIntercept(body.warmup_intercept, { strict: true })
           if (body.peak_prime) normalizePeakPrimeConfig(body.peak_prime)
           if (body.quota?.fable_weekly_limit) normalizeFableWeeklyLimit(body.quota.fable_weekly_limit)
         } catch (error) {

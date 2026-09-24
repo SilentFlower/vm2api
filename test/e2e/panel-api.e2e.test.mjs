@@ -33,6 +33,48 @@ test('panel login → cookie → /api/panel/me', async () => {
   }
 })
 
+test('Auto Mode 分类器模式经管理路由校验、保存并重新读取', async () => {
+  const gw = await startGateway()
+  try {
+    const before = await api(gw, 'GET', '/api/panel/routing')
+    assert.equal(before.status, 200, before.text)
+    assert.equal((before.json.data || before.json).warmup_intercept.auto_mode_classifier_stage1_mode, 'passthrough')
+
+    const invalid = await api(gw, 'PUT', '/api/panel/routing', {
+      body: { warmup_intercept: { auto_mode_classifier_stage1_mode: 'mock_alow' } },
+    })
+    assert.equal(invalid.status, 400, invalid.text)
+    assert.equal(invalid.json.error.code, 'invalid_routing_config')
+
+    const updated = await api(gw, 'PUT', '/api/panel/routing', {
+      body: {
+        warmup_intercept: {
+          title_enabled: true,
+          auto_mode_classifier_stage1_mode: 'mock_block',
+          auto_mode_classifier_stage2_mode: 'error',
+        },
+      },
+    })
+    assert.equal(updated.status, 200, updated.text)
+    const saved = await api(gw, 'GET', '/api/panel/routing')
+    assert.equal((saved.json.data || saved.json).warmup_intercept.auto_mode_classifier_stage2_mode, 'error')
+
+    const partial = await api(gw, 'PUT', '/api/panel/routing', {
+      body: { warmup_intercept: { auto_mode_classifier_stage2_mode: 'passthrough' } },
+    })
+    assert.equal(partial.status, 200, partial.text)
+
+    const after = await api(gw, 'GET', '/api/panel/routing')
+    assert.equal(after.status, 200, after.text)
+    const modes = (after.json.data || after.json).warmup_intercept
+    assert.equal(modes.title_enabled, true)
+    assert.equal(modes.auto_mode_classifier_stage1_mode, 'mock_block')
+    assert.equal(modes.auto_mode_classifier_stage2_mode, 'passthrough')
+  } finally {
+    await gw.stop()
+  }
+})
+
 test('admin database metrics endpoint returns a safe SQLite snapshot', async () => {
   const gw = await startGateway()
   try {

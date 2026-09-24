@@ -117,7 +117,15 @@ import {
 } from './anthropic-policy.mjs'
 import { materializeRemoteImageSources } from './images.mjs'
 import { checkClientAccess } from './client-access-policy.mjs'
-import { detectWarmupIntercept, warmupMessage, warmupSse } from './warmup-intercept.mjs'
+import {
+  autoModeClassifierError,
+  autoModeClassifierMessage,
+  detectAutoModeClassifier,
+  detectWarmupIntercept,
+  normalizeWarmupIntercept,
+  warmupMessage,
+  warmupSse,
+} from './warmup-intercept.mjs'
 
 export function createHandleProtocol(deps) {
   const json = (...args) => deps.json(...args)
@@ -389,16 +397,39 @@ export function createHandleProtocol(deps) {
     logBag.has_tools = Array.isArray(inbound?.tools) && inbound.tools.length > 0
 
     if (!internalProbe && protocol === 'anthropic.messages') {
-      const kind = detectWarmupIntercept(inbound, getRouting()?.warmup_intercept, {
+      const options = {
         claudeCode: /^claude-(?:cli|code)\//i.test(String(req.headers['user-agent'] || '')),
-      })
+        pathName,
+      }
+      const warmupConfig = normalizeWarmupIntercept(getRouting()?.warmup_intercept)
+      const classifier = detectAutoModeClassifier(inbound, options)
+      let classifierMode = 'passthrough'
+      let kind = null
+      if (classifier) {
+        classifierMode =
+          classifier.kind === 'auto_mode_classifier_stage1'
+            ? warmupConfig.auto_mode_classifier_stage1_mode
+            : warmupConfig.auto_mode_classifier_stage2_mode
+        if (classifierMode !== 'passthrough') kind = classifier.kind
+      } else {
+        kind = detectWarmupIntercept(inbound, warmupConfig, options)
+      }
       if (kind) {
         stats.requests++
         stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
         logBag.via = 'warmup-intercept'
         logBag.attempt_count = 0
         logBag.final_state = kind
-        const message = warmupMessage(inbound, kind)
+        if (classifierMode === 'error') {
+          stats.errors++
+          const error = autoModeClassifierError(inbound)
+          logBag.error_code = error.error.code
+          logBag.error_message = error.error.message
+          return json(res, 400, error)
+        }
+        const message = classifier
+          ? autoModeClassifierMessage(inbound, classifier, classifierMode)
+          : warmupMessage(inbound, kind)
         logBag.usage = message.usage
         logBag.stop_reason = message.stop_reason
         if (inbound.stream === true) {

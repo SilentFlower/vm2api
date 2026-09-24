@@ -155,7 +155,9 @@
   "warmup_intercept": {
     "title_enabled": false,
     "suggestion_enabled": false,
-    "haiku_probe_enabled": false
+    "haiku_probe_enabled": false,
+    "auto_mode_classifier_stage1_mode": "passthrough",
+    "auto_mode_classifier_stage2_mode": "passthrough"
   },
   "peak_prime": {
     "enabled": false,

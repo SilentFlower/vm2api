@@ -257,7 +257,11 @@ export function createRoutingRuntime(ctx) {
       routingConfig.quota.fable_weekly_limit = normalizeFableWeeklyLimit(routingConfig.quota.fable_weekly_limit)
     }
     if (body.client_access) routingConfig.client_access = normalizeClientAccess(body.client_access)
-    if (body.warmup_intercept) routingConfig.warmup_intercept = normalizeWarmupIntercept(body.warmup_intercept)
+    if (body.warmup_intercept)
+      routingConfig.warmup_intercept = normalizeWarmupIntercept(
+        { ...(routingConfig.warmup_intercept || {}), ...body.warmup_intercept },
+        { strict: true },
+      )
     if (body.peak_prime) routingConfig.peak_prime = normalizePeakPrimeConfig(body.peak_prime)
     if (body.concurrency) routingConfig.concurrency = { ...(routingConfig.concurrency || {}), ...body.concurrency }
     if (body.pool) {
