@@ -212,6 +212,16 @@ test('Auto Mode Stage1/2 可独立本地处理，默认透传上游', async () =
   assert.equal(stats.errors, 2)
 })
 
+test('峰值预热接受非 Haiku Claude 模型，拒绝空值和非 Claude 模型', () => {
+  for (const model of ['claude-haiku-4-5', 'claude-sonnet-5', 'claude-opus-5', 'claude-fable-5-1']) {
+    assert.equal(normalizePeakPrimeConfig({ model }).model, model)
+  }
+  assert.equal(normalizePeakPrimeConfig({}).model, 'claude-haiku-4-5')
+  for (const model of ['', '  ', 'gpt-5.4', 'sonnet', 'claude/sonnet']) {
+    assert.throws(() => normalizePeakPrimeConfig({ model }), /peak_prime.model 必须填写 Claude 模型 ID/)
+  }
+})
+
 test('峰值预热只跑可用 Claude 槽，重启后同小时不重复', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-peak-prime-'))
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
@@ -230,12 +240,13 @@ test('峰值预热只跑可用 Claude 槽，重启后同小时不重复', async 
   ]
   let calls = 0
   const opts = {
-    config: { enabled: true, hours: [4], minute: 10 },
+    config: { enabled: true, hours: [4], minute: 10, model: 'claude-sonnet-5' },
     statePath,
     now: () => now,
     listTargets: () => targets,
     canRun: () => ({ ok: true }),
-    runChat: async () => {
+    runChat: async (_vm, prime) => {
+      assert.equal(prime.model, 'claude-sonnet-5')
       calls++
       return { ok: true, status: 200, duration_ms: 12 }
     },

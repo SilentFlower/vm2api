@@ -75,6 +75,28 @@ test('Auto Mode 分类器模式经管理路由校验、保存并重新读取', a
   }
 })
 
+test('峰值预热允许配置 Sonnet，拒绝非 Claude 模型', async () => {
+  const gw = await startGateway()
+  try {
+    const invalid = await api(gw, 'PUT', '/api/panel/routing', {
+      body: { peak_prime: { model: 'gpt-5.4' } },
+    })
+    assert.equal(invalid.status, 400, invalid.text)
+    assert.equal(invalid.json.error.code, 'invalid_routing_config')
+
+    const updated = await api(gw, 'PUT', '/api/panel/routing', {
+      body: { peak_prime: { model: 'claude-sonnet-5' } },
+    })
+    assert.equal(updated.status, 200, updated.text)
+
+    const after = await api(gw, 'GET', '/api/panel/routing')
+    assert.equal(after.status, 200, after.text)
+    assert.equal((after.json.data || after.json).peak_prime.model, 'claude-sonnet-5')
+  } finally {
+    await gw.stop()
+  }
+})
+
 test('admin database metrics endpoint returns a safe SQLite snapshot', async () => {
   const gw = await startGateway()
   try {

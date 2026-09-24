@@ -28,9 +28,9 @@ export function normalizePeakPrimeConfig(raw = {}) {
   if (!Number.isInteger(minute) || minute < 0 || minute > 59) {
     throw new Error('peak_prime.minute 必须是 0-59 的整数')
   }
-  const model = String(src.model || DEFAULT_PEAK_PRIME.model).trim()
-  if (!/^claude-[a-z0-9.-]+$/i.test(model) || !/haiku/i.test(model)) {
-    throw new Error('peak_prime.model 必须是 Claude Haiku 模型')
+  const model = String(src.model ?? DEFAULT_PEAK_PRIME.model).trim()
+  if (!/^claude-[a-z0-9.-]+$/i.test(model)) {
+    throw new Error('peak_prime.model 必须填写 Claude 模型 ID')
   }
   const timeout = Number(src.timeout_ms ?? DEFAULT_PEAK_PRIME.timeout_ms)
   if (!Number.isInteger(timeout) || timeout < 10_000 || timeout > 180_000) {

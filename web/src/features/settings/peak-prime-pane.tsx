@@ -124,7 +124,7 @@ export function PeakPrimePane({
             />
           </label>
           <label className='space-y-1.5 text-sm font-medium'>
-            Haiku 模型
+            预热模型
             <Input
               value={String(value.model ?? 'claude-haiku-4-5')}
               onChange={(event) =>
