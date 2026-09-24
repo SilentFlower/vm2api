@@ -34,6 +34,20 @@ import { isTestProbeSource } from './schedule-eligibility.mjs'
 
 export { extraHeadersFromLimitError }
 
+/**
+ * 校验并规范化 Fable 周用量阈值。
+ * @param {object} raw 配额配置里的 fable_weekly_limit。
+ * @returns {object} 启用状态与百分比阈值。
+ */
+export function normalizeFableWeeklyLimit(raw = {}) {
+  const src = raw && typeof raw === 'object' ? raw : {}
+  const percent = Number(src.percent ?? 50)
+  if (!Number.isFinite(percent) || percent < 1 || percent > 100) {
+    throw new Error('quota.fable_weekly_limit.percent 必须在 1-100 之间')
+  }
+  return { enabled: src.enabled === true, percent }
+}
+
 export class AccountQuota {
   constructor({ dataDir, db, config, accounts }) {
     this.db = resolveStoreDb({ db, dataDir })
@@ -605,6 +619,26 @@ export class AccountQuota {
     if (!reset) return null
     const parsed = Date.parse(reset)
     return Number.isFinite(parsed) ? parsed : null
+  }
+
+  /**
+   * 按独立的 Fable 周用量上限筛号，不影响普通模型。
+   * @param {string} accountId 账号 ID。
+   * @returns {boolean} 有可信的未过期窗口且达到阈值时为 true。
+   */
+  fableWeeklyThresholdReached(accountId) {
+    const setting = this.config?.fable_weekly_limit
+    if (setting?.enabled !== true) return false
+    const acc = this.repo.get(accountId)
+    if (!acc || acc.type !== 'oauth') return false
+    const window = acc.unified?.['7d_oi']
+    const reset = Date.parse(window?.reset || '')
+    const utilization = Number(window?.utilization)
+    const percent = Number(setting.percent)
+    if (!Number.isFinite(reset) || reset <= Date.now()) return false
+    if (!Number.isFinite(utilization) || utilization < 0 || utilization > 1) return false
+    if (!Number.isFinite(percent) || percent <= 0 || percent > 100) return false
+    return utilization * 100 >= percent
   }
 
   /** Experimental 50/50 weekly split. Off unless quota.weekly_split.enabled. */

@@ -22,6 +22,24 @@ import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { listQuotaFromHeaders, publicUsageWindow, usageWindowsEmpty } from '../pool/quota-window.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { checkClientAccess } from './client-access-policy.mjs'
+
+function rejectClientAccess(req, res, deps) {
+  const routing = typeof deps.getRoutingConfig === 'function' ? deps.getRoutingConfig() : deps.routingConfig
+  const denied = checkClientAccess(req?.headers?.['user-agent'], routing?.client_access)
+  if (!denied) return false
+  deps.json(
+    res,
+    403,
+    makeError({
+      type: ErrorType.PERMISSION,
+      code: 'client_access_denied',
+      message: denied.reason,
+      status: 403,
+    }).body,
+  )
+  return true
+}
 export function countTokensUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,
@@ -174,6 +192,7 @@ export function blockCountTokensBeforeHop(req, inbound, deps = {}) {
 export async function handleUserCountTokens(req, res, deps) {
   const json = (...args) => deps.json(...args)
   if (!deps.requireAuth(req, res)) return
+  if (rejectClientAccess(req, res, deps)) return
   let inbound
   try {
     inbound = await deps.readBody(req, deps.cfg.limits.max_body_bytes)
@@ -281,6 +300,7 @@ export async function resolveUsageWindows({
 export async function handleUserUsage(req, res, deps) {
   const json = (...args) => deps.json(...args)
   if (!deps.requireAuth(req, res)) return
+  if (rejectClientAccess(req, res, deps)) return
   const peeked = await peekCurrentAccount({
     poolScheduler: typeof deps.getPoolScheduler === 'function' ? deps.getPoolScheduler() : deps.poolScheduler,
     stickyRouter: deps.stickyRouter,

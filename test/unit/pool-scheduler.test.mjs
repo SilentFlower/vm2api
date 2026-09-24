@@ -518,6 +518,30 @@ test('fable concurrency cap leaves room for other models', async (t) => {
   sonnet.release()
 })
 
+test('Fable 周阈值切到下一账号，普通模型仍可使用原账号', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const pool = scheduler(root, {
+    accountQuota: {
+      canAccept: () => ({ ok: true }),
+      fableWeeklyThresholdReached: (id) => id === 'account-1',
+      fableWindowResetAt: () => Date.now() + 60_000,
+    },
+  })
+  const fable = await pool.selectAndReserve({ model: 'claude-fable-5', allowWait: false })
+  assert.equal(fable.ok, true)
+  assert.equal(fable.accountId, 'account-2')
+  fable.release()
+  const sonnet = await pool.selectAndReserve({
+    model: 'claude-sonnet-5',
+    excluded: new Set(['account-2']),
+    allowWait: false,
+  })
+  assert.equal(sonnet.ok, true)
+  assert.equal(sonnet.accountId, 'account-1')
+  sonnet.release()
+})
+
 test('weekly split blocks regular but still accepts fable on the same account', async (t) => {
   const root = project()
   t.after(() => fs.rmSync(root, { recursive: true, force: true }))

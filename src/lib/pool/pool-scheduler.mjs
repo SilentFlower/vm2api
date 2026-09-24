@@ -582,6 +582,10 @@ export class PoolScheduler {
       const until = this.accountQuota.fableWindowResetAt?.(accountId)
       markWait('fable_quota', until)
     }
+    if (isFableModel(modelKey) && this.accountQuota?.fableWeeklyThresholdReached?.(accountId)) {
+      const until = this.accountQuota.fableWindowResetAt?.(accountId)
+      markWait('fable_weekly_limit', until)
+    }
     if (this.accountQuota?.weeklySplitOf) {
       const split = this.accountQuota.weeklySplitOf(accountId)
       const reason = splitBlocksModel(split, modelKey)

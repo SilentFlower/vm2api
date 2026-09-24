@@ -51,6 +51,10 @@ import { collectLivePanelCredentials } from './panel-live-credentials.mjs'
 import { officialCcHome, readOfficialCcStatus, normalizeOfficialCcConfig } from '../oauth/official-cc-bootstrap.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
+import { normalizeClientAccess } from '../protocol/client-access-policy.mjs'
+import { normalizeWarmupIntercept } from '../protocol/warmup-intercept.mjs'
+import { normalizePeakPrimeConfig } from './peak-prime.mjs'
+import { normalizeFableWeeklyLimit } from '../pool/account-quota.mjs'
 import { publicNotifyConfig, summarizePoolAvailability } from './notify.mjs'
 import { cacheHitStats } from './cache-metrics.mjs'
 import { shanghaiDayStartIso } from './pricing.mjs'
@@ -963,7 +967,10 @@ export function buildRouting({ routingConfig, stickyRouter }) {
   const tiers = normalizeTiers(routingConfig?.tiers, routingConfig?.quota, routingConfig?.concurrency)
   return ok({
     sticky: routingConfig?.sticky || {},
-    quota: routingConfig?.quota || {},
+    quota: {
+      ...(routingConfig?.quota || {}),
+      fable_weekly_limit: normalizeFableWeeklyLimit(routingConfig?.quota?.fable_weekly_limit),
+    },
     concurrency: routingConfig?.concurrency || {},
     tiers,
     logging: routingConfig?.logging || {},
@@ -973,6 +980,9 @@ export function buildRouting({ routingConfig, stickyRouter }) {
     inference: routingConfig?.inference || {},
     official_cc: normalizeOfficialCcConfig(routingConfig?.official_cc),
     health_probe: normalizeHealthProbeConfig(routingConfig?.health_probe),
+    client_access: normalizeClientAccess(routingConfig?.client_access),
+    warmup_intercept: normalizeWarmupIntercept(routingConfig?.warmup_intercept),
+    peak_prime: normalizePeakPrimeConfig(routingConfig?.peak_prime),
     usage_probe: normalizeUsageProbeConfig(routingConfig?.usage_probe),
     notify: publicNotifyConfig(routingConfig?.notify),
     sessions: stickyRouter.stats(),

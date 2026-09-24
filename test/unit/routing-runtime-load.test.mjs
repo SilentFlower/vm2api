@@ -49,6 +49,47 @@ test('applyVmSessionSlots updates only native admission policy', () => {
   }
 })
 
+test('persistRoutingPatch 保存移植功能并热更新峰值预热', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-ported-features-'))
+  const routingFile = path.join(root, 'routing.json')
+  fs.mkdirSync(path.join(root, 'vms'))
+  const routingConfig = { quota: {}, concurrency: {}, tiers: {} }
+  let activePrime = null
+  try {
+    const runtime = createRoutingRuntime({
+      cfg: { paths: { project: root } },
+      routingConfigPath: routingFile,
+      routingConfig,
+      stickyRouter: { reloadConfig() {} },
+      accountQuota: {
+        reloadConfig() {},
+        applyTierConcurrency() {},
+        applyTierRpm() {},
+      },
+      peakPrimeMonitor: {
+        setConfig: (config) => {
+          activePrime = config
+        },
+      },
+      requestLog: { setConfig() {} },
+    })
+    runtime.persistRoutingPatch({
+      client_access: { enabled: true, allowed_claude_code_versions: '2.1.*' },
+      warmup_intercept: { title_enabled: true },
+      peak_prime: { enabled: true, hours: [6, 4], minute: 10 },
+      quota: { fable_weekly_limit: { enabled: true, percent: 50 } },
+    })
+    const saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.equal(saved.client_access.enabled, true)
+    assert.equal(saved.warmup_intercept.title_enabled, true)
+    assert.deepEqual(saved.peak_prime.hours, [4, 6])
+    assert.deepEqual(activePrime, saved.peak_prime)
+    assert.deepEqual(saved.quota.fable_weekly_limit, { enabled: true, percent: 50 })
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('persistRoutingPatch reconciles inherited Claude session slots and preserves overrides', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-session-default-'))
   const vms = path.join(root, 'vms')

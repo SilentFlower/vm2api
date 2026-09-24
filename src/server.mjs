@@ -21,6 +21,7 @@ import {
   getPanelAdmin,
 } from './lib/core/security.mjs'
 import { loadModelPolicy } from './lib/protocol/model-policy.mjs'
+import { checkClientAccess } from './lib/protocol/client-access-policy.mjs'
 import { gatewayModelCatalog } from './lib/protocol/models.mjs'
 import {
   createCredentialRefreshMonitor,
@@ -32,6 +33,7 @@ import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
+import { createPeakPrimeMonitor, normalizePeakPrimeConfig } from './lib/admin/peak-prime.mjs'
 import { normalizeNotifyConfig, createNotifyMonitor } from './lib/admin/notify.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
@@ -147,6 +149,7 @@ if (vmSync.upserted || vmSync.rebuilt) {
 
 const routingConfigPath = routingConfigFile(cfg.paths.project)
 let healthMonitor = null
+let peakPrimeMonitor = null
 let credentialRefreshMonitor = null
 let kernelWatchdog = null
 let usageProbeMonitor = null
@@ -194,6 +197,9 @@ const routingRt = createRoutingRuntime({
   },
   get healthMonitor() {
     return healthMonitor
+  },
+  get peakPrimeMonitor() {
+    return peakPrimeMonitor
   },
   setHealthMonitor: (v) => {
     healthMonitor = v
@@ -254,6 +260,7 @@ if (routingConfig.official_cc) {
   routingConfig.official_cc = normalizeOfficialCcConfig(routingConfig.official_cc)
 }
 routingConfig.health_probe = normalizeHealthProbeConfig(routingConfig.health_probe)
+routingConfig.peak_prime = normalizePeakPrimeConfig(routingConfig.peak_prime)
 routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
 routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
 routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
@@ -398,6 +405,28 @@ healthMonitor = createHealthProbeMonitor({
       extraHeaders: { [HEALTH_REAL_HEADER]: '1' },
     }),
 })
+peakPrimeMonitor = createPeakPrimeMonitor({
+  config: routingConfig.peak_prime,
+  statePath: path.join(cfg.paths.data, 'peak-prime.json'),
+  listTargets: () => listVms(cfg.paths.project).map(attachSlotRuntime),
+  canRun: (vm) => {
+    const account = accountForUsageProbe(vm)
+    return account ? accountQuota.canAccept(account.account_id) : { ok: false, reason: 'account_missing' }
+  },
+  runChat: (vm, prime) =>
+    runVmTestChat({
+      projectRoot: cfg.paths.project,
+      vmId: vm.id,
+      model: prime.model,
+      prompt: '.',
+      max_tokens: 16,
+      timeoutMs: prime.timeout_ms,
+      baseUrl: `http://127.0.0.1:${cfg.port}`,
+      apiKey: cfg.api_key,
+      accountQuota,
+      extraHeaders: { [HEALTH_REAL_HEADER]: '1' },
+    }),
+})
 credentialRefreshMonitor = createCredentialRefreshMonitor({
   config: normalizeCredentialRefreshConfig(routingConfig.credential_refresh),
   listTargets: () =>
@@ -480,6 +509,7 @@ backupService.onRestored((db) => {
     routingConfig.official_cc = normalizeOfficialCcConfig(routingConfig.official_cc)
   }
   routingConfig.health_probe = normalizeHealthProbeConfig(routingConfig.health_probe)
+  routingConfig.peak_prime = normalizePeakPrimeConfig(routingConfig.peak_prime)
   routingConfig.usage_probe = normalizeUsageProbeConfig(routingConfig.usage_probe)
   routingConfig.notify = normalizeNotifyConfig(routingConfig.notify)
   routingConfig.tiers = normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)
@@ -495,6 +525,7 @@ backupService.onRestored((db) => {
     mutedErrorClasses: routingConfig.logging?.muted_error_classes,
   })
   healthMonitor?.setConfig(routingConfig.health_probe)
+  peakPrimeMonitor?.setConfig(routingConfig.peak_prime)
   credentialRefreshMonitor?.setConfig(normalizeCredentialRefreshConfig(routingConfig.credential_refresh))
   kernelWatchdog?.setConfig(normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog))
   usageProbeMonitor?.setConfig(routingConfig.usage_probe)
@@ -786,6 +817,9 @@ const handlePanel = createPanelHandler({
   get healthMonitor() {
     return healthMonitor
   },
+  get peakPrimeMonitor() {
+    return peakPrimeMonitor
+  },
   get usageProbeMonitor() {
     return usageProbeMonitor
   },
@@ -912,6 +946,19 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && p === '/v1/models') {
       if (!requireAuth(req, res)) return
+      const denied = checkClientAccess(req.headers['user-agent'], routingConfig.client_access)
+      if (denied) {
+        return json(
+          res,
+          403,
+          makeError({
+            type: ErrorType.PERMISSION,
+            code: 'client_access_denied',
+            message: denied.reason,
+            status: 403,
+          }).body,
+        )
+      }
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, apiScheduler.catalog())
       }
@@ -930,6 +977,7 @@ const server = http.createServer(async (req, res) => {
         stickyRouter,
         accountQuota,
         getPoolScheduler: () => poolScheduler,
+        getRoutingConfig: () => routingConfig,
       })
     }
     if (req.method === 'POST' && (p === '/v1/messages/count_tokens' || p === '/messages/count_tokens')) {
@@ -941,6 +989,7 @@ const server = http.createServer(async (req, res) => {
         stickyRouter,
         accountQuota,
         getPoolScheduler: () => poolScheduler,
+        getRoutingConfig: () => routingConfig,
       })
     }
 
@@ -1033,6 +1082,9 @@ function shutdown(signal) {
     healthMonitor?.stop?.()
   } catch {}
   try {
+    peakPrimeMonitor?.stop?.()
+  } catch {}
+  try {
     credentialRefreshMonitor?.stop?.()
   } catch {}
   try {
@@ -1067,6 +1119,11 @@ server.listen(cfg.port, cfg.host, () => {
     healthMonitor?.start?.({ immediate: true })
   } catch (e) {
     console.warn('[health-probe] start failed', e?.message || e)
+  }
+  try {
+    peakPrimeMonitor?.start?.()
+  } catch (e) {
+    console.warn('[peak-prime] start failed', e?.message || e)
   }
   try {
     credentialRefreshMonitor?.start?.({ immediate: true })

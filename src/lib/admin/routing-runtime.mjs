@@ -24,6 +24,10 @@ import { normalizeLoggingConfig } from './request-log.mjs'
 import { markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import { shouldMarkMissingRefresh } from '../pool/schedule-eligibility.mjs'
 import { normalizeCodexRouting } from '../protocol/codex-route.mjs'
+import { normalizeClientAccess } from '../protocol/client-access-policy.mjs'
+import { normalizeWarmupIntercept } from '../protocol/warmup-intercept.mjs'
+import { normalizePeakPrimeConfig } from './peak-prime.mjs'
+import { normalizeFableWeeklyLimit } from '../pool/account-quota.mjs'
 import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
 import { syncClaudeKernelConfigs } from '../transport/rust-kernel-supervisor.mjs'
 
@@ -40,6 +44,7 @@ export function createRoutingRuntime(ctx) {
   }
   const getHealth = () => (typeof ctx.getHealthMonitor === 'function' ? ctx.getHealthMonitor() : ctx.healthMonitor)
   const getUsage = () => ctx.usageProbeMonitor
+  const getPeakPrime = () => ctx.peakPrimeMonitor
   const getNotify = () => ctx.notifyMonitor
   const setRuntimeRepo = (next) => {
     if (typeof ctx.setRuntimeRepo === 'function') ctx.setRuntimeRepo(next)
@@ -247,7 +252,13 @@ export function createRoutingRuntime(ctx) {
     const previousSessionSlots = normalizeSessionSlots(routingConfig.inference?.session_slots)
     setRouting(routingConfig)
     if (body.sticky) routingConfig.sticky = { ...(routingConfig.sticky || {}), ...body.sticky }
-    if (body.quota) routingConfig.quota = { ...(routingConfig.quota || {}), ...body.quota }
+    if (body.quota) {
+      routingConfig.quota = { ...(routingConfig.quota || {}), ...body.quota }
+      routingConfig.quota.fable_weekly_limit = normalizeFableWeeklyLimit(routingConfig.quota.fable_weekly_limit)
+    }
+    if (body.client_access) routingConfig.client_access = normalizeClientAccess(body.client_access)
+    if (body.warmup_intercept) routingConfig.warmup_intercept = normalizeWarmupIntercept(body.warmup_intercept)
+    if (body.peak_prime) routingConfig.peak_prime = normalizePeakPrimeConfig(body.peak_prime)
     if (body.concurrency) routingConfig.concurrency = { ...(routingConfig.concurrency || {}), ...body.concurrency }
     if (body.pool) {
       routingConfig.pool = { ...(routingConfig.pool || {}), ...body.pool }
@@ -288,6 +299,7 @@ export function createRoutingRuntime(ctx) {
     fs.writeFileSync(ctx.routingConfigPath, JSON.stringify(routingConfig, null, 2))
     ctx.stickyRouter.reloadConfig(routingConfig)
     ctx.accountQuota.reloadConfig(routingConfig)
+    if (body.peak_prime) getPeakPrime()?.setConfig(routingConfig.peak_prime)
     getPool()?.reloadConfig?.(poolSchedulerConfig())
     const kernelPersona = compatibilityTouchesKernel(body.compatibility) ? syncKernelPanelConfig(routingConfig) : null
     if (body.pool || body.failover) initPoolRuntime()

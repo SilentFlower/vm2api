@@ -110,6 +110,9 @@ import { validTimezone } from '../core/timezone.mjs'
 import { stampVmKind, isCodexVm } from '../vm/vm-kind.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
 import { parseAccountTierPreference } from '../pool/claude-tier.mjs'
+import { normalizeFableWeeklyLimit } from '../pool/account-quota.mjs'
+import { normalizeClientAccess } from '../protocol/client-access-policy.mjs'
+import { normalizePeakPrimeConfig } from './peak-prime.mjs'
 import { parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import {
   normalizeInferenceConfig,
@@ -465,6 +468,7 @@ export function createPanelHandler(ctx) {
     ctx.routingConfig = previous
     setManualScheduleWins(ctx.routingConfig.pool?.manual_schedule_wins)
     ctx.healthMonitor?.setConfig(ctx.routingConfig.health_probe)
+    ctx.peakPrimeMonitor?.setConfig(ctx.routingConfig.peak_prime)
     ctx.usageProbeMonitor?.setConfig(ctx.routingConfig.usage_probe)
     ctx.notifyMonitor?.setConfig(ctx.routingConfig.notify)
     if (ctx.routingConfig.logging) {
@@ -3018,6 +3022,12 @@ export function createPanelHandler(ctx) {
           }),
         )
       }
+      if (req.method === 'GET' && p === '/api/panel/peak-prime') {
+        return json(res, 200, panel.ok(ctx.peakPrimeMonitor?.getStatus?.() || null))
+      }
+      if (req.method === 'POST' && p === '/api/panel/peak-prime') {
+        return json(res, 200, panel.ok(await ctx.peakPrimeMonitor.runOnce()))
+      }
       if (req.method === 'GET' && p === '/api/panel/usage-probe') {
         return json(
           res,
@@ -3179,12 +3189,21 @@ export function createPanelHandler(ctx) {
         const body = await readBody(req, cfg.limits.max_body_bytes)
         const previousRoutingConfig = structuredClone(ctx.routingConfig)
         const personaProblems = [...panel.validatePersonaRoutingPatch(body), ...validateInferenceRoutingPatch(body)]
+        let addonProblem = false
+        try {
+          if (body.client_access) normalizeClientAccess(body.client_access)
+          if (body.peak_prime) normalizePeakPrimeConfig(body.peak_prime)
+          if (body.quota?.fable_weekly_limit) normalizeFableWeeklyLimit(body.quota.fable_weekly_limit)
+        } catch (error) {
+          addonProblem = true
+          personaProblems.push(String(error?.message || error))
+        }
         if (personaProblems.length) {
           return json(res, 400, {
             ok: false,
             error: {
               type: 'invalid_request_error',
-              code: 'invalid_persona_template',
+              code: addonProblem ? 'invalid_routing_config' : 'invalid_persona_template',
               message: personaProblems.join('；'),
               problems: personaProblems,
             },

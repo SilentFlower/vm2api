@@ -116,6 +116,8 @@ import {
   restoreToolNamesInSSELine,
 } from './anthropic-policy.mjs'
 import { materializeRemoteImageSources } from './images.mjs'
+import { checkClientAccess } from './client-access-policy.mjs'
+import { detectWarmupIntercept, warmupMessage, warmupSse } from './warmup-intercept.mjs'
 
 export function createHandleProtocol(deps) {
   const json = (...args) => deps.json(...args)
@@ -337,6 +339,28 @@ export function createHandleProtocol(deps) {
       logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
       return
     }
+    const internalProbe =
+      req.apiKeyKind === 'master' && isHealthRealBypass(req.headers) && isValidVmId(req.headers['x-kin-vm'])
+    if (!internalProbe) {
+      const denied = checkClientAccess(req.headers['user-agent'], getRouting()?.client_access)
+      if (denied) {
+        stats.errors++
+        logBag.via = 'client-access'
+        logBag.final_state = 'client_access_denied'
+        logBag.error_code = 'client_access_denied'
+        logBag.error_message = denied.reason
+        return json(
+          res,
+          403,
+          makeError({
+            type: ErrorType.PERMISSION,
+            code: 'client_access_denied',
+            message: denied.reason,
+            status: 403,
+          }).body,
+        )
+      }
+    }
 
     let inbound
     try {
@@ -363,6 +387,28 @@ export function createHandleProtocol(deps) {
     logBag.requested_model = inbound?.model || null
     logBag.stream = isClientStream(inbound, req.headers)
     logBag.has_tools = Array.isArray(inbound?.tools) && inbound.tools.length > 0
+
+    if (!internalProbe && protocol === 'anthropic.messages') {
+      const kind = detectWarmupIntercept(inbound, getRouting()?.warmup_intercept, {
+        claudeCode: /^claude-(?:cli|code)\//i.test(String(req.headers['user-agent'] || '')),
+      })
+      if (kind) {
+        stats.requests++
+        stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
+        logBag.via = 'warmup-intercept'
+        logBag.attempt_count = 0
+        logBag.final_state = kind
+        const message = warmupMessage(inbound, kind)
+        logBag.usage = message.usage
+        logBag.stop_reason = message.stop_reason
+        if (inbound.stream === true) {
+          writeSSEHeaders(res)
+          res.write(warmupSse(message))
+          return res.end()
+        }
+        return json(res, 200, message)
+      }
+    }
 
     const fp = fingerprintRequest(req, inbound)
     const healthDecision = getHealthMonitor()?.decide?.(req.headers, inbound)

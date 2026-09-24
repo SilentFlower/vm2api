@@ -21,6 +21,7 @@ import {
 import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { PageHeader } from '@/components/page-header'
 import { QueryGate } from '@/components/query-gate'
@@ -29,6 +30,7 @@ import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
 import { CacheBreakpointsPane } from '@/features/settings/cache-breakpoints-pane'
+import { ClientAccessPane } from '@/features/settings/client-access-pane'
 import { CredentialWeightPane } from '@/features/settings/credential-weight-pane'
 import { GptPane } from '@/features/settings/gpt-pane'
 import { HealthPane } from '@/features/settings/health-pane'
@@ -41,6 +43,7 @@ import {
 } from '@/features/settings/navigation'
 import { NotifyPane } from '@/features/settings/notify-pane'
 import { OfficialCcSettingsPane } from '@/features/settings/official-cc-pane'
+import { PeakPrimePane } from '@/features/settings/peak-prime-pane'
 import { PersonaPane } from '@/features/settings/persona-pane'
 import { PersonaRulesPane } from '@/features/settings/persona-rules-pane'
 import { PoolPane } from '@/features/settings/pool-pane'
@@ -56,6 +59,7 @@ import { SettingsSkeleton } from '@/features/settings/settings-skeleton'
 import { Socks5Pane } from '@/features/settings/socks5-pane'
 import { StickyPane } from '@/features/settings/sticky-pane'
 import { TelemetryPane } from '@/features/settings/telemetry-pane'
+import { WarmupInterceptPane } from '@/features/settings/warmup-intercept-pane'
 
 export function SettingsPage() {
   const { tab: raw } = useParams({ from: '/_authenticated/settings/$tab' })
@@ -327,6 +331,70 @@ export function SettingsPage() {
                           }
                         />
                       </SettingRow>
+                      <SettingRow
+                        label='Fable 周用量上限'
+                        desc='仅对 OAuth 账号的 Fable 请求生效。'
+                      >
+                        <div className='flex items-center gap-2'>
+                          <Input
+                            type='number'
+                            min={1}
+                            max={100}
+                            className='w-20'
+                            value={Number(
+                              (
+                                quota.fable_weekly_limit as
+                                  Record<string, unknown> | undefined
+                              )?.percent ?? 50
+                            )}
+                            onChange={(event) =>
+                              setDraft({
+                                ...draft,
+                                quota: {
+                                  ...quota,
+                                  fable_weekly_limit: {
+                                    ...((quota.fable_weekly_limit as object) ||
+                                      {}),
+                                    percent: Number(event.target.value),
+                                  },
+                                },
+                              })
+                            }
+                            aria-label='Fable 周用量百分比'
+                          />
+                          <span className='text-sm text-muted-foreground'>
+                            %
+                          </span>
+                          <Switch
+                            checked={
+                              (
+                                quota.fable_weekly_limit as
+                                  Record<string, unknown> | undefined
+                              )?.enabled === true
+                            }
+                            onCheckedChange={(enabled) =>
+                              setDraft({
+                                ...draft,
+                                quota: {
+                                  ...quota,
+                                  fable_weekly_limit: {
+                                    ...((quota.fable_weekly_limit as object) ||
+                                      {}),
+                                    enabled,
+                                    percent: Number(
+                                      (
+                                        quota.fable_weekly_limit as
+                                          Record<string, unknown> | undefined
+                                      )?.percent ?? 50
+                                    ),
+                                  },
+                                },
+                              })
+                            }
+                            aria-label='启用 Fable 周用量上限'
+                          />
+                        </div>
+                      </SettingRow>
                     </CardContent>
                   </Card>
                 </div>
@@ -348,6 +416,15 @@ export function SettingsPage() {
               ) : null}
               {tab === 'protocol' ? (
                 <>
+                  <ClientAccessPane
+                    value={
+                      (draft.client_access as
+                        Record<string, unknown> | undefined) || {}
+                    }
+                    onChange={(next) =>
+                      setDraft({ ...draft, client_access: next })
+                    }
+                  />
                   <GptPane
                     value={
                       (draft.codex as Record<string, unknown> | undefined) || {}
@@ -391,16 +468,36 @@ export function SettingsPage() {
                 />
               ) : null}
               {tab === 'health' ? (
-                <HealthPane
-                  title={SETTINGS_TAB_LABELS[tab]}
-                  failover={failover}
-                  healthProbe={
-                    draft.health_probe as Record<string, unknown> | undefined
-                  }
-                  onFailoverChange={(next) =>
-                    setDraft({ ...draft, failover: next })
-                  }
-                />
+                <>
+                  <PeakPrimePane
+                    value={
+                      (draft.peak_prime as
+                        Record<string, unknown> | undefined) || {}
+                    }
+                    onChange={(next) =>
+                      setDraft({ ...draft, peak_prime: next })
+                    }
+                  />
+                  <WarmupInterceptPane
+                    value={
+                      (draft.warmup_intercept as
+                        Record<string, unknown> | undefined) || {}
+                    }
+                    onChange={(next) =>
+                      setDraft({ ...draft, warmup_intercept: next })
+                    }
+                  />
+                  <HealthPane
+                    title={SETTINGS_TAB_LABELS[tab]}
+                    failover={failover}
+                    healthProbe={
+                      draft.health_probe as Record<string, unknown> | undefined
+                    }
+                    onFailoverChange={(next) =>
+                      setDraft({ ...draft, failover: next })
+                    }
+                  />
+                </>
               ) : null}
               {tab === 'notify' ? (
                 <NotifyPane

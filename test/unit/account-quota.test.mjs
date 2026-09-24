@@ -635,6 +635,29 @@ test('7d_oi window is Fable-only and does not block the account', () => {
   assert.equal(q.fableWindowResetAt('acc-oi'), Date.parse('2026-08-25T00:00:00Z'))
 })
 
+test('Fable 周用量阈值只拦截有有效窗口的 OAuth 账号', () => {
+  const q = new AccountQuota({
+    dataDir: tmpDir(),
+    config: { quota: { fable_weekly_limit: { enabled: true, percent: 50 } } },
+    accounts: [
+      { account_id: 'oauth', type: 'oauth' },
+      { account_id: 'setup', type: 'setup-token' },
+    ],
+  })
+  const reset = new Date(Date.now() + 24 * 3600_000).toISOString()
+  for (const id of ['oauth', 'setup']) {
+    q.ingestHeaders(id, {
+      'anthropic-ratelimit-unified-7d_oi-utilization': '0.54',
+      'anthropic-ratelimit-unified-7d_oi-reset': reset,
+    })
+  }
+  assert.equal(q.fableWeeklyThresholdReached('oauth'), true)
+  assert.equal(q.fableWeeklyThresholdReached('setup'), false)
+  assert.equal(q.canAccept('oauth').ok, true)
+  q.reloadConfig({ quota: { fable_weekly_limit: { enabled: false, percent: 50 } } })
+  assert.equal(q.fableWeeklyThresholdReached('oauth'), false)
+})
+
 test('probe 5h rejected with no last_used stays a hard block until reset', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),

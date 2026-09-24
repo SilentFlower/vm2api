@@ -18,6 +18,10 @@
     "warn_ratio": 0.75,
     "block_on_5h": true,
     "block_on_7d": true,
+    "fable_weekly_limit": {
+      "enabled": false,
+      "percent": 50
+    },
     "weekly_split": {
       "enabled": false,
       "fable_share": 0.5
@@ -141,6 +145,24 @@
       "skip_official": true,
       "ua_regex": ""
     }
+  },
+  "client_access": {
+    "enabled": false,
+    "allowed_claude_code_versions": "",
+    "blocked_claude_code_versions": "",
+    "allowed_user_agents": ""
+  },
+  "warmup_intercept": {
+    "title_enabled": false,
+    "suggestion_enabled": false,
+    "haiku_probe_enabled": false
+  },
+  "peak_prime": {
+    "enabled": false,
+    "hours": [4, 5, 6],
+    "minute": 10,
+    "model": "claude-haiku-4-5",
+    "timeout_ms": 60000
   },
   "notify": {
     "enabled": false,
