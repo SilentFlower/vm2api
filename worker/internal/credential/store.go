@@ -126,6 +126,10 @@ func (s *Store) Load() (Credential, map[string]any, error) {
 	if oauth == nil {
 		oauth = document
 	}
+	if oauth == nil {
+		return Credential{}, nil, errors.New("credentials oauth object is missing")
+	}
+	scopes := stringSlice(firstValue(oauth, "scopes", "scope"))
 	credential := Credential{
 		Type:         NormalizeType(firstString(document, "type")),
 		AccessToken:  firstString(oauth, "accessToken", "access_token"),
@@ -135,7 +139,7 @@ func (s *Store) Load() (Credential, map[string]any, error) {
 		Email:        firstString(oauth, "email", "emailAddress", "email_address"),
 		AccountUUID:  firstString(oauth, "accountUuid", "account_uuid"),
 		OrgUUID:      firstString(oauth, "orgUuid", "org_uuid", "organization_uuid"),
-		Scopes:       stringSlice(oauth["scopes"]),
+		Scopes:       scopes,
 		AuthScheme:   firstString(document, "authScheme", "auth_scheme"),
 	}
 	if typed := firstString(oauth, "type"); typed != "" && credential.Type == TypeOAuth {
@@ -404,7 +408,6 @@ func asInt64(value any) int64 {
 		return 0
 	}
 }
-
 func stringSlice(value any) []string {
 	switch typed := value.(type) {
 	case []string:

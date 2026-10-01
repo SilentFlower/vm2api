@@ -7,6 +7,7 @@ import {
   isLeftoverVmKeyedAccount,
   isSeedAccountRow,
   normalizePanelExpiresAt,
+  quotaFromAccount,
 } from '../../src/lib/admin/panel-api.mjs'
 
 const usageOk = { ok: true, source: 'vm-oauth-usage', at: '2026-08-24T00:00:00.000Z' }
@@ -440,19 +441,16 @@ test('leftover oauth_no_refresh out of pool is unavailable', () => {
   assert.equal(st.text, '无效凭证')
 })
 
-test('Claude tier: no token is none, plan denied is Pro, Fable window is Max', () => {
+test('Claude token defaults to Pro until Fable usage upgrades it', () => {
   assert.equal(inferClaudeTier({}).key, 'none')
   assert.equal(inferClaudeTier({ has_token: true }, { fable: { plan_denied: true, status: 403 } }).key, 'pro')
   assert.equal(inferClaudeTier({ has_token: true, utilization_7d_oi: 0.21 }).key, 'max')
-  assert.equal(inferClaudeTier({ has_token: true, fable: { ok: true } }).key, 'max')
+  assert.equal(inferClaudeTier({ has_token: true, fable: { ok: true } }).key, 'pro')
   assert.equal(
     inferClaudeTier({ has_token: true }, { fable: { plan_denied: true, status: 401, error: 'plan_denied' } }).key,
-    'unknown',
+    'pro',
   )
-  assert.equal(
-    inferClaudeTier({ has_token: true }, { fable: { ok: false, status: 429, error: 'Error' } }).key,
-    'unknown',
-  )
+  assert.equal(inferClaudeTier({ has_token: true }, { fable: { ok: false, status: 429, error: 'Error' } }).key, 'pro')
   assert.equal(
     inferClaudeTier(
       { has_token: true, utilization_7d_oi: 1 },
@@ -462,7 +460,7 @@ test('Claude tier: no token is none, plan denied is Pro, Fable window is Max', (
         status_7d_oi: 'rejected',
       },
     ).key,
-    'unknown',
+    'pro',
   )
   assert.equal(
     inferClaudeTier(
@@ -500,7 +498,7 @@ test('Claude tier: no token is none, plan denied is Pro, Fable window is Max', (
     ).key,
     'max',
   )
-  assert.equal(inferClaudeTier({ has_token: true }).key, 'unknown')
+  assert.equal(inferClaudeTier({ has_token: true }).key, 'pro')
 })
 
 test('setup-token Extra-only row is not leftover/seed and is findable', () => {
@@ -527,4 +525,60 @@ test('vm-keyed row is leftover only when the slot already has an account_uuid', 
   const acc = { account_id: 'vm-01', vm_id: 'vm-01', email: null, unified: {} }
   assert.equal(isLeftoverVmKeyedAccount(acc, { id: 'vm-01', account_uuid: 'acct-uuid' }), true)
   assert.equal(isLeftoverVmKeyedAccount(acc, { id: 'vm-01', account_uuid: null }), false)
+})
+
+test('quotaFromAccount reflects 100% and rejected when official 5h is limited', () => {
+  const futureReset = String(Math.floor(Date.now() / 1000) + 7200)
+  const acc = {
+    unified: {
+      official: {
+        '5h': { utilization: 1.0, status: 'rejected', reset: futureReset },
+        '7d': { utilization: 0.69, status: 'allowed', reset: futureReset },
+      },
+      headers: {
+        '5h': { utilization: 0.38, status: 'allowed', reset: futureReset },
+        '7d': { utilization: 0.63, status: 'allowed', reset: futureReset },
+      },
+    },
+  }
+  const q = quotaFromAccount(acc)
+  assert.equal(q.utilization_5h, 1.0)
+  assert.equal(q.status_5h, 'rejected')
+  assert.equal(q.reset_5h, futureReset)
+  assert.equal(q.utilization_7d, 0.63)
+  assert.equal(q.status_7d, 'allowed')
+})
+
+test('quotaFromAccount falls back to official utilization when headers are missing', () => {
+  const futureReset = String(Math.floor(Date.now() / 1000) + 7200)
+  const acc = {
+    unified: {
+      official: {
+        '5h': { utilization: 0.25, status: 'allowed', reset: futureReset },
+        '7d': { utilization: 0.5, status: 'allowed', reset: futureReset },
+      },
+    },
+  }
+  const q = quotaFromAccount(acc)
+  assert.equal(q.utilization_5h, 0.25)
+  assert.equal(q.status_5h, 'allowed')
+  assert.equal(q.reset_5h, futureReset)
+  assert.equal(q.utilization_7d, 0.5)
+  assert.equal(q.status_7d, 'allowed')
+})
+
+test('quotaFromAccount clears to 0 and active when reset has elapsed', () => {
+  const acc = {
+    unified: {
+      official: {
+        '5h': { utilization: 1.0, status: 'rejected', reset: '1000' },
+      },
+      headers: {
+        '5h': { utilization: 0.38, status: 'allowed', reset: '1000' },
+      },
+    },
+  }
+  const q = quotaFromAccount(acc)
+  assert.equal(q.utilization_5h, 0)
+  assert.equal(q.status_5h, 'active')
 })

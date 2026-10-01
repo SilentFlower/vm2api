@@ -45,6 +45,7 @@ const PANEL_ROUTE_SAMPLES = [
   ['DELETE', '/api/panel/vms/vm-01'],
   ['POST', '/api/panel/vms/vm-01/schedulable'],
   ['POST', '/api/panel/vms/vm-01/cooldown/clear'],
+  ['POST', '/api/panel/vms/vm-01/circuit/reset'],
   ['POST', '/api/panel/vms/vm-01/reload'],
   ['POST', '/api/panel/vms/vm-01/collect-identity'],
   ['POST', '/api/panel/vms/vm-01/probe'],
@@ -130,6 +131,10 @@ const PANEL_ROUTE_SAMPLES = [
   ['GET', '/api/panel/probe-test'],
   ['GET', '/api/panel/probe-test/job-1'],
   ['POST', '/api/panel/probe-test/job-1/cancel'],
+  ['GET', '/api/panel/users'],
+  ['POST', '/api/panel/users'],
+  ['PATCH', '/api/panel/users/u1'],
+  ['DELETE', '/api/panel/users/u1'],
 ]
 
 test('panel route samples all have server handlers', () => {

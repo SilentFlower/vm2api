@@ -3,12 +3,14 @@
  *
  *   device_id     → slot (VM) device
  *   account_uuid  → real OAuth account of the slot
- *   session_id    → official Claude Code keeps the caller's session.
- *                   Unofficial hashes the caller token. With no caller
- *                   session, derive a UUID from account + client + first
- *                   user text (sub2api buildStableSessionSeed). Never
+ *   session_id    → rebuild (default): mint from inbound identity + epoch;
+ *                   reuse sticky session_id while the VM is unchanged.
+ *                   passthrough: official Claude Code keeps the caller
+ *                   session; unofficial hashes the caller token. With no
+ *                   caller session, derive a UUID from account + client +
+ *                   first user text (sub2api buildStableSessionSeed). Never
  *                   randomUUID while any of those anchors exist. A sticky
- *                   row for the same account reuses the id it already stored.
+ *                   row for the same VM reuses the id it already stored.
  *                   Outbound always has a session. Email never goes in
  *                   metadata.user_id (Anthropic 400 has_at).
  *
@@ -48,6 +50,12 @@ export const UNOFFICIAL_SESSION_SEED = 'kin-unofficial-session:'
 
 /** Prefix so a stable seed cannot collide with an unofficial caller hash. */
 export const STABLE_SESSION_SEED = 'kin-stable-session:'
+
+/** Prefix so rebuild values cannot collide with unofficial / stable hashes. */
+export const REBUILD_SESSION_SEED = 'kin-rebuild-session:'
+
+/** Prefix so a sub-agent session cannot collide with any other derived id. */
+export const AGENT_SESSION_SEED = 'kin-claude-code-agent:'
 
 const SESSION_UA_PRODUCT = /([A-Za-z0-9._-]+)\/[A-Za-z0-9._-]+/g
 const SESSION_UA_VERSION = /\bv?\d+(?:\.\d+){1,3}\b/g
@@ -102,7 +110,7 @@ function stableSessionMaterial(accountId, clientDiscriminator, firstUserText) {
   )
 }
 
-/** Deterministic v4-shaped UUID. Used for unofficial outbound session_id. */
+/** Deterministic v4-shaped UUID. Used for unofficial / rebuild outbound session_id. */
 export function uuidFromSeed(seed) {
   const hex = crypto
     .createHash('sha256')
@@ -124,6 +132,8 @@ export function parseUserId(raw) {
       device_id: raw.device_id || raw.deviceId || '',
       account_uuid: raw.account_uuid || raw.accountUuid || '',
       session_id: raw.session_id || raw.sessionId || '',
+      parent_session_id: raw.parent_session_id || raw.parentSessionId || '',
+      root_session_id: raw.root_session_id || raw.rootSessionId || '',
     }
   }
   const s = String(raw)
@@ -134,6 +144,8 @@ export function parseUserId(raw) {
         device_id: p.device_id || p.deviceId || '',
         account_uuid: p.account_uuid || p.accountUuid || '',
         session_id: p.session_id || p.sessionId || '',
+        parent_session_id: p.parent_session_id || p.parentSessionId || '',
+        root_session_id: p.root_session_id || p.rootSessionId || '',
       }
     }
   } catch {}
@@ -153,10 +165,76 @@ function headerValue(headers, key) {
   return ''
 }
 
+function cleanIdentityValue(value) {
+  return String(value || '').trim()
+}
+
+/**
+ * Trusted inbound identity for pool routing. Priority:
+ * metadata.user_id.session_id/device_id > explicit inbound device_id field/header.
+ * Never falls back to API key, IP, UA, or content fingerprint.
+ * @returns {{ sessionId: string, deviceId: string, source: 'metadata'|'explicit-device'|'none' }}
+ */
+export function resolveInboundIdentity({ inbound = {}, body = {}, headers = {} } = {}) {
+  let sessionId = ''
+  let deviceId = ''
+  for (const raw of [inbound?.metadata?.user_id, body?.metadata?.user_id]) {
+    const parsed = parseUserId(raw)
+    if (!parsed) continue
+    if (!sessionId) sessionId = cleanIdentityValue(parsed.session_id)
+    if (!deviceId) deviceId = cleanIdentityValue(parsed.device_id)
+    if (sessionId && deviceId) break
+  }
+  // A sub-agent hop keeps the main session_id; it is its own session.
+  sessionId = agentSessionId(sessionId, claudeCodeAgentId(headers))
+  if (deviceId) return { sessionId, deviceId, source: 'metadata' }
+
+  const explicitDevice =
+    cleanIdentityValue(inbound?.device_id) ||
+    cleanIdentityValue(body?.device_id) ||
+    headerValue(headers, 'x-kin-device-id').trim()
+  if (explicitDevice) return { sessionId, deviceId: explicitDevice, source: 'explicit-device' }
+  // A metadata session_id without any device still pins its own session.
+  if (sessionId) return { sessionId, deviceId: '', source: 'metadata' }
+  return { sessionId: '', deviceId: '', source: 'none' }
+}
+
+/**
+ * Claude Code (>= 2.1.139) sends the main session_id on every hop and marks
+ * sub-agent hops with x-claude-code-agent-id (nested agents add
+ * x-claude-code-parent-agent-id). Main-thread hops carry neither.
+ */
+export function claudeCodeAgentId(headers = {}) {
+  return headerValue(headers, 'x-claude-code-agent-id').trim()
+}
+
+/**
+ * One CLI session per sub-agent, stable for the agent's lifetime. Without an
+ * agent id the root session is the session. UUID-shaped because official
+ * passthrough sends it upstream as metadata.user_id.session_id.
+ */
+export function agentSessionId(rootSessionId, agentId) {
+  const root = String(rootSessionId || '').trim()
+  const agent = String(agentId || '').trim()
+  if (!root || !agent) return root
+  return uuidFromSeed(`${AGENT_SESSION_SEED}${root}#${agent}`)
+}
+
+/** Main session a Claude Code sub-agent hop belongs to; '' on main-thread hops. */
+export function claudeCodeAgentRootSession({ inbound = {}, body = {}, headers = {} } = {}) {
+  if (!claudeCodeAgentId(headers)) return ''
+  return rootCallerSession({ inbound, body, headers })
+}
+
 /**
  * Caller session, in official order: metadata.user_id → sticky headers → body keys.
+ * A Claude Code sub-agent hop gets its own session under that root.
  */
 export function extractCallerSession({ inbound = {}, body = {}, headers = {} } = {}) {
+  return agentSessionId(rootCallerSession({ inbound, body, headers }), claudeCodeAgentId(headers))
+}
+
+function rootCallerSession({ inbound, body, headers }) {
   const raw = inbound?.metadata?.user_id || body?.metadata?.user_id
   const parsed = parseUserId(raw) || {}
   if (parsed.session_id) return String(parsed.session_id)
@@ -175,15 +253,19 @@ export function sessionIdFromOutboundBody(body = {}) {
   return parseUserId(body?.metadata?.user_id)?.session_id || ''
 }
 
-/**
- * Official Claude Code: keep the caller's session.
- * Unofficial: hash the caller token so the raw value never goes upstream.
- * No caller session: reuse the sticky row's outbound id for this account,
- * otherwise a deterministic UUID. randomUUID only when nothing identifies
- * the conversation.
- */
-export function resolveOutboundSessionId(callerSession, opts = {}) {
-  const caller = String(callerSession || '').trim()
+export function outboundSessionMode(routing) {
+  const raw = String(routing?.sticky?.outbound_session || '')
+    .trim()
+    .toLowerCase()
+  return raw === 'passthrough' ? 'passthrough' : 'rebuild'
+}
+
+/** Deterministic outbound session for one identity + bind-generation epoch. */
+export function rebuildOutboundSession({ identity, epoch } = {}) {
+  return uuidFromSeed(`${REBUILD_SESSION_SEED}${String(identity ?? '')}#${epoch}`)
+}
+
+function resolvePassthroughOutboundSessionId(caller, opts) {
   const officialClient = opts.officialClient === true
   if (officialClient && caller) return caller
   if (!officialClient && caller) return uuidFromSeed(UNOFFICIAL_SESSION_SEED + caller)
@@ -210,6 +292,39 @@ export function resolveOutboundSessionId(callerSession, opts = {}) {
 }
 
 /**
+ * rebuild (default): same VM reuses the sticky outbound id; otherwise mint
+ * from inbound A (or the stable seed) + epoch. passthrough keeps the old
+ * official-keeps-A / unofficial-hash behavior.
+ */
+export function resolveOutboundSessionId(callerSession, opts = {}) {
+  const caller = String(callerSession || '').trim()
+  const mode = opts.mode || outboundSessionMode(opts.routing)
+  if (mode === 'passthrough') return resolvePassthroughOutboundSessionId(caller, opts)
+
+  const boundSessionId = String(opts.boundSessionId || '').trim()
+  const boundVmId = String(opts.boundVmId || '').trim()
+  const vmId = String(opts.vmId || '').trim()
+  const sameVm = Boolean(boundVmId && vmId && boundVmId === vmId)
+  if (boundSessionId && sameVm) return boundSessionId
+
+  const accountId = String(opts.accountId || '').trim()
+  const discriminator =
+    opts.clientDiscriminator != null
+      ? String(opts.clientDiscriminator)
+      : sessionContextDiscriminator({
+          clientIp: opts.clientIp,
+          userAgent: opts.userAgent,
+          apiKeyId: opts.apiKeyId,
+        })
+  const firstUserText = String(opts.firstUserText || '')
+  const identity = caller || buildStableSessionSeed(accountId, discriminator, firstUserText)
+  if (caller || stableSessionMaterial(accountId, discriminator, firstUserText)) {
+    return rebuildOutboundSession({ identity, epoch: opts.epoch ?? 'pending' })
+  }
+  return crypto.randomUUID()
+}
+
+/**
  * Slot device + credential account + resolved outbound session.
  */
 export function applyCrsIdentityReplace(body, identity, inbound = {}, reqHeaders = {}, opts = {}) {
@@ -229,9 +344,14 @@ export function applyCrsIdentityReplace(body, identity, inbound = {}, reqHeaders
     String(opts.sessionId || '').trim() ||
     resolveOutboundSessionId(extractCallerSession({ inbound, body, headers: reqHeaders }), {
       officialClient,
+      mode: opts.mode,
+      routing: opts.routing,
       accountId: opts.accountId || identity?.accountId || identity?.vmId || '',
       boundSessionId: opts.boundSessionId,
       boundAccountId: opts.boundAccountId,
+      boundVmId: opts.boundVmId,
+      vmId: opts.vmId || identity?.vmId || '',
+      epoch: opts.epoch,
       clientDiscriminator: opts.clientDiscriminator,
       clientIp: opts.clientIp,
       userAgent: opts.userAgent || headerValue(reqHeaders, 'user-agent'),

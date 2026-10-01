@@ -17,8 +17,15 @@ import {
   ingressAuthSql,
   slaOkErrorSqlList,
 } from '../../admin/error-class.mjs'
-import { calculateCost, emptyCostBucket, shanghaiDayStartIso } from '../../admin/pricing.mjs'
+import {
+  calculateCost,
+  emptyCostBucket,
+  shanghaiDayStartIso,
+  sumCostBuckets,
+  UNPRICED_MODEL,
+} from '../../admin/pricing.mjs'
 import { cacheHitStats } from '../../admin/cache-metrics.mjs'
+import { extraWindowSince, WINDOW_5H_MS, WINDOW_7D_MS } from '../../pool/quota-window.mjs'
 
 const IGNORED_CODES_SQL = ignoredErrorSqlList()
 const SLA_OK_CODES_SQL = slaOkErrorSqlList()
@@ -76,6 +83,9 @@ const SUMMARY_COLUMNS = [
   'group_id',
   'actual_cost',
   'rate_multiplier',
+  'service_tier',
+  'speed',
+  'long_context',
 ]
 
 function toRow(rec) {
@@ -120,6 +130,56 @@ function timeCond(since, until) {
     params.push(new Date(until).toISOString())
   }
   return { cond: where.length ? `WHERE ${where.join(' AND ')}` : '', params }
+}
+
+function accountEventKey(row) {
+  return `${row?.account_id || ''}\0${row?.vm_id || ''}`
+}
+
+function resolveAccountWindow(windows, row) {
+  const list = Array.isArray(windows) ? windows : []
+  return (
+    list.find((w) => w.account_id === row.account_id && (w.vm_id || null) === (row.vm_id || null)) ||
+    list.find((w) => w.account_id && w.account_id === row.account_id) ||
+    list.find((w) => w.vm_id && w.vm_id === row.vm_id) ||
+    null
+  )
+}
+
+function groupCostEvents(rows = []) {
+  const map = new Map()
+  for (const row of rows) {
+    const key = accountEventKey(row)
+    const list = map.get(key) || []
+    list.push(row)
+    map.set(key, list)
+  }
+  return map
+}
+
+function bucketEventsSince(rows = [], sinceMs) {
+  const since = Number(sinceMs)
+  const picked = rows.filter((row) => {
+    const at = Date.parse(row.created_at)
+    return Number.isFinite(at) && (!Number.isFinite(since) || at >= since)
+  })
+  if (!picked.length) return emptyCostBucket()
+  return sumCostBuckets(
+    picked.map((row) => ({
+      requests: 1,
+      success: Number(row.success || 0),
+      errors: Number(row.errors || 0),
+      input_tokens: Number(row.input_tokens || 0),
+      output_tokens: Number(row.output_tokens || 0),
+      cache_read_tokens: Number(row.cache_read_tokens || 0),
+      cache_creation_tokens: Number(row.cache_creation_tokens || 0),
+      input_cost: Number(row.input_cost || 0),
+      output_cost: Number(row.output_cost || 0),
+      cache_read_cost: Number(row.cache_read_cost || 0),
+      cache_creation_cost: Number(row.cache_creation_cost || 0),
+      total_cost: Number(row.total_cost || 0),
+    })),
+  )
 }
 
 function ownerPred(ownerUserId) {
@@ -433,17 +493,19 @@ export class UsageLogsRepo {
   }
 
   /**
-   * Fill official-standard cost on rows that predate the billing columns.
-   * Idempotent; skips rows that already have total_cost.
+   * Fill official cost on rows that predate the billing columns, re-pricing with the
+   * stored service_tier / speed. Rows the pricer cannot price are marked 'unpriced'
+   * (cost stays NULL) so they are never guessed at standard rates. Idempotent.
    */
   backfillMissingCosts({ limit = 4000 } = {}) {
     const rows = this.db
       .prepare(`
       SELECT id, model, upstream_model, requested_model,
              input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
-             cache_creation_5m_tokens, cache_creation_1h_tokens, rate_multiplier
+             cache_creation_5m_tokens, cache_creation_1h_tokens, rate_multiplier,
+             service_tier, speed
       FROM usage_logs
-      WHERE total_cost IS NULL
+      WHERE total_cost IS NULL AND pricing_model IS NULL
       LIMIT ?
     `)
       .all(Math.max(1, Math.min(20000, Number(limit) || 4000)))
@@ -451,7 +513,8 @@ export class UsageLogsRepo {
     const upd = this.db.prepare(`
       UPDATE usage_logs
          SET input_cost = ?, output_cost = ?, cache_read_cost = ?,
-             cache_creation_cost = ?, total_cost = ?, actual_cost = ?, pricing_model = ?
+             cache_creation_cost = ?, total_cost = ?, actual_cost = ?, pricing_model = ?,
+             long_context = ?
        WHERE id = ?
     `)
     this.db.exec('BEGIN')
@@ -459,17 +522,21 @@ export class UsageLogsRepo {
       for (const r of rows) {
         const model = r.upstream_model || r.model || r.requested_model
         const c = calculateCost(r, model)
+        if (!c.known) {
+          upd.run(null, null, null, null, null, null, UNPRICED_MODEL, null, r.id)
+          continue
+        }
         const parsedRate = r.rate_multiplier == null ? 1 : Number(r.rate_multiplier)
         const rate = Number.isFinite(parsedRate) ? parsedRate : 1
-        const totalCost = c.known ? c.total_cost : 0
         upd.run(
-          c.known ? c.input_cost : 0,
-          c.known ? c.output_cost : 0,
-          c.known ? c.cache_read_cost : 0,
-          c.known ? c.cache_creation_cost : 0,
-          totalCost,
-          totalCost * rate,
+          c.input_cost,
+          c.output_cost,
+          c.cache_read_cost,
+          c.cache_creation_cost,
+          c.total_cost,
+          c.total_cost * rate,
           c.pricing_key,
+          c.long_context ? 1 : 0,
           r.id,
         )
       }
@@ -557,13 +624,25 @@ export class UsageLogsRepo {
     }))
   }
 
-  /** Official-standard cost grouped by upstream model for one credential / slot. */
+  /**
+   * Official cost grouped by upstream model and billing band for one credential / slot.
+   * service_tier is folded to fast / flex / other-raw (standard aliases → NULL);
+   * speed is 'fast' or NULL. unpriced_requests counts rows left without an estimate.
+   */
   costByModel({ vmId = null, accountId = null, since = null, until = null } = {}) {
     const { cond, params } = filterCond({ since, until, vmId, accountId })
     const rows = this.db
       .prepare(`
       SELECT COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), NULLIF(requested_model, ''), '—') AS model,
+             CASE
+               WHEN service_tier IS NULL OR service_tier IN ('', 'default', 'auto', 'standard') THEN NULL
+               WHEN service_tier IN ('priority', 'fast') THEN 'fast'
+               ELSE service_tier
+             END AS service_tier,
+             CASE WHEN speed = 'fast' THEN 'fast' ELSE NULL END AS speed,
+             COALESCE(long_context, 0) AS long_context,
              COUNT(*) AS requests,
+             SUM(CASE WHEN pricing_model = '${UNPRICED_MODEL}' THEN 1 ELSE 0 END) AS unpriced_requests,
              COALESCE(SUM(input_tokens), 0) AS input_tokens,
              COALESCE(SUM(output_tokens), 0) AS output_tokens,
              COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
@@ -574,14 +653,18 @@ export class UsageLogsRepo {
              COALESCE(SUM(cache_creation_cost), 0) AS cache_creation_cost,
              COALESCE(SUM(total_cost), 0) AS total_cost
       FROM usage_logs ${cond}
-      GROUP BY 1
+      GROUP BY 1, 2, 3, 4
       ORDER BY total_cost DESC, requests DESC
       LIMIT 24
     `)
       .all(...params)
     return rows.map((r) => ({
       model: r.model,
+      service_tier: r.service_tier || null,
+      speed: r.speed || null,
+      long_context: Number(r.long_context || 0),
       requests: Number(r.requests || 0),
+      unpriced_requests: Number(r.unpriced_requests || 0),
       input_tokens: Number(r.input_tokens || 0),
       output_tokens: Number(r.output_tokens || 0),
       cache_read_tokens: Number(r.cache_read_tokens || 0),
@@ -594,28 +677,101 @@ export class UsageLogsRepo {
     }))
   }
 
+  /**
+   * Per-slot usage over the last `days` Shanghai calendar days (stats dialog).
+   * Buckets are Shanghai days so the last bucket lines up with billingStats().today.
+   * `models` / `endpoints` are ranked by request count and capped; `endpoints`
+   * is the inbound request path (usage_logs keeps no separate upstream endpoint).
+   */
+  vmUsageStats({ vmId, days = 30 } = {}) {
+    if (!vmId) return { days: 0, since: null, history: [], models: [], endpoints: [] }
+    const span = Math.max(1, Math.min(90, Math.floor(Number(days)) || 30))
+    const since = new Date(Date.parse(shanghaiDayStartIso()) - (span - 1) * 86400_000).toISOString()
+    const { cond, params } = filterCond({ since, vmId })
+    const history = this.db
+      .prepare(`
+      SELECT strftime('%Y-%m-%d', created_at, '+8 hours') AS day,
+             COUNT(*) AS requests,
+             SUM(CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END) AS errors,
+             COALESCE(SUM(input_tokens), 0) AS input_tokens,
+             COALESCE(SUM(output_tokens), 0) AS output_tokens,
+             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+             COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens,
+             COALESCE(SUM(total_cost), 0) AS total_cost,
+             COALESCE(SUM(duration_ms), 0) AS duration_ms_sum,
+             SUM(CASE WHEN duration_ms IS NOT NULL THEN 1 ELSE 0 END) AS duration_n
+      FROM usage_logs ${cond}
+      GROUP BY day ORDER BY day
+    `)
+      .all(...params)
+      .map((r) => ({
+        day: r.day,
+        requests: Number(r.requests || 0),
+        errors: Number(r.errors || 0),
+        input_tokens: Number(r.input_tokens || 0),
+        output_tokens: Number(r.output_tokens || 0),
+        cache_read_tokens: Number(r.cache_read_tokens || 0),
+        cache_creation_tokens: Number(r.cache_creation_tokens || 0),
+        total_cost: Number(r.total_cost || 0),
+        duration_ms_sum: Number(r.duration_ms_sum || 0),
+        duration_n: Number(r.duration_n || 0),
+      }))
+    const group = (expr, limit) =>
+      this.db
+        .prepare(`
+      SELECT ${expr} AS name,
+             COUNT(*) AS requests,
+             COALESCE(SUM(input_tokens), 0) + COALESCE(SUM(output_tokens), 0) AS tokens,
+             COALESCE(SUM(total_cost), 0) AS total_cost
+      FROM usage_logs ${cond}
+      GROUP BY name ORDER BY requests DESC, total_cost DESC LIMIT ${limit}
+    `)
+        .all(...params)
+        .map((r) => ({
+          name: r.name,
+          requests: Number(r.requests || 0),
+          tokens: Number(r.tokens || 0),
+          total_cost: Number(r.total_cost || 0),
+        }))
+    return {
+      days: span,
+      since,
+      history,
+      models: group("COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), NULLIF(requested_model, ''), '—')", 12),
+      endpoints: group("COALESCE(NULLIF(path, ''), '—')", 8),
+    }
+  }
+
   /** Official-standard totals: all-time + Shanghai calendar today + per account. */
-  billingStats() {
+  billingStats({ accountWindows = null, now = Date.now() } = {}) {
     try {
       this.backfillMissingCosts()
     } catch {}
     const todayStart = shanghaiDayStartIso()
     const total = this._costSelect('', [])
     const today = this._costSelect('WHERE created_at >= ?', [todayStart])
-    const fiveHStart = new Date(Date.now() - 5 * 3600_000).toISOString()
-    const sevenDStart = new Date(Date.now() - 7 * 86400_000).toISOString()
+    const fiveHStart = new Date(now - WINDOW_5H_MS).toISOString()
+    const sevenDStart = new Date(now - WINDOW_7D_MS).toISOString()
     const accountsTotal = this.costByAccount()
     const accountsToday = this.costByAccount({ since: todayStart })
-    const accounts5h = this.costByAccount({ since: fiveHStart })
-    const accounts7d = this.costByAccount({ since: sevenDStart })
     const keyOf = (a) => a.account_id + '\0' + (a.vm_id || '')
     const todayById = new Map(accountsToday.map((a) => [keyOf(a), a]))
-    const fiveById = new Map(accounts5h.map((a) => [keyOf(a), a]))
-    const sevenById = new Map(accounts7d.map((a) => [keyOf(a), a]))
+    const aligned = Array.isArray(accountWindows) && accountWindows.length > 0
+    const events = aligned ? this._costEventsSince(sevenDStart) : null
+    const fiveById = aligned ? null : new Map(this.costByAccount({ since: fiveHStart }).map((a) => [keyOf(a), a]))
+    const sevenById = aligned ? null : new Map(this.costByAccount({ since: sevenDStart }).map((a) => [keyOf(a), a]))
+    const eventsByKey = aligned ? groupCostEvents(events) : null
     const accounts = accountsTotal.map((a) => {
       const t = todayById.get(keyOf(a)) || emptyCostBucket()
-      const w = fiveById.get(keyOf(a)) || emptyCostBucket()
-      const w7 = sevenById.get(keyOf(a)) || emptyCostBucket()
+      const win = aligned ? resolveAccountWindow(accountWindows, a) : null
+      const since5 = aligned ? (extraWindowSince(win?.reset_5h, WINDOW_5H_MS, now) ?? Date.parse(fiveHStart)) : null
+      const since7 = aligned ? (extraWindowSince(win?.reset_7d, WINDOW_7D_MS, now) ?? Date.parse(sevenDStart)) : null
+      const w = aligned
+        ? bucketEventsSince(eventsByKey.get(keyOf(a)) || [], since5)
+        : fiveById.get(keyOf(a)) || emptyCostBucket()
+      const w7 = aligned
+        ? bucketEventsSince(eventsByKey.get(keyOf(a)) || [], since7)
+        : sevenById.get(keyOf(a)) || emptyCostBucket()
       return {
         ...a,
         today: { ...t },
@@ -640,25 +796,69 @@ export class UsageLogsRepo {
         window_5h_input_cost: Number(w.input_cost || 0),
         window_5h_output_cost: Number(w.output_cost || 0),
         window_5h_cache_cost: Number(w.cache_read_cost || 0) + Number(w.cache_creation_cost || 0),
+        window_5h_start: aligned ? new Date(since5).toISOString() : fiveHStart,
         window_7d_cost: Number(w7.total_cost || 0),
         window_7d_requests: Number(w7.requests || 0),
         window_7d_success: Number(w7.success || 0),
         window_7d_errors: Number(w7.errors || 0),
         window_7d_tokens: Number(w7.input_tokens || 0) + Number(w7.output_tokens || 0),
+        window_7d_start: aligned ? new Date(since7).toISOString() : sevenDStart,
       }
     })
+    const window5h = aligned
+      ? {
+          ...sumCostBuckets(accounts.map((a) => a.window_5h)),
+          ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_5h))),
+        }
+      : this._costSelect('WHERE created_at >= ?', [fiveHStart])
+    const window7d = aligned
+      ? {
+          ...sumCostBuckets(accounts.map((a) => a.window_7d)),
+          ...cacheHitStats(sumCostBuckets(accounts.map((a) => a.window_7d))),
+        }
+      : this._costSelect('WHERE created_at >= ?', [sevenDStart])
     return {
       source: 'anthropic-official',
       currency: 'USD',
       today_start: todayStart,
-      window_5h_start: fiveHStart,
-      window_7d_start: sevenDStart,
+      window_5h_start: aligned
+        ? accounts.reduce((min, a) => (!min || a.window_5h_start < min ? a.window_5h_start : min), fiveHStart)
+        : fiveHStart,
+      window_7d_start: aligned
+        ? accounts.reduce((min, a) => (!min || a.window_7d_start < min ? a.window_7d_start : min), sevenDStart)
+        : sevenDStart,
       today,
-      window_5h: this._costSelect('WHERE created_at >= ?', [fiveHStart]),
-      window_7d: this._costSelect('WHERE created_at >= ?', [sevenDStart]),
+      window_5h: window5h,
+      window_7d: window7d,
       total,
       accounts,
     }
+  }
+
+  _costEventsSince(since) {
+    return this.db
+      .prepare(
+        `
+      SELECT
+        COALESCE(NULLIF(final_account_id, ''), NULLIF(account_id, ''), vm_id, '—') AS account_id,
+        vm_id,
+        created_at,
+        CASE WHEN ${SLA_SUCCESS_PRED} THEN 1 ELSE 0 END AS success,
+        CASE WHEN ${SLA_ERROR_PRED} THEN 1 ELSE 0 END AS errors,
+        COALESCE(input_tokens, 0) AS input_tokens,
+        COALESCE(output_tokens, 0) AS output_tokens,
+        COALESCE(cache_read_tokens, 0) AS cache_read_tokens,
+        COALESCE(cache_creation_tokens, 0) AS cache_creation_tokens,
+        COALESCE(input_cost, 0) AS input_cost,
+        COALESCE(output_cost, 0) AS output_cost,
+        COALESCE(cache_read_cost, 0) AS cache_read_cost,
+        COALESCE(cache_creation_cost, 0) AS cache_creation_cost,
+        COALESCE(total_cost, 0) AS total_cost
+      FROM usage_logs
+      WHERE created_at >= ?
+    `,
+      )
+      .all(since)
   }
 
   ownerBilling({ ownerUserId = null, since = null, until = null, groupBy = 'vm' } = {}) {
@@ -687,7 +887,8 @@ export class UsageLogsRepo {
              SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END) AS fail,
              COALESCE(SUM(input_tokens), 0) AS tokens_in,
              COALESCE(SUM(output_tokens), 0) AS tokens_out,
-             COALESCE(SUM(COALESCE(actual_cost, total_cost, 0)), 0) AS cost_usd
+             COALESCE(SUM(COALESCE(actual_cost, total_cost, 0)), 0) AS cost_usd,
+             COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS official_cost_usd
       FROM usage_logs ${cond}
     `)
       .get(...params)
@@ -699,7 +900,8 @@ export class UsageLogsRepo {
              SUM(CASE WHEN ${ERROR_PRED} THEN 1 ELSE 0 END) AS fail,
              COALESCE(SUM(input_tokens), 0) AS tokens_in,
              COALESCE(SUM(output_tokens), 0) AS tokens_out,
-             COALESCE(SUM(COALESCE(actual_cost, total_cost, 0)), 0) AS cost_usd
+             COALESCE(SUM(COALESCE(actual_cost, total_cost, 0)), 0) AS cost_usd,
+             COALESCE(SUM(COALESCE(total_cost, 0)), 0) AS official_cost_usd
       FROM usage_logs ${cond}
       GROUP BY ${groupCol}
       ORDER BY cost_usd DESC
@@ -717,6 +919,7 @@ export class UsageLogsRepo {
         tokens_in: num(totals, 'tokens_in'),
         tokens_out: num(totals, 'tokens_out'),
         cost_usd: num(totals, 'cost_usd'),
+        official_cost_usd: num(totals, 'official_cost_usd'),
       },
       items: items.map((row) => ({
         vm_id: grouped === 'vm' ? row.id || null : undefined,
@@ -727,6 +930,7 @@ export class UsageLogsRepo {
         tokens_in: num(row, 'tokens_in'),
         tokens_out: num(row, 'tokens_out'),
         cost_usd: num(row, 'cost_usd'),
+        official_cost_usd: num(row, 'official_cost_usd'),
       })),
     }
   }

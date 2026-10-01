@@ -4,7 +4,8 @@
     "mode": "conversation",
     "ttl_seconds": 86400,
     "header_keys": ["x-session-id", "x-conversation-id", "x-claude-code-session-id", "session-id", "thread-id"],
-    "body_keys": ["conversation_id", "session_id", "thread_id", "prompt_cache_key"]
+    "body_keys": ["conversation_id", "session_id", "thread_id", "prompt_cache_key"],
+    "outbound_session": "rebuild"
   },
   "concurrency": {
     "default_max_per_account": 2,
@@ -67,14 +68,20 @@
   "pool": {
     "strategy": "weighted-round-robin",
     "manual_schedule_wins": true,
-    "max_waiters_per_account": 32,
+    "max_waiters_per_account": 100,
     "fallback_wait_timeout_ms": 30000,
     "sticky_wait_timeout_ms": 45000,
     "worker_health_ttl_ms": 5000,
-    "heartbeat_stale_ms": 15000
+    "heartbeat_stale_ms": 15000,
+    "circuit_failure_threshold": 3,
+    "circuit_open_ms": 30000
   },
   "failover": {
-    "max_total_attempts": 12
+    "max_total_attempts": 12,
+    "max_account_switches": 10,
+    "max_same_account_retries": 1,
+    "same_account_retry_delay_ms": 500,
+    "total_retry_deadline_ms": 120000
   },
   "inference": {
     "engine": "rust",
@@ -86,7 +93,8 @@
     "persona_preset": "official_full",
     "overlay_preset": "off",
     "persona_park": false,
-    "cache_ttl": "1h"
+    "cache_ttl": "1h",
+    "min_max_tokens": { "enabled": true, "value": 128 }
   },
   "official_cc": {
     "enabled": true,
@@ -94,11 +102,7 @@
     "apply_seed": true,
     "reconcile_fingerprint": true,
     "sync_telemetry": true,
-    "quota_via": "usage-api",
-    "cli_stats": false,
-    "usage_fallback": false,
     "hello_prompt": "hello",
-    "stats_prompt": "/stats",
     "timeout_ms": 240000,
     "memory": "500m",
     "resident": false,
@@ -114,13 +118,14 @@
     "timeout_ms": 60000
   },
   "health_probe": {
-    "enabled": false,
+    "enabled": true,
     "interval_sec": 600,
     "cache_ttl_sec": 900,
     "max_stale_sec": 900,
     "cache_models": [],
     "cache_model": "",
     "intercept_unofficial": true,
+    "intercept_warmup": true,
     "fail_closed": true,
     "run_on_start": true,
     "real": {
@@ -149,7 +154,7 @@
     "digest_sec": 21600,
     "min_available": 1,
     "run_on_start": true,
-    "console_url": "https://ccmax20.cc",
+    "console_url": "",
     "events": {
       "pool_empty": true,
       "pool_low": true,

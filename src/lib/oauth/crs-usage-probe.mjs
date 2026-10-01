@@ -13,7 +13,9 @@ import {
   usageFablePresence,
 } from './usage-interpret.mjs'
 
-export const FABLE_PROBE_MODEL = 'claude-fable-5'
+/** Current Max model first; the previous id is only a fallback when this one is missing. */
+export const FABLE_TIER_MODELS = Object.freeze(['claude-fable-5-1', 'claude-fable-5'])
+export const FABLE_PROBE_MODEL = FABLE_TIER_MODELS[0]
 export const OAUTH_USAGE_PATH = '/api/oauth/usage'
 /** sub2api Extra / Messages 响应头被动采样，不打 GET /api/oauth/usage。 */
 export const PASSIVE_HEADER_SOURCE = 'messages-headers'
@@ -128,6 +130,24 @@ export function parseOAuthUsage(data = {}) {
   }
 }
 
+export function isCompleteOAuthUsage(data = {}, parsed = null) {
+  const p = parsed || parseOAuthUsage(data)
+  if (!p.five_hour || !p.seven_day) return false
+  if (p.usage_has_fable !== null) return true
+  return (
+    data.seven_day_fable === null ||
+    data.seven_day_oi === null ||
+    data.seven_day_overage_included === null ||
+    Array.isArray(data.limits) ||
+    Array.isArray(data.model_scoped)
+  )
+}
+
+function usageScopeMissing(res = {}) {
+  const msg = String(res.body?.error?.message || res.body?.error || '')
+  return Number(res.status || 0) === 403 && /scope requirement|does not meet scope|user:profile/i.test(msg)
+}
+
 export function parseFableProbe({ status, body, transportError, headers } = {}) {
   const err = body?.error || {}
   const msg = String(err.message || body?.message || err.code || '')
@@ -233,6 +253,56 @@ export function parseUsageRetryAfterMs(headers = {}, body = {}) {
   return n > 180 ? n : n * 1000
 }
 
+/**
+ * Fable hop results, in attempt order.
+ * 200 is Max. 403 on every tried model is Pro.
+ * 429 is not Pro and not Max: a Pro hop can be rate-limited too.
+ * A transport error or a revoked grant does not classify the plan.
+ */
+export function tierFromFableAttempts(attempts = []) {
+  let denied = null
+  let limited = null
+  for (const fable of attempts) {
+    if (!fable) continue
+    if (fable.transport) return { tier: null, fable }
+    if (fable.ok) return { tier: 'max', fable }
+    if (fable.banned) return { tier: null, fable }
+    if (fable.limited) {
+      limited = fable
+      continue
+    }
+    if (fable.plan_denied) denied = fable
+  }
+  if (denied && !limited) return { tier: 'pro', fable: denied }
+  return { tier: null, fable: limited || denied || attempts.filter(Boolean).at(-1) || null }
+}
+
+/** Messages hop that Setup Token can run. Official /usage is not required. */
+export async function probeFableEntitlement({
+  exec,
+  timeoutMs = 20000,
+  identity = null,
+  models = FABLE_TIER_MODELS,
+} = {}) {
+  const attempts = []
+  for (const model of models) {
+    const fableRes = await callGoWorker({
+      exec,
+      timeoutMs,
+      identity,
+      body: {
+        model,
+        max_tokens: 1,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+    })
+    const fable = { ...parseFableProbe(fableRes), model }
+    attempts.push(fable)
+    if (fable.transport || fable.ok || fable.banned) break
+  }
+  return tierFromFableAttempts(attempts)
+}
+
 /** Official /usage 429 is quota-API throttling, not a dead grant. */
 export function isOfficialUsageRateLimited(probe = {}) {
   if (!probe || typeof probe !== 'object') return false
@@ -286,6 +356,7 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       source: 'official-cc-usage',
       via: 'crs-mock',
       interpretations: compareUsageInterpretations(raw),
+      limits_present: true,
       ...parsed,
       five_hour: official.five_hour || parsed.five_hour,
       seven_day: official.seven_day || parsed.seven_day,
@@ -313,6 +384,7 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       usage_error: usageRes.body?.error?.message || usageRes.body?.error,
       rate_limited: false,
     })
+  const usageMissingScope = usageScopeMissing(usageRes)
   const rawBody = usageRes.ok && usageRes.body && typeof usageRes.body === 'object' ? usageRes.body : {}
   const official = usageRes.ok ? interpretOfficialUsage(rawBody) : null
   const parsed = usageRes.ok
@@ -328,20 +400,10 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
       }
 
   let fable = null
-  if (includeFable) {
-    const fableRes = await callGoWorker({
-      exec,
-      timeoutMs,
-      identity,
-      body: {
-        model: FABLE_PROBE_MODEL,
-        max_tokens: 1,
-        messages: [{ role: 'user', content: 'hi' }],
-      },
-      // Do not send inbound anthropic-beta — unofficial probes must replay
-      // the slot's stored Claude Code betas, not overwrite them.
-    })
-    fable = parseFableProbe(fableRes)
+  if (includeFable && !usageMissingScope) {
+    // Do not send inbound anthropic-beta — unofficial probes must replay
+    // the slot's stored Claude Code betas, not overwrite them.
+    fable = (await probeFableEntitlement({ exec, timeoutMs, identity })).fable
     const hasFableUsage = parsed.usage_has_fable === true || !!parsed.seven_day_oi
     // Usage listing a Fable model is Max. Hop 401/403 is format noise, not Pro.
     if (usageRes.ok && fable && hasFableUsage) {
@@ -374,9 +436,14 @@ export async function probeVmUsage({ exec, includeFable = true, timeoutMs = 2000
     source: 'official-cc-usage',
     via: usageRes.via || 'go-worker',
     usage_status: usageRes.status,
+    limits_present: usageRes.ok ? isCompleteOAuthUsage(rawBody, parsed) : false,
+    usage_scope_missing: usageMissingScope,
+    credential_scope_required: usageMissingScope ? 'user:profile' : null,
     usage_error: usageRes.ok
       ? null
-      : usageRes.body?.error?.message || usageRes.body?.error || `http_${usageRes.status}`,
+      : usageMissingScope
+        ? '当前凭证缺少 user:profile scope，需导入完整 OAuth 后才能探测官方 /usage'
+        : usageRes.body?.error?.message || usageRes.body?.error || `http_${usageRes.status}`,
     ...parsed,
     five_hour: official?.five_hour || parsed.five_hour,
     seven_day: official?.seven_day || parsed.seven_day,

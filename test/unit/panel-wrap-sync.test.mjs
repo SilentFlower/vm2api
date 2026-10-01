@@ -20,6 +20,7 @@ function seedWrapTemplate(project) {
   const template = path.join(project, 'share', 'wrap-cli')
   fs.mkdirSync(template, { recursive: true })
   fs.writeFileSync(path.join(template, 'cli-node'), 'cli-node')
+  fs.writeFileSync(path.join(template, 'cc-node'), 'cc-node')
   fs.writeFileSync(path.join(template, 'kin-kernel'), 'kin-kernel')
 }
 
@@ -143,7 +144,16 @@ test('kernel upload rejects non-ELF payloads', async () => {
   }
 })
 
-function releaseFetch(elf, { assetBytes = elf, status = 200 } = {}) {
+function releaseFetch(
+  elf,
+  {
+    assetBytes = elf,
+    cliBytes = fakeElf64Amd64('github-cli-node'),
+    ccBytes = fakeElf64Amd64('github-cc-node'),
+    cragBytes = fakeElf64Amd64('github-crag'),
+    status = 200,
+  } = {},
+) {
   return async (url) => {
     const href = String(url)
     if (href.endsWith('/releases/latest')) {
@@ -156,6 +166,21 @@ function releaseFetch(elf, { assetBytes = elf, status = 200 } = {}) {
               size: assetBytes.length,
               url: 'https://api.github.com/repos/dofastted/vm2api/releases/assets/9',
             },
+            {
+              name: 'cli-node',
+              size: cliBytes.length,
+              url: 'https://api.github.com/repos/dofastted/vm2api/releases/assets/8',
+            },
+            {
+              name: 'cc-node',
+              size: ccBytes.length,
+              url: 'https://api.github.com/repos/dofastted/vm2api/releases/assets/7',
+            },
+            {
+              name: 'kin-kernel-crag',
+              size: cragBytes.length,
+              url: 'https://api.github.com/repos/dofastted/vm2api/releases/assets/6',
+            },
           ],
         }),
         { status: 200, headers: { 'content-type': 'application/json' } },
@@ -165,6 +190,24 @@ function releaseFetch(elf, { assetBytes = elf, status = 200 } = {}) {
       return new Response(assetBytes, {
         status,
         headers: { 'content-length': String(assetBytes.length) },
+      })
+    }
+    if (href.endsWith('/releases/assets/8')) {
+      return new Response(cliBytes, {
+        status: 200,
+        headers: { 'content-length': String(cliBytes.length) },
+      })
+    }
+    if (href.endsWith('/releases/assets/7')) {
+      return new Response(ccBytes, {
+        status: 200,
+        headers: { 'content-length': String(ccBytes.length) },
+      })
+    }
+    if (href.endsWith('/releases/assets/6')) {
+      return new Response(cragBytes, {
+        status: 200,
+        headers: { 'content-length': String(cragBytes.length) },
       })
     }
     throw new Error(`unexpected ${href}`)
@@ -211,6 +254,15 @@ test('github kernel release replaces host kernel and syncs stopped slots', async
     assert.equal(response.body.data.sync.items[0].kernel.reason, 'vm_stopped')
     assert.ok(fs.readFileSync(path.join(project, 'bin', 'kin-kernel')).equals(elf))
     assert.ok(fs.readFileSync(path.join(project, 'share', 'wrap-cli', 'kin-kernel.bin')).equals(elf))
+    assert.ok(
+      fs.readFileSync(path.join(project, 'share', 'wrap-cli', 'cli-node')).equals(fakeElf64Amd64('github-cli-node')),
+    )
+    assert.ok(
+      fs.readFileSync(path.join(project, 'share', 'wrap-cli', 'cc-node')).equals(fakeElf64Amd64('github-cc-node')),
+    )
+    assert.ok(fs.readFileSync(path.join(project, 'share', 'crag', 'kin-kernel')).equals(fakeElf64Amd64('github-crag')))
+    assert.equal(response.body.data.release.cli_node, 'cli-node')
+    assert.equal(response.body.data.release.cc_node, 'cc-node')
     assert.ok(
       fs.readFileSync(path.join(project, 'vms', 'legacy-slot', 'cli-home', '.kin', 'kin-kernel.bin')).equals(elf),
     )

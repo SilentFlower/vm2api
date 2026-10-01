@@ -11,18 +11,26 @@
 | 角色 | 页面 | 能力 |
 |------|------|------|
 | `user` | 虚拟机 / 代理池 / 密钥 / 计费 / 日志 | 只管自己的 VM、代理、key；自建配额 `vm_create_quota` 0–100；不能调度平台池 |
-| `super` | 总览 / 集群 / 用量 / 日志 + 虚拟机 | 读 VM + 拨调度 / 清冷却 |
-| `admin` | 全部（不含用户管理页） | `*`。admin/master **未 pin** 的 `/v1` 只打未分配平台池 |
+| `super` | 总览 / 集群 / 用量 / 日志 + 虚拟机 | 读 VM + 拨调度 / 清冷却；集群只读节点列表 |
+| `admin` | 全部 | `*`。可管理用户 VM，但 admin/master **未 pin** 的 `/v1` 只打未分配平台池 |
 
-开源仓 **没有用户管理**。登录只用环境变量 `VM2API_ADMIN_USER` / `VM2API_ADMIN_PASSWORD` 灌进去的第一个 admin。`GET/POST/PATCH/DELETE /users` 返回 `404 not_found`。
+环境变量 `VM2API_ADMIN_USER` / `VM2API_ADMIN_PASSWORD` 只在库里还没有同名用户时灌进第一个 admin；之后以 SQLite `users` 为准，面板「用户」页可增删改、改密码。密码 scrypt。不能删/停用最后一个 admin。
 
 `vms/*.json` 的 `owner_user_id` / `origin`（`platform` \| `admin_assigned` \| `user_created`）是属主 SSOT。`PATCH /vms/:id/owner` 仅 admin。自建 VM 不能收回进平台池。
 
-## 计费
+## 用户
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/billing` | 计费汇总。`from`/`until`/`group_by=vm|key` |
+| GET | `/users` | 列表（含 `vm_create_quota`） |
+| POST | `/users` | `{ username, password, role, enabled, vm_create_quota? }` |
+| PATCH | `/users/:id` | 改角色/密码/启用/配额；改密会撤销该用户其它会话 |
+| DELETE | `/users/:id` | |
+| PATCH | `/vms/:id/owner` | admin：`{ user_id }` 分配，`{ user_id: null }` 收回（仅 `admin_assigned`） |
+| GET | `/billing` | 用户计费汇总。`from`/`until`/`group_by=vm|key`。user 隐式只看自己；admin 可 `user_id=` |
+
+
+用户名 `^[a-zA-Z][a-zA-Z0-9._-]{1,31}$`，密码 8–128。`vm_create_quota` 整数 0–100，默认 0。
 
 ## 总览 / 槽位
 
@@ -30,7 +38,7 @@
 |------|------|------|
 | GET | `/dashboard` | 总览：健康、KPI、`proxy_pool`、`ops`（默认近 1h SLA/TTFT）、`billing` |
 | GET | `/vms` | 列表（`has_token`、`cred_status`、`proxy_configured`、`can_import_credential`、`account_tier`、`schedule_level`、`schedule_level_mode`、`worker_credential`、Fable 轨） |
-| GET | `/vms/:id` | 详情 + 调度等级 + 代理健康 + `billing.today/window_5h/window_7d/by_model` + `account.runtime_window` |
+| GET | `/vms/:id` | 详情 + 调度等级 + 代理健康 + `billing.today/window_5h/window_7d/by_model/usage_stats`（`usage_stats` = 近 30 个上海自然日的按日用量 + 模型 / 入站路径排名，日界同 `billing.today`） + `account.runtime_window` |
 | PATCH | `/vms/:id` | 热改并发、模型白名单、槽策略、`schedule_level` 或 `timezone`（不重启槽）。`timezone` 为任意有效 IANA 名称，会钉住该槽（后续绑定不覆盖）；`timezone_follow_proxy: true` 重新跟随已绑代理的出口时区 |
 | POST | `/vms/:id/probe` | 槽 SOCKS5 探官方 `/usage` + Fable（Pro 跳过 Fable） |
 | POST | `/vms/:id/schedulable` | `{ schedulable }` 是否入池；不改容器 |
@@ -132,6 +140,10 @@
 
 `compatibility.persona_preset`（`official` / `official_full` / `zero` / `custom`）和 `compatibility.cache_ttl`（`5m` / `1h`）保存后投影到每个 Claude 槽的 `vms/<id>/run/kernel.json`：`persona_preset`、`system_layout`（`zero`→`zero`，其余→`identity`）、`default_cache_ttl`。响应 `kernel_persona.updated` 是本次字节有变化的槽数。`PATCH /vms/:id` 的 `timezone` / `timezone_follow_proxy` 另把 `timezone` 热写进该槽 `kernel.json`，`timezone_sync.kernel_hot` 表示文件有变化。容器 `TZ` 不在这次写入里。Codex 槽不写。
 
+`compatibility.agent_standing`（字符串，≤2000）与四个按档布尔 map `agent_standing_presets` / `agent_standing_hide_presets` / `persona_env_presets` / `persona_hide_presets` 控制常驻约束、约束遮罩、Environment 和整档 usage 遮罩，不投影到 `kernel.json`，Node 每次请求热读。`GET /api/panel/persona/preview-vars?timezone=<IANA>` 返回 system提示词页预览用的真实模板常量（身份句、官方 agent 全文、按该时区渲染的 Environment），不含 billing；时区非法或缺省按 UTC。
+
+`agent_standing_presets` 缺 map/key 默认关闭，只有显式 `true` 启用；`agent_standing` 内置文本保持不变。约束遮罩与 Environment 开关缺省仍为开启，整档遮罩仍回落既有模板/旧设置。保存显式开启的档位不改变其他缺省关闭的档位。
+
 ## 蒸馏拦截
 
 | 方法 | 路径 | 说明 |
@@ -214,6 +226,8 @@ Claude 槽测试与能力探针走官方 CC 入站（`/v1/messages`）。GPT/Cod
 
 `PUT /proxies/config` 的 `follow_proxy_timezone`（默认 true）：绑定一条代理后，该槽采用出口节点的 IANA 时区（persona `# Environment`、指纹、容器 `TZ`）。操作者在创建时或 `PATCH /vms/:id` 手动指定过时区的槽不受影响。
 
+`PUT /proxies/config` 的 `dns_primary`（默认 `auto`）：远程 SOCKS5 透明出口优先使用的 DNS 上游，可选 `auto`、`https://1.1.1.1/dns-query`、`https://8.8.8.8/dns-query`、`8.8.8.8:53`、`1.1.1.1:53`。所选上游排第一，其余内置上游按默认顺序排在其后作为自动 fallback；`auto` 直接用 kin-egress 内置顺序。`IP:53` 为经 SOCKS 转发的 DNS-over-TCP，出口到 DNS 服务器之间明文。变更后重载已绑定的 `kin-egress`，不重建槽位，响应 `egress` 数组报告各出口重载结果。
+
 ### `POST /proxies/geo` · `POST /proxies/:id/geo`
 
 经该代理本身去查出口 IP 的国家 / 城市 / 时区（本地出口走宿主机默认路由）。结果落在 `proxies.geo_*` 列，列表响应的 `geo` 字段回显。单条成功后，已绑槽位在 `follow_proxy_timezone` 开启且未被手动钉住时会改用该时区。
@@ -243,6 +257,31 @@ Claude 槽测试与能力探针走官方 CC 入站（`/v1/messages`）。GPT/Cod
 > 除此之外，任何 `/api/panel/*` 响应都不得包含代理账密；`GET /proxies` 永不返回（`publicProxy()` 只吐 `has_auth` 布尔）。
 
 sessionKey / 授权码导入必须走该槽 SOCKS5。
+
+## 集群（SSH 节点，仅 admin；super 只读 `GET /cluster/nodes`）
+
+控制面主动拨 SSH（出站 22），本机在 NAT 后也能接入；远端在 NAT 后时 `jump_node_id` 经已接入节点跳转。远端 Docker 走 SSH `direct-streamlocal` 转发 `/var/run/docker.sock`，dockerd 不开 TCP、远端不装 agent。
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/cluster/nodes` | 节点 + `link`（`idle/connecting/ready/backoff/error`）+ `health`（SSH 往返延迟、Docker 可用性）+ `bridge` |
+| GET | `/cluster/local` | 控制面自身链路：`control`（进程 / 容器 + `network_mode`、监听地址）、`nat`（直连就绪节点看到的 `$SSH_CLIENT` 作公网出口，与本机网卡比对得 `behind_nat`；同一节点回连面板端口得 `inbound`：`open/closed/loopback`）、`docker`（本机 daemon、槽容器数）。服务端缓存 30s，`?refresh=1` 强制重测。super 可读 |
+| POST | `/cluster/nodes/probe` | `{ host, port, username, auth_type: key\|password, private_key?, passphrase?, password?, jump_node_id? }` → `{ host_key, docker, uname, existing_id }`，拨一次即断 |
+| POST | `/cluster/nodes` | probe 同体 + `host_key_sha256`（必须，TOFU 固定）+ `host_key_alg`、`label` |
+| GET / DELETE | `/cluster/nodes/:id` | 删除前不能有节点经它跳转；远端容器不动 |
+| POST | `/cluster/nodes/:id/reconnect` | 清掉 `error` 与退避，立刻重连 |
+| POST | `/cluster/nodes/:id/shell-ticket` | 30 秒一次性终端票据 |
+| WS | `/cluster/nodes/:id/shell?ticket=&cols=&rows=` | 客户端发 `{"t":"d","d":"…"}` 输入、`{"t":"r","c":列,"r":行}` 改尺寸；服务端二进制帧为终端输出，文本帧 `{"t":"exit"\|"error"}` |
+| GET | `/cluster/nodes/:id/docker/info` | 版本 / 系统 / 容器数 |
+| POST / GET | `/cluster/nodes/:id/docker/install` | get.docker.com 安装并把登录用户加进 docker 组，完成后自动重连；非 root 需免密 sudo |
+| GET / POST | `/cluster/nodes/:id/docker/containers` | 列表（含已停止）/ 创建并启动 `{ image, name?, ports?: ["8080:80[/udp]"], env?: ["K=v"], restart? }`，本地没有镜像先拉 |
+| POST | `/cluster/nodes/:id/docker/containers/:cid/{start,stop,restart}` | |
+| DELETE | `/cluster/nodes/:id/docker/containers/:cid` | 强删（含匿名卷） |
+| GET | `/cluster/nodes/:id/docker/containers/:cid/logs?tail=` | `{ tty, lines: [{ stream, text }] }`，tail 1–5000 |
+
+- 链路：keepalive 10s × 3；断开后 1s 起指数退避（±20% 抖动，封顶 60s）。**指纹不符 / 认证失败不自动重试**，停在 `error` 等人工重连。
+- 凭证（私钥、口令、密码）存 `cluster_nodes`，设了 `VM2API_DB_SECRET` 即 AES-256-GCM 加密；任何响应都不回传。
+- 本机 Docker 桥：每个节点在 `<data>/cluster/<id>/docker.sock`（0600）监听，`docker -H unix://…/docker.sock ps` 直接操作远端 daemon。数据目录所在文件系统不支持 unix socket（如 WSL `/mnt/*`）时设 `VM2API_CLUSTER_SOCKET_DIR`。
 
 ## 管理口（master）
 

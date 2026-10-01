@@ -223,12 +223,12 @@ export class AccountRuntimeRepo {
       current.cooldown_until = Number(until) || null
       current.cooldown_reason = reason || null
       // Structured mirror of the protocol-level limit (sub2api account columns).
+      // overload_until is only the 529 hard column (RateLimitService.handle529).
+      // A 502 failover also uses reason provider_overloaded for 15s; writing it
+      // here paints every hopped VM as 过载冷却 and removes them from the pool.
       if (/rate_limited|quota_exhausted/i.test(String(reason || ''))) {
         current.rate_limited_at = Date.now()
         current.rate_limit_reset_at = Number(until) || null
-      }
-      if (/overload/i.test(String(reason || ''))) {
-        current.overload_until = Number(until) || null
       }
     }
     return this.upsert(current)
@@ -302,6 +302,14 @@ export class AccountRuntimeRepo {
         state.status = 'ready'
         state.cooldown_until = null
         state.cooldown_reason = null
+        changed = true
+      }
+      if (state.rate_limit_reset_at && state.rate_limit_reset_at <= now) {
+        state.rate_limit_reset_at = null
+        changed = true
+      }
+      if (state.overload_until && state.overload_until <= now) {
+        state.overload_until = null
         changed = true
       }
       const models = { ...(state.model_states || {}) }

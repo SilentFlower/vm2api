@@ -2,14 +2,12 @@
 .github
 node_modules
 web/node_modules
-web/dist
 bin/*
 !bin/kin-kernel
 !bin/kin-egress
 !bin/kin-worker
 !bin/kin-codex-kernel
-!bin/kin-cookie-auth
-share/*
+!bin/kin-oauth-auth
 !share/wrap-cli
 !share/wrap-cli/**
 vms
@@ -20,6 +18,11 @@ data
 docs/images
 test
 crates
+patches
+.local
+local-src
+skills
+src/lib/oauth/auth.js
 worker/bin
 *.md
 !README.md

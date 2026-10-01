@@ -8,12 +8,15 @@ class Scheduler {
     this.candidates = candidates
     this.cooldowns = []
     this.successes = []
+    this.releasedAccounts = []
     this.selectCalls = 0
   }
 
-  async selectAndReserve({ excluded }) {
+  async selectAndReserve({ excluded, avoid = null, allowWait = true }) {
     this.selectCalls++
-    const candidate = this.candidates.find((item) => !excluded.has(item.accountId) && !excluded.has(item.vmId))
+    const open = this.candidates.filter((item) => !excluded.has(item.accountId) && !excluded.has(item.vmId))
+    const preferred = avoid ? open.filter((item) => !avoid.has(item.accountId) && !avoid.has(item.vmId)) : open
+    const candidate = preferred[0] || (allowWait ? open[0] : null)
     if (!candidate) return { ok: false, reason: 'no_eligible_accounts' }
     return { ...candidate, ok: true, release() {} }
   }
@@ -24,6 +27,10 @@ class Scheduler {
 
   markSuccess(candidate) {
     this.successes.push(candidate)
+  }
+
+  releaseAccountSessions(value) {
+    this.releasedAccounts.push(value)
   }
 }
 
@@ -67,13 +74,11 @@ test('account1 quota exhausted rotates to account2 and commits final sticky', as
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const attempts = new Attempts()
   const bindings = []
-  const unbound = []
   const runner = new FailoverRunner({
     scheduler,
     attemptsRepo: attempts,
     stickyRouter: {
       bind: (key, value, opts) => bindings.push({ key, value, opts }),
-      unbindByAccount: (value) => unbound.push(value),
     },
   })
   const seen = []
@@ -109,7 +114,7 @@ test('account1 quota exhausted rotates to account2 and commits final sticky', as
   ])
   assert.equal(scheduler.cooldowns.length, 1)
   assert.equal(scheduler.cooldowns[0].candidate.accountId, 'account-1')
-  assert.deepEqual(unbound, [{ accountId: 'account-1', vmId: 'vm-01' }])
+  assert.deepEqual(scheduler.releasedAccounts, [{ accountId: 'account-1', vmId: 'vm-01' }])
   const commits = bindings.filter((b) => b.opts?.countHit !== false)
   assert.ok(bindings.some((b) => b.value.accountId === 'account-1' && b.opts?.countHit === false))
   assert.deepEqual(commits, [
@@ -125,13 +130,13 @@ test('account1 quota exhausted rotates to account2 and commits final sticky', as
 
 test('slot_busy spill serves the turn elsewhere but keeps the session pinned', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
+  scheduler.releaseAccountSessions = () => assert.fail('capacity spill must not unbind')
   const pins = new Map([['conversation-1', { accountId: 'account-1', vmId: 'vm-01' }]])
   const runner = new FailoverRunner({
     scheduler,
     stickyRouter: {
       resolve: (key) => pins.get(key) || null,
       bind: (key, value) => pins.set(key, value),
-      unbindByAccount: () => assert.fail('capacity spill must not unbind'),
     },
   })
   const result = await runner.run({
@@ -152,6 +157,32 @@ test('slot_busy spill serves the turn elsewhere but keeps the session pinned', a
   assert.equal(result.ok, true)
   assert.equal(result.accountId, 'account-2')
   assert.deepEqual(pins.get('conversation-1'), { accountId: 'account-1', vmId: 'vm-01' })
+})
+
+test('#A20: a late completion never writes back a pin another request released', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const pins = new Map([['conversation-1', { accountId: 'account-1', vmId: 'vm-01', generation: 3 }]])
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: {
+      resolve: (key) => pins.get(key) || null,
+      bind: (key, value) => pins.set(key, { ...value, generation: (pins.get(key)?.generation || 0) + 1 }),
+    },
+  })
+  const result = await runner.run({
+    requestId: 'req-late',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'conversation-1',
+    callAttempt: () => {
+      // While this hop streams, a quota exclusion elsewhere releases the pin.
+      pins.delete('conversation-1')
+      return success()
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-1')
+  assert.equal(pins.has('conversation-1'), false)
 })
 
 test('verified hop binds family and session sticky keys to the same account', async () => {
@@ -175,6 +206,46 @@ test('verified hop binds family and session sticky keys to the same account', as
   const commits = bindings.filter((b) => b.opts?.countHit !== false)
   assert.deepEqual(commits.map((b) => b.key).sort(), ['child-sess', 'dev:aabbcc'])
   assert.ok(commits.every((b) => b.value.accountId === 'account-1' && b.value.vmId === 'vm-01'))
+})
+
+test('probe hop passes skipSessionSeat and only updates device affinity', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const selectCalls = []
+  const select = scheduler.selectAndReserve.bind(scheduler)
+  scheduler.selectAndReserve = async (opts) => {
+    selectCalls.push(opts)
+    return select(opts)
+  }
+  const sessionBindings = []
+  const deviceBindings = []
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: {
+      resolve: (key) => (key === 'dev2:device-1' ? { vmId: 'vm-01', accountId: 'account-1' } : null),
+      bind: (key, value, opts) => sessionBindings.push({ key, value, opts }),
+      bindDeviceAffinity: (key, value, opts) => deviceBindings.push({ key, value, opts }),
+    },
+  })
+  const result = await runner.run({
+    requestId: 'req-probe-seatless',
+    canonicalBody: { model: 'claude-haiku-test' },
+    model: 'claude-haiku-test',
+    stickyKey: null,
+    stickyKeys: [],
+    stickyDeviceId: 'device-1',
+    deviceKey: 'dev2:device-1',
+    skipSessionSeat: true,
+    callAttempt: () => success(),
+  })
+  assert.equal(result.ok, true)
+  assert.equal(selectCalls.length, 1)
+  assert.equal(selectCalls[0].skipSessionSlot, true)
+  assert.equal(selectCalls[0].stickyKey, null)
+  assert.deepEqual(selectCalls[0].stickyKeys, [])
+  assert.equal(selectCalls[0].deviceVmId, 'vm-01')
+  assert.deepEqual(sessionBindings, [])
+  assert.equal(deviceBindings.length, 2)
+  assert.ok(deviceBindings.every((binding) => binding.key === 'dev2:device-1'))
 })
 
 test('verified hop stores the outbound session on every sticky alias', async () => {
@@ -249,7 +320,7 @@ test('committed realtime stream failure never switches accounts', async () => {
   assert.equal(scheduler.selectCalls, 1)
 })
 
-test('committed incomplete hop drops the session window immediately', async () => {
+test('committed incomplete hop keeps the session window', async () => {
   const sessions = new SessionLimitRegistry()
   sessions.touch('account-1', 'conversation-1')
   const scheduler = new Scheduler([candidate(1), candidate(2)])
@@ -272,7 +343,7 @@ test('committed incomplete hop drops the session window immediately', async () =
     },
   })
   assert.equal(result.finalState, 'incomplete')
-  assert.equal(sessions.snapshot('account-1').active, 0)
+  assert.equal(sessions.snapshot('account-1').active, 1)
 })
 
 test('cloudflare 403 does not trigger SOCKS disconnect', async () => {
@@ -472,8 +543,15 @@ test('cli-hop rust slot repairs signature 400 even when signature_repair is off'
   assert.equal(calls, 2)
 })
 
-test('thinking-only hop retries same account and returns the later text', async () => {
+test('thinking-only hop moves to the next slot and returns the later text', async () => {
   const scheduler = new Scheduler([candidate(1)])
+  let n = 0
+  const select = scheduler.selectAndReserve.bind(scheduler)
+  scheduler.selectAndReserve = async (args) => {
+    const selected = await select(args)
+    if (selected?.ok) selected.slotIndex = n++
+    return selected
+  }
   const runner = new FailoverRunner({
     scheduler,
     config: { same_account_retry_delay_ms: 0 },
@@ -509,9 +587,17 @@ test('thinking-only hop retries same account and returns the later text', async 
   assert.equal(result.body.stop_reason, 'end_turn')
 })
 
-test('repeated incomplete hop stops on the original VM after one recovery', async () => {
+test('a replayable incomplete hop tries a free VM before repeating the same one', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const runner = new FailoverRunner({ scheduler, config: { same_account_retry_delay_ms: 0 } })
+  const parked = []
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+    rateLimitService: {
+      handleUpstreamError: () => null,
+      tempUnschedule: (item) => parked.push(item),
+    },
+  })
   const seen = []
   const result = await runner.run({
     requestId: 'req-incomplete-affinity',
@@ -520,6 +606,7 @@ test('repeated incomplete hop stops on the original VM after one recovery', asyn
     stickyKey: 'session-affinity',
     callAttempt: ({ candidate: selected }) => {
       seen.push(selected.vmId)
+      if (selected.vmId === 'vm-02') return success('recovered')
       return {
         ok: false,
         status: 200,
@@ -529,13 +616,122 @@ test('repeated incomplete hop stops on the original VM after one recovery', asyn
       }
     },
   })
-  assert.equal(result.ok, false)
+  assert.equal(result.ok, true)
+  assert.equal(result.vmId, 'vm-02')
+  assert.equal(result.attemptCount, 2)
+  assert.deepEqual(seen, ['vm-01', 'vm-02'])
+  assert.deepEqual(parked, [])
+})
+
+test('pinned incomplete hop still stops on the pinned VM', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler, config: { same_account_retry_delay_ms: 0 } })
+  const result = await runner.run({
+    requestId: 'req-incomplete-pin',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    pinVmId: 'vm-01',
+    callAttempt: () => ({
+      ok: false,
+      status: 200,
+      committed: false,
+      terminalState: 'incomplete',
+      body: { type: 'message', role: 'assistant', content: [], stop_reason: null },
+    }),
+  })
   assert.equal(result.status, 502)
   assert.equal(result.body.error.code, 'incomplete_response')
-  assert.equal(result.attemptCount, 2)
   assert.equal(result.vmId, 'vm-01')
-  assert.deepEqual(seen, ['vm-01', 'vm-01'])
-  assert.equal(scheduler.selectCalls, 2)
+})
+
+test('aborted signal stops before another account is tried', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler, config: { same_account_retry_delay_ms: 0 } })
+  const seen = []
+  const signal = AbortSignal.abort()
+  const result = await runner.run({
+    requestId: 'req-cancel',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    signal,
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.vmId)
+      return success('should not run')
+    },
+  })
+  assert.equal(result.body.error.code, 'client_cancelled')
+  assert.equal(result.status, 499)
+  assert.deepEqual(seen, [])
+  assert.equal(scheduler.cooldowns.length, 0)
+})
+
+test('client cancellation preserves sticky session and skips account cleanup', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const controller = new AbortController()
+  const result = await new FailoverRunner({
+    scheduler,
+    stickyRouter: {},
+    config: { same_account_retry_delay_ms: 0 },
+  }).run({
+    requestId: 'req-cancel-preserve-session',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'parent-session',
+    signal: controller.signal,
+    callAttempt: () => {
+      controller.abort()
+      return {
+        ok: false,
+        status: 499,
+        clientCancelled: true,
+        terminalState: 'cancelled',
+        body: { type: 'error', error: { code: 'client_cancelled', message: 'Client closed the connection' } },
+      }
+    },
+  })
+  assert.equal(result.status, 499)
+  assert.equal(result.body.error.code, 'client_cancelled')
+  assert.deepEqual(scheduler.releasedAccounts, [])
+})
+
+test('streamed plan limit writes the hard block and rotates to another account', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const blocks = []
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+    rateLimitService: {
+      handleUpstreamError: ({ accountId, policy }) => {
+        if (policy.reason !== 'account_quota_exhausted') return null
+        blocks.push({ accountId, reason: policy.reason })
+        return { kind: 'rate_limited', until: 9_999_999_999_999 }
+      },
+      tempUnschedule: () => {},
+    },
+  })
+  const seen = []
+  const result = await runner.run({
+    requestId: 'req-plan-limit',
+    canonicalBody: { model: 'claude-haiku-test' },
+    model: 'claude-haiku-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.accountId)
+      if (selected.accountId === 'account-2') return success('other account')
+      return {
+        ok: false,
+        status: 429,
+        committed: false,
+        terminalState: 'rejected',
+        body: { type: 'error', error: { type: 'api_error', message: "You've hit your limit · resets 11am (UTC)" } },
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.accountId, 'account-2')
+  assert.deepEqual(seen, ['account-1', 'account-2'])
+  assert.deepEqual(blocks, [{ accountId: 'account-1', reason: 'account_quota_exhausted' }])
+  const cooled = scheduler.cooldowns.find((item) => item.candidate.accountId === 'account-1')
+  assert.equal(cooled.update.until, 9_999_999_999_999)
 })
 
 test('fast 502 retries the same account once without cooldown', async () => {
@@ -561,10 +757,9 @@ test('fast 502 retries the same account once without cooldown', async () => {
   assert.notEqual(result.body.error.code, 'server_overloaded')
   assert.deepEqual(seen, ['account-1', 'account-1'])
   assert.equal(scheduler.cooldowns.length, 0)
-  assert.equal(scheduler.selectCalls, 3)
 })
 
-test('502 rotates to another account after one same-account retry', async () => {
+test('a retryable 502 moves to a free account before retrying the same one', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const runner = new FailoverRunner({
     scheduler,
@@ -583,7 +778,7 @@ test('502 rotates to another account after one same-account retry', async () => 
   })
   assert.equal(result.ok, true)
   assert.equal(result.accountId, 'account-2')
-  assert.deepEqual(seen, ['account-1', 'account-1', 'account-2'])
+  assert.deepEqual(seen, ['account-1', 'account-2'])
   assert.equal(scheduler.cooldowns.length, 0)
 })
 
@@ -639,10 +834,9 @@ test('pin 401 without refresh does not forever-park the slot', async () => {
 
 test('401 without refresh disables that slot then hops', async () => {
   const scheduler = new Scheduler([{ ...candidate(1), hasRefresh: false }, candidate(2)])
-  const unbound = []
   const runner = new FailoverRunner({
     scheduler,
-    stickyRouter: { unbindByAccount: (value) => unbound.push(value) },
+    stickyRouter: {},
   })
   const result = await runner.run({
     requestId: 'req-401-no-rt',
@@ -664,8 +858,8 @@ test('401 without refresh disables that slot then hops', async () => {
   assert.equal(result.accountId, 'account-2')
   assert.equal(scheduler.cooldowns[0].update.reason, 'oauth_no_refresh')
   assert.equal(scheduler.cooldowns[0].update.status, 'disabled')
-  assert.ok(unbound.length >= 1)
-  assert.equal(unbound[0].accountId, 'account-1')
+  assert.ok(scheduler.releasedAccounts.length >= 1)
+  assert.equal(scheduler.releasedAccounts[0].accountId, 'account-1')
 })
 
 test('second 401 on the same generation disables the slot then hops', async () => {
@@ -705,10 +899,9 @@ test('second 401 on the same generation disables the slot then hops', async () =
 
 test('401 unbinds the dead account then continues on the next slot', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
-  const unbound = []
   const runner = new FailoverRunner({
     scheduler,
-    stickyRouter: { unbindByAccount: (value) => unbound.push(value) },
+    stickyRouter: {},
   })
   const result = await runner.run({
     requestId: 'req-401',
@@ -729,8 +922,8 @@ test('401 unbinds the dead account then continues on the next slot', async () =>
   })
   assert.equal(result.ok, true)
   assert.equal(result.accountId, 'account-2')
-  assert.ok(unbound.length >= 1)
-  assert.equal(unbound[0].accountId, 'account-1')
+  assert.ok(scheduler.releasedAccounts.length >= 1)
+  assert.equal(scheduler.releasedAccounts[0].accountId, 'account-1')
 })
 
 test('first 401 with refresh revokes the slot once then hops', async () => {
@@ -795,9 +988,9 @@ test('applyAttempt failure releases its reservation and fails over', async () =>
 
   assert.equal(result.ok, true)
   assert.equal(result.accountId, 'account-2')
-  assert.deepEqual(prepared, ['account-1', 'account-1', 'account-2'])
-  assert.equal(releases, 3)
-  assert.equal(attempts.items.length, 3)
+  assert.deepEqual(prepared, ['account-1', 'account-2'])
+  assert.equal(releases, 2)
+  assert.equal(attempts.items.length, 2)
   assert.ok(attempts.items.every((item) => item.state === 'completed'))
 })
 
@@ -864,9 +1057,11 @@ test('pool exhaustion details include the scheduler snapshot', async () => {
     model: 'claude-sonnet-test',
     callAttempt: () => success(),
   })
-  assert.equal(result.status, 503)
-  assert.equal(result.body.error.code, 'account_pool_exhausted')
-  assert.equal(result.body.error.message, 'No eligible Claude accounts remain')
+  assert.equal(result.status, 429)
+  assert.equal(result.body.error.code, 'pool_overloaded')
+  assert.equal(result.body.error.message, '号池负载过高，稍后再试')
+  assert.equal(result.retryAfterSec, 10_064)
+  assert.equal(result.attemptCount, 0)
   assert.equal(result.body.error.details.reason, 'all_accounts_busy')
   assert.equal(result.body.error.details.soonest_available_ms, 10_064_000)
   assert.equal(result.body.error.details.sticky_cleared, true)
@@ -874,33 +1069,65 @@ test('pool exhaustion details include the scheduler snapshot', async () => {
   assert.deepEqual(result.body.error.details.wait_reasons, ['account_cooldown'])
 })
 
-test('preferLastResult does not deliver thinking-only as HTTP 200', async () => {
+test('one VM gets at most three executions for a request, hidden retries included', async () => {
   const scheduler = new Scheduler([candidate(1)])
+  const seen = []
   const runner = new FailoverRunner({
     scheduler,
-    config: { max_total_attempts: 1, max_same_account_retries: 0, max_account_switches: 0 },
+    config: { same_account_retry_delay_ms: 0 },
   })
   const result = await runner.run({
-    requestId: 'req-incomplete-last',
+    requestId: 'req-incomplete-cap',
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
-    callAttempt: () => ({
-      ok: true,
-      status: 200,
-      committed: false,
-      terminalState: 'verified',
-      body: {
-        type: 'message',
-        role: 'assistant',
-        content: [{ type: 'thinking', thinking: 'draft', signature: 'sig' }],
-        stop_reason: null,
-      },
-    }),
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.vmId)
+      return {
+        ok: false,
+        status: 200,
+        committed: false,
+        terminalState: 'incomplete',
+        rust_transport_retried: seen.length === 1,
+        body: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'thinking', thinking: 'draft', signature: 'sig' }],
+          stop_reason: null,
+        },
+      }
+    },
   })
-  assert.equal(result.ok, false)
   assert.equal(result.status, 502)
   assert.equal(result.body.error.code, 'incomplete_response')
-  assert.notEqual(result.status, 200)
+  assert.equal(result.vmId, 'vm-01')
+  assert.equal(result.attemptCount, 2)
+  assert.deepEqual(seen, ['vm-01', 'vm-01'])
+})
+
+test('the fifth candidate is reached after four VMs fail', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2), candidate(3), candidate(4), candidate(5)])
+  const seen = []
+  const result = await new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0, max_total_attempts: 4, max_account_switches: 3 },
+  }).run({
+    requestId: 'req-fifth',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.vmId)
+      if (selected.vmId === 'vm-05') return success('fifth')
+      return {
+        ok: false,
+        status: 529,
+        terminalState: 'rejected',
+        body: { type: 'error', error: { type: 'overloaded_error', message: 'Overloaded' } },
+      }
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.vmId, 'vm-05')
+  assert.deepEqual(seen, ['vm-01', 'vm-02', 'vm-03', 'vm-04', 'vm-05'])
 })
 
 test('same sticky session requests execute serially', async () => {
@@ -985,4 +1212,56 @@ test('fable 403 marks pro and failovers without credential cooldown', async () =
   assert.deepEqual(denied, ['account-1'])
   assert.deepEqual(accepted, ['account-2'])
   assert.equal(scheduler.cooldowns.length, 0)
+})
+
+function leasingScheduler(candidates, cap = 2) {
+  const state = { inflight: 0, selects: [] }
+  return {
+    state,
+    async selectAndReserve(opts) {
+      state.selects.push(opts)
+      const vmId = opts.pinVmId || opts.familyVmId || candidates[0].vmId
+      const found = candidates.find((item) => item.vmId === vmId)
+      if (!found || state.inflight >= cap) return { ok: false, reason: 'all_accounts_busy', eligible: 1 }
+      state.inflight++
+      let released = false
+      return {
+        ...found,
+        ok: true,
+        release() {
+          if (released) return
+          released = true
+          state.inflight--
+        },
+      }
+    },
+    markCooldown() {},
+    markSuccess() {},
+  }
+}
+
+test('explicit VM pin is not redirected by a family locked elsewhere', async () => {
+  const scheduler = leasingScheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({
+    scheduler,
+    stickyRouter: {
+      resolve: (key) => (key === 'family2:root' ? { accountId: 'account-2', vmId: 'vm-02' } : null),
+      bind: () => true,
+    },
+  })
+  for (let i = 0; i < 3; i++) {
+    const result = await runner.run({
+      requestId: `req-pinned-${i}`,
+      canonicalBody: { model: 'claude-haiku-test' },
+      model: 'claude-haiku-test',
+      pinVmId: 'vm-01',
+      familyKey: 'family2:root',
+      familyVmId: 'vm-02',
+      callAttempt: () => success(),
+    })
+    assert.equal(result.ok, true)
+    assert.equal(result.vmId, 'vm-01')
+  }
+  assert.equal(scheduler.state.selects.length, 3)
+  assert.equal(scheduler.state.inflight, 0)
 })

@@ -8,6 +8,7 @@ import {
   resolveHopEngine,
   dispatchStreamInference,
   dispatchCallInference,
+  isDeadWrapHop,
   rustHealthTtlMs,
   rustSlotWaitMs,
   resolveHopSlotWaitMs,
@@ -41,6 +42,40 @@ import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
+
+test('empty assistant hop does not SIGKILL the supervisor', () => {
+  assert.equal(
+    isDeadWrapHop({
+      ok: false,
+      status: 200,
+      terminalState: 'incomplete',
+      transportError: false,
+      body: { type: 'message', role: 'assistant', content: [], stop_reason: null },
+    }),
+    false,
+  )
+  assert.equal(
+    isDeadWrapHop({
+      ok: false,
+      status: 499,
+      clientCancelled: true,
+      terminalState: 'cancelled',
+      transportError: false,
+      body: { error: { code: 'client_cancelled', message: 'Client closed the connection' } },
+    }),
+    false,
+  )
+  assert.equal(
+    isDeadWrapHop({
+      ok: false,
+      status: 0,
+      terminalState: 'transport_error',
+      transportError: true,
+      body: { error: { message: 'socket hang up' } },
+    }),
+    true,
+  )
+})
 
 test('wrap system error is not a credential ensure; 401 still is', () => {
   assert.equal(
@@ -432,6 +467,64 @@ unixTest('pinned rust does not fall back to Go HTTP', async () => {
   assert.match(String(result.via), /rust-kernel/)
 })
 
+unixTest('streamed plan-limit error is a response, not a dead slot: no recycle', async () => {
+  const previous = process.env.KIN_KERNEL_BIN
+  process.env.KIN_KERNEL_BIN = '/bin/true'
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-limit-'))
+  const runDir = path.join(root, 'vm-01', 'run')
+  const homeDir = path.join(root, 'vm-01', 'cli-home')
+  fs.mkdirSync(runDir, { recursive: true })
+  fs.mkdirSync(homeDir, { recursive: true })
+  fs.writeFileSync(path.join(runDir, 'internal.token'), 'internal-test\n', { mode: 0o600 })
+  const kernelSocket = path.join(runDir, 'kernel.sock')
+  const server = http.createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream' })
+    res.end(
+      'event: error\ndata: {"type":"error","error":{"type":"api_error","message":"provider error: You\'ve hit your limit · resets 11am (UTC)"}}\n\n',
+    )
+  })
+  await new Promise((resolve, reject) => {
+    server.once('error', reject)
+    server.listen(kernelSocket, resolve)
+  })
+  const exec = {
+    vmId: 'vm-01',
+    homeDir,
+    vm: {
+      id: 'vm-01',
+      inference_engine: 'rust',
+      runtime: {
+        kernel_socket: kernelSocket,
+        worker_socket: path.join(runDir, 'worker.sock'),
+        worker_run_dir: runDir,
+        worker_token_file: path.join(runDir, 'internal.token'),
+      },
+    },
+  }
+  try {
+    const recycled = []
+    const result = await dispatchStreamInference({
+      exec,
+      body: { model: 'claude-haiku-4-5-20251001', messages: [{ role: 'user', content: 'hi' }] },
+      routing: { inference: { engine: 'rust' } },
+      ensureRust: async () => ({ ok: true, reason: 'already_up' }),
+      recycleWrap: (target) => {
+        recycled.push(target?.vmId)
+        return { ok: true, skipped: false }
+      },
+      timeoutMs: 3000,
+    })
+    assert.equal(result.status, 429)
+    assert.equal(result.committed, false)
+    assert.deepEqual(recycled, [])
+  } finally {
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+    if (previous == null) delete process.env.KIN_KERNEL_BIN
+    else process.env.KIN_KERNEL_BIN = previous
+  }
+})
+
 unixTest('committed Rust stream transport failure is not replayed on Go', async () => {
   const previous = process.env.KIN_KERNEL_BIN
   process.env.KIN_KERNEL_BIN = '/bin/true'
@@ -602,6 +695,20 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
   assert.equal(doc.proxy_required, false)
   assert.doesNotMatch(raw, /sk-ant-|oat01|password=/i)
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('writeKernelConfig points cc and crag at cc-node', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-cc-cfg-'))
+  try {
+    for (const dataplane of ['cc', 'crag']) {
+      const written = writeKernelConfig(root, { id: 'vm-09', dataplane }, { token: 'tok' })
+      const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
+      assert.equal(doc.dataplane, dataplane)
+      assert.equal(doc.claude_bin, '/home/kincli/.kin/cc-node')
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('writeKernelConfig uses identity layout when persona_inject is rewrite', () => {

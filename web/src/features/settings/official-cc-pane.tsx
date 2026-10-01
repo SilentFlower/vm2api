@@ -97,9 +97,10 @@ export function OfficialCcSettingsPane({
       <CardContent className='space-y-3'>
         <p className='text-xs text-muted-foreground'>
           这是槽位外面的初装配置。启用时每次换票都重新 wipe 再跑官方
-          hello，不是只写票。 rust 槽推理固定 cli-hop，这里不能改成
-          HTTP。成功后按「同步遥测」写官方身份，并热更新槽内 worker.json。
-          虚拟机页的种子开关不能单独打开 DNT 来对抗这份配置。
+          hello，不是只写票。运输固定 Rust cli-hop，这里不能改成 HTTP。真正跑
+          CLI 的是数据面：默认 cli-node + kernel，也可切 cc-node + kernel 或
+          crag + cc-node。成功后按「同步遥测」写官方身份，并热更新槽内
+          worker.json。虚拟机页的种子开关不能单独打开 DNT 来对抗这份配置。
         </p>
 
         <div className='divide-y'>
@@ -138,38 +139,6 @@ export function OfficialCcSettingsPane({
                   onChange={(v) => set({ [key]: v })}
                 />
               ))}
-              <SwitchRow
-                id='occ-usage_fallback'
-                label='额度回退'
-                hint='协议失败时再跑 CLI /usage'
-                checked={config.usage_fallback === true}
-                onChange={(v) => set({ usage_fallback: v })}
-              />
-              <SwitchRow
-                id='occ-cli_stats'
-                label='CLI /stats'
-                hint='默认关。只在协议额度不够时才开'
-                checked={config.cli_stats === true}
-                onChange={(v) => set({ cli_stats: v })}
-              />
-            </div>
-
-            <div className='space-y-1.5'>
-              <Label htmlFor='occ-quota'>额度来源</Label>
-              <Select
-                value={config.quota_via === 'cli' ? 'cli' : 'usage-api'}
-                onValueChange={(v) => set({ quota_via: v })}
-              >
-                <SelectTrigger id='occ-quota'>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value='usage-api'>
-                    协议 /api/oauth/usage
-                  </SelectItem>
-                  <SelectItem value='cli'>CLI</SelectItem>
-                </SelectContent>
-              </Select>
             </div>
 
             <div className='space-y-1.5'>
@@ -222,9 +191,10 @@ export function OfficialCcSettingsPane({
             </div>
 
             <p className='text-xs text-muted-foreground'>
-              推理固定 cli-hop，跟外部 inference.engine=rust。保存不会把
-              official_cc.inference 写成 http。 额度默认走协议 /usage。hello
-              默认不常驻。
+              运输固定 cli-hop，跟 inference.engine=rust。保存不会把
+              official_cc.inference 写成 http。三种内核搭配在设置 →
+              协议或内核页切换。hello 之后在槽内跑 CLI /usage，失败重试 2
+              次；账号等级以完整官方 usage 为准。hello 默认不常驻。
             </p>
           </CollapsibleContent>
         </Collapsible>

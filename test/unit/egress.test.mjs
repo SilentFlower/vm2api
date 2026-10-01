@@ -3,23 +3,30 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import net from 'node:net'
 import {
   LOCAL_EGRESS_ID,
   boundProxyUrl,
   bridgeName,
   chainName,
+  dnsUpstreamChain,
+  validDnsPrimary,
   egressEnabled,
   hasBoundExit,
   inspectEgressNetwork,
   inspectEgressProcess,
   iptablesPlan,
+  hostProxyUrlForVm,
   isLocalEgressProxy,
+  localEgressProxyUrl,
   localEgressStatus,
   egressListening,
+  egressRunDir,
   proxyEgressReady,
   networkName,
   portsForProxy,
   slotNetworkForVm,
+  startEgressProcess,
 } from '../../src/lib/vm/egress.mjs'
 
 test('names stay short and stable per proxy id', () => {
@@ -71,6 +78,33 @@ test('local egress is identified and has no SOCKS url', () => {
   assert.equal(slotNetworkForVm({ proxy: { id: LOCAL_EGRESS_ID } }), 'kin-eg-px-local')
 })
 
+test('local egress proxy follows the Codex kernel env order for https', () => {
+  assert.equal(localEgressProxyUrl({ HTTP_PROXY: 'http://h.test:1', http_proxy: 'http://h.test:2' }), '')
+  assert.equal(localEgressProxyUrl({ ALL_PROXY: 'socks5://a.test:1080' }), 'socks5h://a.test:1080')
+  assert.equal(localEgressProxyUrl({ all_proxy: 'http://b.test:2', ALL_PROXY: 'http://a.test:1' }), 'http://a.test:1')
+  assert.equal(localEgressProxyUrl({ ALL_PROXY: 'http://a.test:1', https_proxy: 'http://s.test:3' }), 'http://s.test:3')
+  assert.equal(
+    localEgressProxyUrl({ https_proxy: 'http://s.test:3', HTTPS_PROXY: 'http://S.test:4' }),
+    'http://S.test:4',
+  )
+})
+
+test('host hops: local Codex follows the deployment proxy, local Claude stays direct', (t) => {
+  const saved = process.env.HTTPS_PROXY
+  process.env.HTTPS_PROXY = 'http://proxy.test:8443'
+  t.after(() => {
+    if (saved === undefined) delete process.env.HTTPS_PROXY
+    else process.env.HTTPS_PROXY = saved
+  })
+  const local = { id: LOCAL_EGRESS_ID, scheme: 'local', host: 'local', port: 0 }
+  assert.equal(hostProxyUrlForVm({ id: 'vm-gpt', platform: 'openai', proxy: local }), 'http://proxy.test:8443')
+  assert.equal(hostProxyUrlForVm({ id: 'vm-cc', platform: 'anthropic', proxy: local }), '')
+  assert.equal(
+    hostProxyUrlForVm({ id: 'vm-gpt', platform: 'openai', proxy: { host: '10.0.0.5', port: 1080 } }),
+    'socks5h://10.0.0.5:1080',
+  )
+})
+
 test('inspectEgressNetwork exposes name and network for slot start', () => {
   const info = inspectEgressNetwork('px-local', () => ({
     ok: true,
@@ -119,4 +153,58 @@ test('local egress readiness is direct and does not require kin-egress', () => {
   const listen = egressListening('/tmp/does-not-matter', LOCAL_EGRESS_ID)
   assert.equal(listen.ok, true)
   assert.equal(listen.mode, 'direct')
+})
+
+test('dns primary puts the chosen upstream first and keeps the rest as fallback', () => {
+  assert.equal(dnsUpstreamChain('auto'), '')
+  assert.equal(dnsUpstreamChain('bogus'), '')
+  assert.equal(
+    dnsUpstreamChain('8.8.8.8:53'),
+    '8.8.8.8:53,https://1.1.1.1/dns-query,https://8.8.8.8/dns-query,1.1.1.1:53',
+  )
+  assert.equal(validDnsPrimary('auto'), true)
+  assert.equal(validDnsPrimary('https://1.1.1.1/dns-query'), true)
+  assert.equal(validDnsPrimary('9.9.9.9:53'), false)
+})
+
+test('egress config carries dns_upstream only when configured', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-dns-'))
+  const base = {
+    projectRoot: root,
+    proxyUrl: 'socks5h://127.0.0.1:1',
+    tcpPort: 20000,
+    dnsPort: 20001,
+    listenHost: '127.0.0.1',
+    bin: '/bin/true',
+  }
+  const a = startEgressProcess({ ...base, proxyId: 'px-a', dnsUpstream: '' })
+  assert.equal(a.ok, true)
+  assert.equal(JSON.parse(fs.readFileSync(a.configPath, 'utf8')).dns_upstream, undefined)
+  const b = startEgressProcess({ ...base, proxyId: 'px-b', dnsUpstream: '8.8.8.8:53,1.1.1.1:53' })
+  assert.equal(JSON.parse(fs.readFileSync(b.configPath, 'utf8')).dns_upstream, '8.8.8.8:53,1.1.1.1:53')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('egress readiness checks the exact listener without opening a connection', async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'egress-listen-'))
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  let accepted = 0
+  const listener = net.createServer((socket) => {
+    accepted++
+    socket.destroy()
+  })
+  await new Promise((resolve) => listener.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => listener.close(resolve)))
+  const proxyId = 'px-passive-probe'
+  const dir = egressRunDir(root, proxyId)
+  fs.mkdirSync(dir, { recursive: true })
+  fs.writeFileSync(path.join(dir, 'egress.pid'), String(process.pid))
+  const config = path.join(dir, 'egress.json')
+  const port = listener.address().port
+  fs.writeFileSync(config, JSON.stringify({ listen_tcp: `127.0.0.1:${port}` }))
+  assert.equal(egressListening(root, proxyId).ok, true)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(accepted, 0, 'readiness must not enter the transparent forwarding path')
+  fs.writeFileSync(config, JSON.stringify({ listen_tcp: `127.0.0.2:${port}` }))
+  assert.equal(egressListening(root, proxyId, 100).reason, 'not_listening')
 })

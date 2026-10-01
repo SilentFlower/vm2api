@@ -15,9 +15,10 @@ import { RefusalGuardCard } from './refusal-guard-card'
 export function ProtocolPage() {
   const dash = useQuery(dashboardQueryOptions())
   const models = useQuery(modelsQueryOptions())
-  const base = String(
-    dash.data?.health?.base_url || location.origin || 'https://ccmax20.cc'
-  ).replace(/\/$/, '')
+  const base = String(dash.data?.health?.base_url || location.origin).replace(
+    /\/$/,
+    ''
+  )
   const items = models.data?.items || []
   const copy = (text: string) => {
     void navigator.clipboard.writeText(text)
@@ -59,15 +60,15 @@ export function ProtocolPage() {
                 </Button>
               </div>
               <p className='text-muted-foreground'>
-                内核与人设只在{' '}
-                <Link
-                  to='/settings/$tab'
-                  params={{ tab: 'protocol' }}
-                  className='underline underline-offset-4'
-                >
-                  设置 → 协议
-                </Link>{' '}
-                配置。蒸馏拦截与拒答缓存在本页保存。
+                system 提示词在{' '}
+                <Link to='/system' className='underline underline-offset-4'>
+                  system提示词
+                </Link>
+                。wrap / crag 数据面在设置 → 协议或{' '}
+                <Link to='/wrap' className='underline underline-offset-4'>
+                  内核页
+                </Link>
+                。蒸馏拦截与拒答缓存在本页保存。
               </p>
             </CardContent>
           </Card>

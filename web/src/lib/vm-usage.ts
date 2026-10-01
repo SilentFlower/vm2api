@@ -1,5 +1,7 @@
+import type { BillingAccountRow } from '@/types/panel-overview'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
+import { isCodexVm } from '@/lib/vm-kind'
 
 function num(v: unknown): number {
   const n = Number(v)
@@ -31,6 +33,19 @@ export function isLeftoverUsageAccount(row: UsageAccountRow): boolean {
   const id = String(row.account_id || '')
   const vmId = String(row.vm_id || '')
   return !!id && id === vmId && !row.email
+}
+
+/**
+ * The slot a billing row may be shown as. Slot ids get reused, so a row from an
+ * earlier account on the same id belongs to that account, not the slot's current one.
+ */
+export function billingRowSlot(
+  row: BillingAccountRow,
+  byId: Map<string, Vm>
+): Vm | undefined {
+  const vm = row.vm_id ? byId.get(String(row.vm_id)) : undefined
+  if (!vm?.account_uuid) return vm
+  return vm.account_uuid === row.account_id ? vm : undefined
 }
 
 export function usageAccountForVm(
@@ -114,11 +129,13 @@ export function vmTodayView(vm: Vm, accounts?: UsageAccountRow[]): Vm {
 export function cacheHitPct(
   input: unknown,
   read: unknown,
-  write: unknown
+  write: unknown,
+  scheme: 'anthropic' | 'openai' = 'anthropic'
 ): number | null {
-  const prompt = num(input) + num(read) + num(write)
+  const prompt =
+    scheme === 'openai' ? num(input) : num(input) + num(read) + num(write)
   if (!prompt) return null
-  return (num(read) / prompt) * 100
+  return Math.min(100, (num(read) / prompt) * 100)
 }
 
 /** Prefers the gateway's own `cache_hit_rate` (0–1) and falls back to local math. */
@@ -132,7 +149,8 @@ export function vmCacheHitPct(
   return cacheHitPct(
     row.today_input_tokens,
     row.today_cache_read_tokens,
-    row.today_cache_creation_tokens
+    row.today_cache_creation_tokens,
+    isCodexVm(vm) ? 'openai' : 'anthropic'
   )
 }
 
@@ -197,4 +215,16 @@ export function vmWindowCosts(
     h5: num(acc?.window_5h_cost ?? vm.window_5h_cost),
     d7: num(acc?.window_7d_cost ?? vm.window_7d_cost),
   }
+}
+
+/**
+ * 账号累计官方价费用。`/api/panel/vms` 不带任何费用字段，累计值只在 `/usage`
+ * 账号行和 `/dashboard` 的槽位里；两边都可能缺，取较大者，和 `vmTodayView`
+ * 同一取舍——累计只增不减，较小的一定是过期或缺失。
+ */
+export function vmTotalCost(vm: Vm, accounts?: UsageAccountRow[]): number {
+  return Math.max(
+    num(vm.total_cost),
+    num(usageAccountForVm(vm, accounts)?.total_cost)
+  )
 }

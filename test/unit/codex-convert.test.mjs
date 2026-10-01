@@ -2,6 +2,8 @@ import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
   chatToCodexResponses,
+  responsesToolChoice,
+  createChatSseState,
   normalizeCodexResponsesInput,
   responsesSseToChatChunk,
   responsesSseToAnthropicEvents,
@@ -25,6 +27,67 @@ test('strips client identity fields', () => {
   assert.equal(out.base_url, undefined)
   assert.equal(out.metadata.user_id, undefined)
   assert.equal(out.metadata.topic, 'keep')
+})
+
+test('chat tool turns become function_call items', () => {
+  const body = chatToCodexResponses({
+    model: 'gpt-5.5',
+    reasoning_effort: 'medium',
+    messages: [
+      { role: 'system', content: 'be brief' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'todo', arguments: '{"a":1}' } }],
+      },
+      { role: 'tool', tool_call_id: 'call_1', content: 'done' },
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: 'look' },
+          { type: 'image_url', image_url: { url: 'data:image/png;base64,aaaa' } },
+        ],
+      },
+    ],
+  })
+  assert.equal(
+    body.input.some((item) => item.role === 'assistant' && !item.content?.[0]?.text),
+    false,
+  )
+  assert.deepEqual(body.input[1], {
+    type: 'function_call',
+    call_id: 'call_1',
+    name: 'todo',
+    arguments: '{"a":1}',
+  })
+  assert.deepEqual(body.input[2], { type: 'function_call_output', call_id: 'call_1', output: 'done' })
+  assert.equal(body.input[3].content[1].type, 'input_image')
+  assert.equal(body.input[3].content[1].image_url, 'data:image/png;base64,aaaa')
+  const washed = toCodexResponses('openai.chat', {
+    model: 'gpt-5.5',
+    reasoning_effort: 'high',
+    messages: [{ role: 'user', content: 'hi' }],
+  })
+  assert.equal(washed.body.reasoning.effort, 'high')
+})
+
+test('chat tool_choice hoists function.name onto Responses tool_choice.name', () => {
+  const body = chatToCodexResponses({
+    model: 'gpt-5.4',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [{ type: 'function', function: { name: 'get_weather', parameters: { type: 'object' } } }],
+    tool_choice: { type: 'function', function: { name: 'get_weather' } },
+  })
+  assert.deepEqual(body.tool_choice, { type: 'function', name: 'get_weather' })
+  const native = toCodexResponses('openai.responses', {
+    model: 'gpt-5.4',
+    input: 'hi',
+    tool_choice: { type: 'function', function: { name: 'lookup' } },
+  })
+  assert.deepEqual(native.body.tool_choice, { type: 'function', name: 'lookup' })
+  assert.equal(responsesToolChoice({ type: 'tool', name: 'get_weather' }).name, 'get_weather')
+  assert.equal(responsesToolChoice({ type: 'any' }), 'required')
+  assert.equal(responsesToolChoice('auto'), 'auto')
 })
 
 test('chat converts to responses input', () => {
@@ -114,6 +177,34 @@ test('responses SSE maps to chat chunks', () => {
   assert.match(done, /"completion_tokens":12/)
   assert.match(done, /"cached_tokens":8/)
   assert.match(done, /"cache_creation_tokens":3/)
+})
+
+test('function-call SSE maps to chat tool_calls', () => {
+  const state = createChatSseState()
+  const added = responsesSseToChatChunk(
+    'data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"todo"}}',
+    'codex',
+    state,
+  )
+  assert.match(added, /"tool_calls"/)
+  assert.match(added, /"name":"todo"/)
+  const delta = responsesSseToChatChunk(
+    'data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\\"a\\":1}"}',
+    'codex',
+    state,
+  )
+  const parsed = JSON.parse(delta.slice(5).trim())
+  assert.equal(parsed.choices[0].delta.tool_calls[0].function.arguments, '{"a":1}')
+  assert.equal(parsed.choices[0].delta.content, undefined)
+  const done = responsesSseToChatChunk(
+    'data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":1}}}',
+    'codex',
+    state,
+  )
+  assert.match(done, /"finish_reason":"tool_calls"/)
+  const reason = responsesSseToChatChunk('data: {"type":"response.reasoning_summary_text.delta","delta":"think"}')
+  assert.match(reason, /"reasoning_content":"think"/)
+  assert.doesNotMatch(reason, /"content"/)
 })
 
 test('responses SSE maps to Anthropic message events', () => {

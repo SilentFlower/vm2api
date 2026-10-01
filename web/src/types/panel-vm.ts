@@ -34,6 +34,8 @@ export type VmProxySnap = {
   port?: number | string
   status?: string
   enabled?: boolean
+  blocked_reason?: 'ipv6_disabled' | null
+  address_family?: 4 | 6 | null
   latency_ms?: number
   last_error?: string
   last_probe_at?: string
@@ -73,7 +75,8 @@ export type VmKernelSnapshot = {
   credential_state?: string | null
   proxy_state?: string | null
   telemetry?: {
-    enabled?: boolean
+    enabled?: boolean | null
+    running?: boolean | null
     process?: string | null
     read_only?: boolean
   } | null
@@ -90,10 +93,22 @@ export type VmKernelSnapshot = {
   codex_health?: VmKernelHealth | null
 }
 
+export type VmCircuit = {
+  account_id?: string
+  state: 'closed' | 'open' | 'half_open'
+  failures: number
+  threshold: number
+  /** 毫秒时间戳；仅 open 时有值 */
+  open_until: number | null
+  open_ms: number
+}
+
 export type Vm = {
   id: string
   name?: string
   owner_user_id?: string | null
+  /** 所在集群节点；null / 缺省 = 本机。远端槽位不支持官方初装、wrap-cli、换内核等。 */
+  node_id?: string | null
   origin?: string | null
   email?: string
   status?: string
@@ -132,6 +147,8 @@ export type Vm = {
   schedule_state?: 'on' | 'restricted' | 'off'
   restriction_reason?: string | null
   restriction_until?: number | null
+  /** Claude 单元熔断（Codex 为 null）。连续 5xx 达阈值后打开，到期只放 1 个探测。 */
+  circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
   utilization_5h?: number
@@ -155,6 +172,8 @@ export type Vm = {
       utilization_7d?: number
     }
   } | null
+  /** Raw OpenAI `plan_type` from wham/usage (GPT slots only). */
+  plan_type?: string | null
   reset_credits?: {
     available_count?: number
     credits?: Array<{ expires_at?: string }>
@@ -164,8 +183,8 @@ export type Vm = {
   fable?: Record<string, unknown>
   weekly_split?: Record<string, unknown>
   account_tier?: string
-  /** Official /usage listed a Fable model. Overrides leftover Pro stamps. */
-  usage_has_fable?: boolean
+  /** Complete official usage: true = Max, false = Pro, null = unconfirmed. */
+  usage_has_fable?: boolean | null
   /** anthropic | openai。缺省按 Claude 槽展示。 */
   platform?: string | null
   /** claude | codex */
@@ -175,6 +194,8 @@ export type Vm = {
   resolved_inference_engine?: 'go' | 'rust' | null
   persona_preset?: string | null
   resolved_persona_preset?: string | null
+  dataplane?: 'wrap' | 'cc' | 'crag' | null
+  resolved_dataplane?: 'wrap' | 'cc' | 'crag' | null
   kernel?: string
   region?: string
   /** 槽位环境时区（容器 `TZ` + persona `# Environment`）。 */
@@ -188,6 +209,12 @@ export type Vm = {
   /** Claude CLI native 执行位热准入上限；内核固定预开 20。 */
   session_slots?: number | null
   session_slots_override?: boolean
+  /** 单槽位配额覆盖；缺字段 = 跟随全局 `settings/quota`。GPT 槽位恒为 null。 */
+  quota_override?: VmQuotaOverride | null
+  /** 覆盖后实际生效的配额。 */
+  quota_policy?: VmQuotaView | null
+  /** 不含覆盖、按全局分档算出的配额，供「跟随全局」展示。 */
+  quota_inherited?: VmQuotaView | null
   /** 当前有效调度等级；自动模式范围 1～7，手动模式范围 1～10。 */
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
@@ -226,6 +253,14 @@ export type Vm = {
     transport?: boolean
     rate_limited?: boolean
   }
+  last_probe_check?: {
+    at?: string
+    ok?: boolean
+    source?: string
+    via?: string
+    error?: string | null
+    data_at?: string | null
+  } | null
   probe_source?: string
   /** 最近一次刷票失败的原因。与 `last_probe.error` 是两条独立的失效来源。 */
   refresh_error?: string
@@ -258,12 +293,64 @@ export type Vm = {
   [key: string]: unknown
 }
 
+/** `billing.by_model` 一行：同一上游模型按计费档位（tier / speed / 长上下文）拆开。 */
+export type VmBillingModelRow = {
+  model: string
+  /** 规范化后的 OpenAI 档位：`fast`（含 priority）、`flex` 或其它原值；标准档为 null */
+  service_tier?: string | null
+  /** Anthropic fast 模式为 `fast`，否则 null */
+  speed?: string | null
+  long_context?: number
+  requests: number
+  unpriced_requests?: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  total_cost: number
+}
+
+/** `billing.usage_stats`：近 N 个上海自然日的槽位用量（统计弹窗）。`endpoints` 是入站路径。 */
+export type VmUsageStatsDay = {
+  /** 上海时区 `YYYY-MM-DD`，与 `billing.today` 同一天界。 */
+  day: string
+  requests: number
+  errors: number
+  input_tokens: number
+  output_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  total_cost: number
+  duration_ms_sum: number
+  duration_n: number
+}
+
+export type VmUsageStatsRank = {
+  name: string
+  requests: number
+  tokens: number
+  total_cost: number
+}
+
+export type VmUsageStats = {
+  days: number
+  since: string | null
+  history: VmUsageStatsDay[]
+  models: VmUsageStatsRank[]
+  endpoints: VmUsageStatsRank[]
+}
+
 export type VmDetailPayload = {
   vm?: Vm
   kernel?: VmKernelSnapshot | null
   proxy?: VmProxySnap | null
   account?: Record<string, unknown> | null
-  billing?: Record<string, unknown> | null
+  billing?:
+    | (Record<string, unknown> & {
+        by_model?: VmBillingModelRow[]
+        usage_stats?: VmUsageStats | null
+      })
+    | null
   [key: string]: unknown
 }
 
@@ -315,6 +402,10 @@ export type OfficialCcStatus = {
   hello_ok?: boolean
   usage_ok?: boolean
   account_tier?: string
+  /** `profile` = 官方 /api/oauth/profile；`usage` = /usage 推断兜底。 */
+  account_tier_source?: string
+  /** 槽内 GET /v1/models 返回的模型 id。 */
+  available_models?: string[]
   exit_code?: number | null
   resident?: boolean
   resident_ok?: boolean
@@ -327,6 +418,18 @@ export type OfficialCcStatus = {
   telemetry_official?: boolean
   [key: string]: unknown
 }
+
+export type VmQuotaView = {
+  limit_5h: number
+  limit_7d: number
+  max_sessions: number
+  session_idle_min: number
+  block_on_5h: boolean
+  block_on_7d: boolean
+  weekly_split: boolean
+}
+
+export type VmQuotaOverride = Partial<VmQuotaView>
 
 export type QuotaTierKey = 'default' | 'pro' | 'max'
 

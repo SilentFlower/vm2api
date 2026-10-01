@@ -62,6 +62,7 @@ export const ErrorCode = {
   FABLE_REQUIRES_MAX: 'fable_requires_max',
 
   INCOMPLETE_RESPONSE: 'incomplete_response',
+  CLIENT_CANCELLED: 'client_cancelled',
   // protocol
   PROTOCOL_UNSUPPORTED: 'protocol_unsupported',
   CONVERT_FAILED: 'convert_failed',
@@ -78,21 +79,21 @@ export const ErrorCode = {
   COUNT_TOKENS_UNSUPPORTED: 'count_tokens_unsupported',
   USAGE_UNSUPPORTED: 'usage_unsupported',
   // pool — client-facing only; internal codes stay on the log bag
-  SERVER_OVERLOADED: 'server_overloaded',
+  POOL_OVERLOADED: 'pool_overloaded',
+  POOL_UNAVAILABLE: 'pool_unavailable',
 }
 
 export const CLIENT_POOL_BUSY_MESSAGE = '号池负载过高，稍后再试'
+export const CLIENT_POOL_UNAVAILABLE_MESSAGE = '号池当前没有可用账号'
 
-const POOL_CAPACITY_CODES = new Set([
-  'server_overloaded',
+/** Every eligible seat stayed busy until the bounded wait ran out. */
+const POOL_OVERLOADED_CODES = new Set(['pool_overloaded', 'pool_wait_queue_full'])
+/** Nothing eligible to wait for: configuration, quota, credentials, or model gates. */
+const POOL_UNAVAILABLE_CODES = new Set([
   'account_pool_exhausted',
   'api_pool_exhausted',
   'no_available_accounts',
   'no_eligible_accounts',
-  'pool_wait_queue_full',
-  'pool_deadline_exceeded',
-  'attempts_exhausted',
-  'max_account_switches_exceeded',
 ])
 
 const POOL_CAPACITY_MESSAGE = /no eligible|no ready api|account pool|号池没有|无可用账号|eligible claude/i
@@ -108,21 +109,37 @@ export function isUsagePolicyErrorMessage(message = '') {
   return USAGE_POLICY_MESSAGE.test(String(message || ''))
 }
 
-export function isPoolCapacityError(code, message = '') {
-  if (POOL_CAPACITY_CODES.has(String(code || '').trim())) return true
-  return POOL_CAPACITY_MESSAGE.test(String(message || ''))
+/** `overloaded` (real capacity, 429), `unavailable` (nothing eligible, 503), or null. */
+export function poolErrorKind(code, message = '') {
+  const key = String(code || '').trim()
+  if (POOL_OVERLOADED_CODES.has(key)) return 'overloaded'
+  if (POOL_UNAVAILABLE_CODES.has(key)) return 'unavailable'
+  if (POOL_CAPACITY_MESSAGE.test(String(message || ''))) return 'unavailable'
+  return null
+}
+
+function poolClientError(kind) {
+  if (kind === 'overloaded') {
+    return makeError({
+      type: ErrorType.RATE_LIMIT,
+      code: ErrorCode.POOL_OVERLOADED,
+      message: CLIENT_POOL_BUSY_MESSAGE,
+      status: 429,
+    })
+  }
+  return makeError({
+    type: ErrorType.OVERLOADED,
+    code: ErrorCode.POOL_UNAVAILABLE,
+    message: CLIENT_POOL_UNAVAILABLE_MESSAGE,
+    status: 503,
+  })
 }
 
 export function rewritePoolErrorForClient(mapped, originalBody = null) {
   const code = originalBody?.error?.code || mapped?.body?.error?.code
   const message = originalBody?.error?.message || mapped?.body?.error?.message || ''
-  if (!isPoolCapacityError(code, message)) return mapped
-  return makeError({
-    type: ErrorType.OVERLOADED,
-    code: ErrorCode.SERVER_OVERLOADED,
-    message: CLIENT_POOL_BUSY_MESSAGE,
-    status: 503,
-  })
+  const kind = poolErrorKind(code, message)
+  return kind ? poolClientError(kind) : mapped
 }
 
 export function makeError({
@@ -141,26 +158,46 @@ export function makeError({
   return { status, body: { error } }
 }
 
-const GATEWAY_OVERLOAD_CODES = new Set(['server_overloaded', 'account_pool_exhausted', 'api_pool_exhausted'])
-const CLIENT_CANCEL_CODES = new Set([
-  'client_cancelled',
-  'request_cancelled',
-  'client_aborted',
-  'selection_cancelled',
-  'ECONNRESET',
-  'aborted',
-])
+// Cancellation is decided by the request's own AbortSignal, never by transport
+// text: an upstream ECONNRESET or a local timeout is a real failure, not a cancel.
+const CLIENT_CANCEL_CODES = new Set(['client_cancelled', 'request_cancelled', 'client_aborted', 'selection_cancelled'])
 
 export function isClientCancelledCode(code, message = '') {
-  const hay = `${code || ''} ${message || ''}`
   if (CLIENT_CANCEL_CODES.has(String(code || '').trim())) return true
-  return /econnreset|client_aborted|request_cancelled|selection_cancelled|context canceled/i.test(hay)
+  return /client_aborted|request_cancelled|selection_cancelled|context canceled/i.test(`${code || ''} ${message || ''}`)
 }
 
 export function isClientCancelledResult(result = {}) {
+  if (result?.clientCancelled === true || result?.terminalState === 'cancelled') return true
   const code = result?.body?.error?.code || result?.error_code || ''
   const message = result?.body?.error?.message || result?.error_message || ''
   return isClientCancelledCode(code, message)
+}
+
+/**
+ * Client lifecycle terminal: the caller went away. Not an error, not a success.
+ * Keeps committed/usage so billing and the log see what was really delivered.
+ */
+export function clientCancelledResult(result = {}, details = null) {
+  return {
+    ...result,
+    ok: false,
+    status: 499,
+    clientCancelled: true,
+    transportError: false,
+    terminalState: 'cancelled',
+    finalState: 'cancelled',
+    committed: !!result?.committed,
+    body: {
+      type: 'error',
+      error: {
+        type: ErrorType.TIMEOUT,
+        code: ErrorCode.CLIENT_CANCELLED,
+        message: 'Client closed the connection',
+        ...(details && Object.keys(details).length ? { details } : {}),
+      },
+    },
+  }
 }
 
 /** Classify & map Anthropic upstream error body + HTTP status */
@@ -197,10 +234,15 @@ export function assistantStopReason(result = {}) {
   return String(result?.stopReason || result?.body?.stop_reason || '').trim()
 }
 
-/** Envelope plus stop_reason plus visible text/tool/refusal. Thinking-only is not complete. */
+/**
+ * sub2api: message_stop ends the stream even when the body has no visible text.
+ * Without that terminal event, stop_reason plus visible text/tool/refusal is required.
+ * Thinking-only and a bare stop_reason are not complete.
+ */
 export function isCompleteAssistantMessage(result = {}) {
   const body = result?.body && typeof result.body === 'object' ? result.body : result
   if (!isAssistantMessageBody(body)) return false
+  if (result?.sawMessageStop) return true
   if (!assistantStopReason({ body, stopReason: result?.stopReason })) return false
   return assistantVisibleOutput(body)
 }
@@ -212,9 +254,15 @@ export function isIncompleteAssistantMessage(result = {}) {
 }
 
 export function finalizeAssembledAssistantHop(result = {}) {
+  if (isClientCancelledResult(result)) return result
   if (isCompleteAssistantMessage(result)) return result?.ok ? result : { ...result, ok: true }
   if (isIncompleteAssistantMessage(result) || result?.ok) {
-    return { ...result, ok: false, committed: false, terminalState: 'incomplete' }
+    return {
+      ...result,
+      ok: false,
+      committed: !!result?.committed,
+      terminalState: 'incomplete',
+    }
   }
   return result
 }
@@ -236,7 +284,7 @@ export function incompleteAssistantClientError(result = {}) {
   return {
     ...result,
     ok: false,
-    committed: false,
+    committed: !!result?.committed,
     terminalState: 'incomplete',
     status: 502,
     body: {
@@ -268,14 +316,8 @@ export function mapUpstreamError(status, body, headers = {}) {
     })
   }
 
-  if (GATEWAY_OVERLOAD_CODES.has(String(inboundCode || '')) || isPoolCapacityError(inboundCode, msg)) {
-    return makeError({
-      type: ErrorType.OVERLOADED,
-      code: ErrorCode.SERVER_OVERLOADED,
-      message: CLIENT_POOL_BUSY_MESSAGE,
-      status: 503,
-    })
-  }
+  const poolKind = poolErrorKind(inboundCode, msg)
+  if (poolKind) return poolClientError(poolKind)
   if (isClientCancelledCode(inboundCode, msg)) {
     return makeError({
       type: ErrorType.TIMEOUT,

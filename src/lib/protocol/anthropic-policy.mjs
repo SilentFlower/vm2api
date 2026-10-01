@@ -2,7 +2,7 @@ import crypto from 'node:crypto'
 import { liftMidConversationSystemMessages, stripIllegalContentFields } from './sanitize.mjs'
 import { isAnthropicServerTool } from './web-search.mjs'
 import { normalizeThinkingForModel, ensureUnofficialAdaptiveThinking, ensureUnofficialEffortHigh } from './thinking.mjs'
-import { applyMaxTokensCap, applyOpus55RequestRules, getCapabilities } from './model-policy.mjs'
+import { applyMaxTokensCap, applyModelRequestRules, getCapabilities } from './model-policy.mjs'
 import { ensureOutputConfigSchema, rectifyUnofficialRequest } from './request-rectifier.mjs'
 import { DEFAULT_CACHE_TTL, applyCacheBreakpoints, stripCacheScopeFields } from './cache-ttl.mjs'
 import { normalizeImageContentBlocks } from './images.mjs'
@@ -147,7 +147,45 @@ export function stripInvalidThinkingBlocks(body = {}) {
     return filteredThis ? { ...message, content } : message
   })
   if (!changed) return body
-  return { ...body, messages }
+  const withoutEmpty = messages.filter((message) => !messageContentIsEmpty(message?.content))
+  return { ...body, messages: mergeSameRole(withoutEmpty) }
+}
+
+function messageContentIsEmpty(content) {
+  if (content == null) return true
+  if (typeof content === 'string') return !content.trim()
+  if (!Array.isArray(content)) return false
+  if (!content.length) return true
+  return content.every((block) => {
+    if (typeof block === 'string') return !block.trim()
+    if (!block || typeof block !== 'object') return true
+    if (block.type === 'text' || block.type == null) return !String(block.text || '').trim()
+    return false
+  })
+}
+
+function mergeSameRole(messages) {
+  const out = []
+  for (const message of messages) {
+    const last = out[out.length - 1]
+    if (!last || last.role !== message.role) {
+      out.push({ ...message })
+      continue
+    }
+    last.content = mergeContent(last.content, message.content)
+  }
+  return out
+}
+
+function mergeContent(left, right) {
+  if (typeof left === 'string' && typeof right === 'string') return `${left}\n${right}`
+  const blocks = []
+  for (const part of [left, right]) {
+    if (part == null || part === '') continue
+    if (typeof part === 'string') blocks.push({ type: 'text', text: part })
+    else if (Array.isArray(part)) blocks.push(...part)
+  }
+  return blocks
 }
 
 export const CONTEXT_MANAGEMENT_BETA = 'context-management-2025-06-27'
@@ -174,18 +212,44 @@ export function modelSupportsMidConversationSystem(modelId = '') {
  * models drop the field; final beta sanitize may still strip it later.
  */
 export function ensureClearThinkingContextManagement(body = {}) {
-  if (!thinkingModeEnabled(body)) return body
+  // 不支持的模型（Haiku）即使没开 thinking 也要删掉调用方带的 context_management：
+  // cli-hop 会先把 Haiku 的 thinking 固定为 disabled，且跳过后面的 beta 清洗，
+  // 这里若提前返回，clear_thinking 就会漏到上游，导致槽内 CLI 被杀。
   if (!modelSupportsContextManagement(body.model)) {
     if (body.context_management == null) return body
     const out = { ...body }
     delete out.context_management
     return out
   }
+  if (!thinkingModeEnabled(body)) return body
   if (body.context_management != null) return body
   return {
     ...body,
     context_management: { edits: [{ ...CLEAR_THINKING_EDIT }] },
   }
+}
+
+export const FAST_MODE_BETA = 'fast-mode-2026-02-01'
+
+/** Opus 5.5 / Opus 5 / Opus 4.8 accept `speed: "fast"`; 4.7 errors, 4.6 silently runs standard. */
+export function modelSupportsFastMode(model = '') {
+  const m = String(model || '').toLowerCase()
+  if (!m.includes('opus')) return false
+  return /opus-5(?![0-9])/.test(m) || /opus-4[-.]8(?![0-9])/.test(m)
+}
+
+export function wantsFastMode(body = {}) {
+  return (
+    String(body?.speed ?? '')
+      .trim()
+      .toLowerCase() === 'fast' && modelSupportsFastMode(body?.model)
+  )
+}
+
+/** Add the fast-mode beta when the body asks for fast on a supported model (mimicry drops client betas). */
+export function ensureFastModeBeta(header = '', body = {}) {
+  if (!wantsFastMode(body) || anthropicBetaTokensContains(header, FAST_MODE_BETA)) return header
+  return header ? `${header},${FAST_MODE_BETA}` : FAST_MODE_BETA
 }
 
 export function anthropicBetaTokensContains(header, token) {
@@ -215,6 +279,14 @@ export function sanitizeAnthropicBodyForBetaTokens(body = {}, anthropicBetaHeade
   }
   if (!anthropicBetaTokensContains(anthropicBetaHeader, PROMPT_CACHING_SCOPE_BETA)) {
     out = stripCacheScopeFields(out)
+  }
+  // `speed` needs the fast-mode beta; without it the request 400s instead of running standard.
+  if (
+    Object.prototype.hasOwnProperty.call(out, 'speed') &&
+    (!anthropicBetaTokensContains(anthropicBetaHeader, FAST_MODE_BETA) || !modelSupportsFastMode(out.model))
+  ) {
+    out = { ...out }
+    delete out.speed
   }
   const allowMidSystem =
     modelSupportsMidConversationSystem(out.model) &&
@@ -261,7 +333,7 @@ export function prepareAnthropicRequest(
   let out = clone(body)
   // Model-aware thinking normalize (adaptive ↔ enabled) before other policy
   normalizeThinkingForModel(out)
-  out = applyOpus55RequestRules(out)
+  out = applyModelRequestRules(out)
   applyMaxTokensCap(out)
   if (unofficial) {
     out = ensureUnofficialAdaptiveThinking(out)

@@ -7,8 +7,12 @@
 const FAILURE_ALPHA = 0.2
 const CAPACITY_ALPHA = 0.4
 const FAILURE_HALF_LIFE_MS = 15 * 60 * 1000
+const RPM_WINDOW_MS = 60_000
+
+export const OPENAI_MAX_WAITERS = 100
 
 const slots = new Map()
+const waiters = []
 const feedback = new Map()
 let roundRobinCursor = 0
 
@@ -16,7 +20,7 @@ function slotOf(id) {
   const key = String(id || '')
   let slot = slots.get(key)
   if (!slot) {
-    slot = { inFlight: 0, lastStartedAt: null }
+    slot = { inFlight: 0, lastStartedAt: null, starts: [] }
     slots.set(key, slot)
   }
   return slot
@@ -28,6 +32,12 @@ function decayedFailure(entry, now) {
   return entry.value * 0.5 ** (elapsed / FAILURE_HALF_LIFE_MS)
 }
 
+function recentStarts(slot, now) {
+  if (!slot?.starts?.length) return 0
+  slot.starts = slot.starts.filter((t) => now - t < RPM_WINDOW_MS)
+  return slot.starts.length
+}
+
 export function openAIRuntimeSignals(id, now = Date.now()) {
   const key = String(id || '')
   const slot = slots.get(key)
@@ -37,6 +47,8 @@ export function openAIRuntimeSignals(id, now = Date.now()) {
   return {
     inFlight: slot?.inFlight || 0,
     lastStartedAt: slot?.lastStartedAt ?? null,
+    rpmCount: recentStarts(slot, now),
+    rpmResetAt: slot?.starts?.length ? slot.starts[0] + RPM_WINDOW_MS : null,
     failureRateBps: Math.round(Math.min(1, Math.max(0, failure)) * 10_000),
     firstOutputLatencyMs: Number.isFinite(latency) && latency > 0 ? Math.round(latency) : null,
   }
@@ -51,19 +63,79 @@ export function bumpOpenAICursor() {
   return roundRobinCursor
 }
 
-export function acquireOpenAISlot(id, now = Date.now()) {
+/**
+ * One synchronous check-and-claim: concurrency and RPM are read and taken in
+ * the same tick, so two admissions can never both see the last free seat.
+ * Returns a lease whose release() is idempotent, or null when full.
+ */
+export function tryAcquireOpenAISlot(id, { concurrency = 1, maxRpm = 0, now = Date.now() } = {}) {
+  const cap = Number(concurrency) > 0 ? Number(concurrency) : 1
   const slot = slotOf(id)
+  if (slot.inFlight >= cap) return null
+  const rpm = Number(maxRpm) || 0
+  if (rpm > 0 && recentStarts(slot, now) >= rpm) return null
+  recentStarts(slot, now)
   slot.inFlight += 1
   slot.lastStartedAt = now
-  return slot.inFlight
+  slot.starts.push(now)
+  let released = false
+  return {
+    id: String(id || ''),
+    release() {
+      if (released) return
+      released = true
+      slot.inFlight = Math.max(0, slot.inFlight - 1)
+      wakeOpenAIWaiter()
+    },
+  }
 }
 
-export function releaseOpenAISlot(id) {
-  const key = String(id || '')
-  const slot = slots.get(key)
-  if (!slot) return 0
-  slot.inFlight = Math.max(0, slot.inFlight - 1)
-  return slot.inFlight
+export function openAIWaiterCount() {
+  return waiters.length
+}
+
+/** FIFO: one released seat wakes the oldest waiter. A woken waiter that still misses passes it on. */
+export function wakeOpenAIWaiter() {
+  const next = waiters.shift()
+  next?.wake()
+}
+
+/**
+ * Park until a seat frees, `deadline` passes, or `signal` aborts.
+ * Resolves `{ woken }`; throws `pool_wait_queue_full` past OPENAI_MAX_WAITERS.
+ */
+export function waitForOpenAICapacity({ deadline, signal = null } = {}) {
+  if (waiters.length >= OPENAI_MAX_WAITERS) {
+    return Promise.reject(Object.assign(new Error('OpenAI pool wait queue is full'), { code: 'pool_wait_queue_full' }))
+  }
+  return new Promise((resolve) => {
+    const entry = {}
+    const cleanup = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener?.('abort', onAbort)
+      const at = waiters.indexOf(entry)
+      if (at >= 0) waiters.splice(at, 1)
+    }
+    const onAbort = () => {
+      cleanup()
+      resolve({ woken: false, aborted: true })
+    }
+    entry.wake = () => {
+      cleanup()
+      resolve({ woken: true })
+    }
+    const timer = setTimeout(
+      () => {
+        cleanup()
+        resolve({ woken: false })
+      },
+      Math.max(1, Number(deadline) - Date.now()),
+    )
+    timer.unref?.()
+    waiters.push(entry)
+    if (signal?.aborted) onAbort()
+    else signal?.addEventListener?.('abort', onAbort, { once: true })
+  })
 }
 
 export function reportOpenAIAttempt(id, kind, firstOutputMs = null, now = Date.now()) {
@@ -85,5 +157,6 @@ export function reportOpenAIAttempt(id, kind, firstOutputMs = null, now = Date.n
 export function resetOpenAIAccountRuntime() {
   slots.clear()
   feedback.clear()
+  for (const entry of waiters.splice(0)) entry.wake()
   roundRobinCursor = 0
 }

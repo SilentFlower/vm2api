@@ -4,14 +4,21 @@ import { Link } from '@tanstack/react-router'
 import type { Vm, VmKernelSnapshot } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { patchVm } from '@/lib/api'
+import { isCodexVm } from '@/lib/vm-kind'
 import { Button } from '@/components/ui/button'
 import { dashboardQueryOptions } from '@/features/overview/queries'
+import {
+  DATAPLANE_HINT,
+  HOP_TRANSPORT_LABEL,
+  dataplaneLabel,
+} from '@/features/vm/dataplane-contract'
 import {
   DEFAULT_RESOLVED_ENGINE,
   inferenceEngineLabel,
   inferenceEnginePatchValue,
   normalizeInferenceEngine,
 } from '@/features/vm/engine-contract'
+import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
 import { vmQueryOptions } from '@/features/vm/queries'
 
 export function VmEngineEditor({
@@ -37,6 +44,7 @@ export function VmEngineEditor({
     resolved
   )
   const inherits = configured === 'auto'
+  const remote = isRemoteVm(vm)
   const status = useMemo(
     () => ({
       configured: inferenceEngineLabel(configured),
@@ -66,8 +74,18 @@ export function VmEngineEditor({
         <EngineValue label='解析后' value={status.resolved} />
         <EngineValue label='当前运行' value={status.active} />
       </div>
+      <div className='mt-3 grid gap-2 text-sm sm:grid-cols-2'>
+        <EngineValue
+          label='数据面'
+          value={isCodexVm(vm) ? '—' : dataplaneLabel(vm.resolved_dataplane)}
+        />
+      </div>
       <p className='mt-3 text-xs leading-relaxed text-muted-foreground'>
-        公开仓固定 Rust · Claude Code cli-hop，跟随{' '}
+        运输固定 {HOP_TRANSPORT_LABEL}。{DATAPLANE_HINT} 数据面在{' '}
+        <Link to='/wrap' className='underline underline-offset-4'>
+          内核页
+        </Link>{' '}
+        或{' '}
         <Link
           to='/settings/$tab'
           params={{ tab: 'protocol' }}
@@ -75,18 +93,23 @@ export function VmEngineEditor({
         >
           设置 → 协议
         </Link>
-        。Go HTTP 转发不再启用。
+        切换。Go HTTP 转发不再启用。
       </p>
       {inherits ? null : (
         <Button
           className='mt-3'
           variant='outline'
-          disabled={inherit.isPending}
+          disabled={inherit.isPending || remote}
           onClick={() => inherit.mutate()}
         >
           {inherit.isPending ? '恢复中…' : '恢复跟随全局'}
         </Button>
       )}
+      {remote ? (
+        <p className='mt-2 text-xs text-muted-foreground'>
+          切换推理内核：{REMOTE_UNSUPPORTED_TEXT}
+        </p>
+      ) : null}
     </CardSection>
   )
 }

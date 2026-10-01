@@ -16,6 +16,7 @@ import {
 import { isManualScheduleLocked } from '../pool/schedule-policy.mjs'
 import { isLeftoverQuotaScheduleOff } from '../pool/availability.mjs'
 import { manualScheduleLevelOf, parseScheduleLevelInput } from '../pool/credential-weight.mjs'
+import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { normalizeOwnerId, vmOriginOf } from '../admin/resource-owner.mjs'
 import { normalizeVmKind } from './vm-kind.mjs'
 import { validTimezone } from '../core/timezone.mjs'
@@ -67,6 +68,7 @@ export function summarizeVm(vm, projectRoot = null) {
     persona_preset: vm.persona_preset || null,
     seed_policy: vm.seed_policy || null,
     region: vm.region || vm.zone || null,
+    node_id: vm.node_id || null,
     note: vm.note || null,
     platform: kind.platform,
     family: kind.family,
@@ -83,12 +85,14 @@ export function summarizeVm(vm, projectRoot = null) {
     auth_scheme: kind.kind === 'codex' ? null : vm.claude?.auth_scheme || null,
     has_refresh: kind.kind === 'codex' ? !!codex?.has_refresh : hasRefreshPresence(vm.claude),
     refresh_error: kind.kind === 'codex' ? null : vm.claude?.refresh_error || null,
-    account_tier: kind.kind === 'codex' ? 'codex' : vm.claude?.account_tier || null,
+    account_tier:
+      kind.kind === 'codex' ? 'codex' : vm.claude?.account_tier || (hasAccessPresence(vm.claude) ? 'pro' : null),
     has_session_key: false,
     max_concurrency: vm.policy?.maxConcurrency ?? 2,
     max_rpm: vm.policy?.maxRpm ?? 0,
     session_slots: kind.kind === 'codex' ? null : (vm.policy?.sessionSlots ?? null),
     session_slots_override: kind.kind === 'codex' ? false : vm.policy?.sessionSlotsOverride === true,
+    quota_override: kind.kind === 'codex' ? null : vmQuotaOverrideOf(vm),
     allowed_models:
       Array.isArray(vm.policy?.allowed_models) && vm.policy.allowed_models.length
         ? vm.policy.allowed_models.map((id) => String(id || '').trim()).filter(Boolean)
@@ -124,6 +128,7 @@ export function summarizeVm(vm, projectRoot = null) {
     status_7d: quota.status_7d ?? null,
     codex_usage: codex?.usage || null,
     reset_credits: codex?.reset_credits || null,
+    plan_type: codex?.plan_type || null,
   }
 }
 
@@ -136,15 +141,17 @@ export function getActiveVmId(projectRoot) {
   }
 }
 
-export function persistAccountTier(projectRoot, vmId, tier) {
+export function persistAccountTier(projectRoot, vmId, tier, { source = null } = {}) {
   const key = String(tier || '').toLowerCase()
   if (key !== 'pro' && key !== 'max') return null
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
   if (!fs.existsSync(file)) return null
   const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
   vm.claude = vm.claude || {}
-  if (vm.claude.account_tier === key) return vm
+  if (vm.claude.account_tier_source === 'profile' && source !== 'profile' && source !== 'usage') return vm
+  if (vm.claude.account_tier === key && (vm.claude.account_tier_source || null) === source) return vm
   vm.claude.account_tier = key
+  vm.claude.account_tier_source = source
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
   return vm
@@ -239,6 +246,17 @@ export function persistAllowedModels(projectRoot, vmId, models) {
   return vm
 }
 
+/** Reload can recreate the container (new id, new exit network); the record must follow. Re-reads so other fields are not clobbered. */
+export function persistVmRuntime(projectRoot, vmId, runtime) {
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  if (!runtime || !fs.existsSync(file)) return null
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.runtime = runtime
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
 export function persistVmSessionSlots(projectRoot, vmId, value, { override = true } = {}) {
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
   if (!fs.existsSync(file)) return null
@@ -248,6 +266,19 @@ export function persistVmSessionSlots(projectRoot, vmId, value, { override = tru
     sessionSlots: value,
     sessionSlotsOverride: override,
   }
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
+/** `override` is a parsed `quota_override` (null clears it, the slot follows global quota again). */
+export function persistVmQuotaOverride(projectRoot, vmId, override) {
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  if (!fs.existsSync(file)) return null
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy = { ...(vm.policy || {}) }
+  if (override) vm.policy.quota = override
+  else delete vm.policy.quota
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
   return vm
@@ -275,6 +306,10 @@ function applySlotEnginePatch(vm, patch = {}) {
   if (Object.prototype.hasOwnProperty.call(patch, 'persona_preset')) {
     if (patch.persona_preset) vm.persona_preset = patch.persona_preset
     else delete vm.persona_preset
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, 'dataplane')) {
+    if (patch.dataplane) vm.dataplane = patch.dataplane
+    else delete vm.dataplane
   }
 }
 

@@ -142,6 +142,111 @@ test('backfillMissingCosts restores actual cost with the stored group multiplier
   assert.equal(store.repo.backfillMissingCosts(), 0)
 })
 
+function finishWith(store, model, usage) {
+  const ctx = store.start({ method: 'POST', headers: {}, socket: {} }, { protocol: 'x', pathName: '/v1' })
+  return store.finish(ctx, { status: 200, model, upstream_model: model, vm_id: 'vm-t', account_id: 'acc-t', usage })
+}
+
+test('tier-unpriced rows stay unpriced after backfill', () => {
+  const store = tmpStore('normal')
+  // gpt-5.5 publishes no >272K fast column; gpt-5.3-codex has no flex band.
+  const a = finishWith(store, 'gpt-5.5', { input_tokens: 1_000_000, output_tokens: 0, service_tier: 'priority' })
+  const b = finishWith(store, 'gpt-5.3-codex', { input_tokens: 1000, output_tokens: 0, service_tier: 'flex' })
+  assert.equal(a.total_cost, null)
+  assert.equal(a.pricing_model, 'unpriced')
+  assert.equal(a.service_tier, 'priority')
+  assert.equal(b.pricing_model, 'unpriced')
+  store.repo.billingStats()
+  const rows = store.db.prepare('SELECT total_cost, actual_cost, pricing_model FROM usage_logs ORDER BY id').all()
+  for (const r of rows) {
+    assert.equal(r.total_cost, null)
+    assert.equal(r.actual_cost, null)
+    assert.equal(r.pricing_model, 'unpriced')
+  }
+})
+
+test('backfill reprices with the stored service tier and speed', () => {
+  const store = tmpStore('normal')
+  const insert = store.db.prepare(`
+    INSERT INTO usage_logs (id, request_id, created_at, model, upstream_model, status,
+      input_tokens, output_tokens, service_tier, speed)
+    VALUES (?, ?, ?, ?, ?, 200, ?, 0, ?, ?)
+  `)
+  const now = new Date().toISOString()
+  // 100K stays under the 272K long-context threshold → plain flex band ($2.5/MTok input).
+  insert.run('log_bf_flex', 'rid_bf_flex', now, 'gpt-5.5', 'gpt-5.5', 100_000, 'flex', null)
+  insert.run('log_bf_fast', 'rid_bf_fast', now, 'claude-opus-4-8', 'claude-opus-4-8', 1_000_000, null, 'fast')
+  insert.run('log_bf_weird', 'rid_bf_weird', now, 'gpt-5.5', 'gpt-5.5', 1000, 'weird', null)
+  store.repo.backfillMissingCosts()
+  const got = Object.fromEntries(
+    store.db
+      .prepare("SELECT id, total_cost, pricing_model FROM usage_logs WHERE id LIKE 'log_bf_%'")
+      .all()
+      .map((r) => [r.id, [r.total_cost, r.pricing_model]]),
+  )
+  assert.deepEqual(got.log_bf_flex, [0.25, 'gpt-5.5'])
+  assert.deepEqual(got.log_bf_fast, [10, 'opus-4.5'])
+  assert.deepEqual(got.log_bf_weird, [null, 'unpriced'])
+  assert.equal(store.repo.backfillMissingCosts(), 0)
+})
+
+test('costByModel splits rows by billing band', () => {
+  const store = tmpStore('normal')
+  finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0, speed: 'fast' })
+  finishWith(store, 'claude-opus-4-8', { input_tokens: 1_000_000, output_tokens: 0 })
+  const rows = store.repo.costByModel({ vmId: 'vm-t' })
+  assert.equal(rows.length, 2)
+  const fast = rows.find((r) => r.speed === 'fast')
+  const std = rows.find((r) => r.speed !== 'fast')
+  assert.equal(fast.total_cost, 10)
+  assert.equal(fast.requests, 1)
+  assert.equal(std.total_cost, 5)
+  assert.equal(std.long_context, 0)
+})
+
+test('vmUsageStats buckets by Shanghai day, isolates the slot and ranks models and paths', () => {
+  const store = tmpStore('normal')
+  const insert = store.db.prepare(`
+    INSERT INTO usage_logs (id, request_id, created_at, path, model, upstream_model, status,
+      vm_id, input_tokens, output_tokens, total_cost, duration_ms)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 100, 50, ?, ?)
+  `)
+  const shanghaiDay = (offsetDays) =>
+    new Date(Date.now() + 8 * 3600_000 - offsetDays * 86400_000).toISOString().slice(0, 10)
+  // 16:30Z is 00:30 the next Shanghai day: a UTC bucket would file it under the wrong date.
+  const at = (offsetDays) => `${shanghaiDay(offsetDays + 1)}T16:30:00.000Z`
+  insert.run('u1', 'r1', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 1, 1000)
+  insert.run('u2', 'r2', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 1, 3000)
+  insert.run('u3', 'r3', at(2), '/v1/chat/completions', 'm-b', 'm-b', 200, 'vm-x', 4, null)
+  insert.run('u4', 'r4', at(0), '/v1/messages', 'm-a', 'm-a', 200, 'vm-other', 99, 1)
+  insert.run('u5', 'r5', at(40), '/v1/messages', 'm-a', 'm-a', 200, 'vm-x', 99, 1)
+  const out = store.repo.vmUsageStats({ vmId: 'vm-x', days: 30 })
+  assert.deepEqual(
+    out.history.map((h) => [h.day, h.requests, h.total_cost]),
+    [
+      [shanghaiDay(2), 1, 4],
+      [shanghaiDay(0), 2, 2],
+    ],
+  )
+  const today = out.history.at(-1)
+  // rows without a duration must not drag the average toward zero
+  assert.equal(today.duration_ms_sum / today.duration_n, 2000)
+  assert.equal(out.history[0].duration_n, 0)
+  assert.deepEqual(
+    out.models.map((m) => [m.name, m.requests]),
+    [
+      ['m-a', 2],
+      ['m-b', 1],
+    ],
+  )
+  assert.deepEqual(
+    out.endpoints.map((e) => e.name),
+    ['/v1/messages', '/v1/chat/completions'],
+  )
+  assert.equal(out.endpoints[0].tokens, 300)
+  assert.deepEqual(store.repo.vmUsageStats({ vmId: null }).history, [])
+})
+
 test('zero group multiplier keeps usage and key counters but charges no USD', () => {
   const store = tmpStore('normal')
   const groups = new GroupsRepo(store.db)
@@ -181,6 +286,51 @@ test('zero group multiplier keeps usage and key counters but charges no USD', ()
   assert.equal(stored.usage_5h, 0)
 })
 
+test('billingStats Extra window excludes older logs outside reset-5h', () => {
+  const store = tmpStore('normal')
+  const now = Date.parse('2026-09-26T12:00:00.000Z')
+  const ctxOld = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  store.finish(ctxOld, {
+    status: 200,
+    model: 'claude-opus-5',
+    upstream_model: 'claude-opus-5',
+    vm_id: 'vm-01',
+    account_id: 'acc-1',
+    usage: { input_tokens: 1_000_000, output_tokens: 0 },
+  })
+  store.repo.db.prepare('UPDATE usage_logs SET created_at = ? WHERE vm_id = ?').run('2026-09-26T08:00:00.000Z', 'vm-01')
+  const ctxNew = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'anthropic.messages', pathName: '/v1/messages' },
+  )
+  store.finish(ctxNew, {
+    status: 200,
+    model: 'claude-opus-5',
+    upstream_model: 'claude-opus-5',
+    vm_id: 'vm-01',
+    account_id: 'acc-1',
+    usage: { input_tokens: 200_000, output_tokens: 0 },
+  })
+  store.repo.db
+    .prepare(
+      "UPDATE usage_logs SET created_at = '2026-09-26T11:30:00.000Z' WHERE created_at > '2026-09-26T10:00:00.000Z'",
+    )
+    .run()
+  const reset5h = '2026-09-26T16:00:00.000Z'
+  const bill = store.billingStats({
+    now,
+    accountWindows: [{ account_id: 'acc-1', vm_id: 'vm-01', reset_5h: reset5h }],
+  })
+  assert.equal(bill.accounts[0].window_5h_requests, 1)
+  assert.ok(bill.accounts[0].window_5h_cost < 2)
+  assert.equal(bill.accounts[0].window_5h_cost, bill.window_5h.total_cost)
+  const rolling = store.billingStats({ now })
+  assert.equal(rolling.accounts[0].window_5h_requests, 2)
+})
+
 test('billingStats aggregates official cost per account and today', () => {
   const store = tmpStore('normal')
   const ctx = store.start(
@@ -216,6 +366,27 @@ test('billingStats aggregates official cost per account and today', () => {
   assert.equal(models[0].model, 'claude-opus-5')
   assert.equal(models[0].total_cost, 5)
   assert.equal(models[0].input_tokens, 1_000_000)
+})
+
+test('finish writes OpenAI Responses cache read and cache write', () => {
+  const store = tmpStore('normal')
+  const ctx = store.start(
+    { method: 'POST', headers: {}, socket: {} },
+    { protocol: 'openai.responses', pathName: '/v1/responses' },
+  )
+  const sum = store.finish(ctx, {
+    status: 200,
+    protocol: 'openai.responses',
+    model: 'gpt-5.6-sol',
+    upstream_model: 'gpt-5.6-sol',
+    usage: {
+      input_tokens: 100,
+      output_tokens: 4,
+      input_tokens_details: { cached_tokens: 80, cache_write_tokens: 10 },
+    },
+  })
+  assert.equal(sum.cache_read_tokens, 80)
+  assert.equal(sum.cache_creation_tokens, 10)
 })
 
 test('finish prices OpenAI usage with top-level cached_tokens', () => {
@@ -508,6 +679,22 @@ test('sanitizeRequestBodySnapshot redacts secrets and summarizes tools', async (
   assert.equal(snap.authorization, '[REDACTED]')
   assert.equal(snap.tools[0].name, 'Read')
   assert.ok(String(snap.messages[0].content).includes('…'))
+})
+
+test('sanitizeRequestBodySnapshot omits image bytes', async () => {
+  const { sanitizeRequestBodySnapshot } = await import('../../src/lib/admin/request-log.mjs')
+  const payload = 'iVBORw0KGgo'.repeat(20)
+  const snap = sanitizeRequestBodySnapshot({
+    messages: [
+      {
+        role: 'user',
+        content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: payload } }],
+      },
+    ],
+  })
+  assert.equal(snap.messages[0].content[0].source.data, undefined)
+  assert.equal(snap.messages[0].content[0].source.bytes, payload.length)
+  assert.equal(JSON.stringify(snap).includes(payload), false)
 })
 
 test('setConfig hot-updates mode', () => {

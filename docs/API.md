@@ -58,12 +58,12 @@ x-api-key: sk-vm-…
 | 钉槽（仅 master） | 虚拟机测试 loopback |
 | `X-Request-ID` | 原样回写响应头 |
 
-体大小上限默认 2MB。超限 `400 body_too_large`。
+体大小上限默认 128MB（`KIN_MAX_BODY` 可覆盖）。超限在选号之前返回 `413 body_too_large`，不进入号池。
 
 ## Messages
 
 ```bash
-curl -sS https://ccmax20.cc/v1/messages \
+curl -sS http://127.0.0.1:8787/v1/messages \
   -H "Authorization: Bearer $KEY" \
   -H "content-type: application/json" \
   -H "x-session-id: conv-1" \
@@ -82,10 +82,17 @@ curl -sS https://ccmax20.cc/v1/messages \
 
 支持的 Messages 字段原样进入清洗层：`system`、`tools`、`tool_choice`、`thinking`、`output_config`、`metadata`、`stop_sequences`、图片块、`cache_control`。非法 `role` 会洗掉。OpenAI 形态 tools 出现在本口时先转成 Anthropic tools，但仍判非官方。
 
+### Sonnet 5.5 兼容边界
+
+`claude-sonnet-5-5` 不支持原生强制工具调用。Node 沿用 Opus 5.5 策略：`tool_choice=any/tool/required` 转成 `{type:auto}`；指定名称的客户端工具设置 `strict:true`，服务端工具不加该字段。不注入提示词，也不把普通文本伪造成工具调用。**strict 只约束实际工具调用的参数，不保证一定调用或只调用指定工具。** 需要原生强制调用时继续使用支持该能力的模型，例如 `claude-sonnet-5`；其行为不变。
+
+规则覆盖 Messages、Chat Completions、Responses 的出站清洗。`auto` / `none` 保持；不支持的 disabled/enabled thinking 转为 adaptive，保留 display。结构化输出转换保留 `output_config.effort`，已有 `output_config.format` 优先，否则从 `response_format` / `text.format` 合并，cli-hop 与普通出站路径均补齐对象 schema 的 `additionalProperties:false`（不覆盖显式值）。
+
+
 ## Chat Completions
 
 ```bash
-curl -sS https://ccmax20.cc/v1/chat/completions \
+curl -sS http://127.0.0.1:8787/v1/chat/completions \
   -H "Authorization: Bearer $KEY" \
   -H "content-type: application/json" \
   -d '{
@@ -142,7 +149,7 @@ curl -sS https://ccmax20.cc/v1/chat/completions \
 ## 模型目录
 
 ```bash
-curl -sS https://ccmax20.cc/v1/models -H "Authorization: Bearer $KEY"
+curl -sS http://127.0.0.1:8787/v1/models -H "Authorization: Bearer $KEY"
 ```
 
 读面板持久化的 `model_policy`，**不** hop 槽位 `/v1/models`。未入库的 id → `400`，请求被拒，不上游。别名如 `claude-haiku-4-5` 可解析到带日期的目录项。出站 `model` 去掉 `[1m]` 后缀。
@@ -155,14 +162,14 @@ curl -sS https://ccmax20.cc/v1/models -H "Authorization: Bearer $KEY"
 - 完整 OAuth：不 hop count_tokens，返回与 `GET /v1/usage` 相同的 5H/7D
 
 ```bash
-curl -sS https://ccmax20.cc/v1/messages/count_tokens \
+curl -sS http://127.0.0.1:8787/v1/messages/count_tokens \
   -H "Authorization: Bearer $KEY" \
   -H "content-type: application/json" \
   -d '{"model":"claude-sonnet-5","messages":[{"role":"user","content":"hi"}]}'
 ```
 
 ```bash
-curl -sS https://ccmax20.cc/v1/usage -H "Authorization: Bearer $KEY"
+curl -sS http://127.0.0.1:8787/v1/usage -H "Authorization: Bearer $KEY"
 ```
 
 `GET /v1/usage` 仅完整 OAuth。成功：
@@ -176,14 +183,26 @@ curl -sS https://ccmax20.cc/v1/usage -H "Authorization: Bearer $KEY"
 }
 ```
 
-`utilization` 0–100。有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。Setup Token / API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
+`utilization` 0–100。有 Messages Extra 用 Extra；两窗都空才走一次带缓存的官方 `/api/oauth/usage`（`source=oauth-usage`）。Setup Token 只有 `user:inference` 时官方 usage 会返回 scope 错误；服务端保留失败原因，不把它当吊销/封禁，也不改历史套餐。Console API Key 调 `/v1/usage` → `400 usage_unsupported`。窗缺失为 `null`，不伪装 0%。
+
+## 面板额度探测
+
+`POST /api/panel/probe` 是手动 fresh 探测，默认等同：
+
+```json
+{ "hop": true, "force": true }
+```
+
+可传 `{ "hop": false }` 只读最近 Messages 响应头缓存；`force:false` 则允许复用 usage cache。返回 `items[]`，每项 `ok:false` 会带 `error`，顶栏按成功/失败分别提示。
+
+套餐判定只认成功且完整的官方 usage：必须有 5h、7d，并能确定 Fable 7d 是否存在；有 Fable 7d 即 Max，没有即 Pro。失败、scope 不足、只有 5h、CLI 文本不完整都不改套餐。未知但有票的账号在面板显示为“待探测/未确认”，不是第三套餐。
 
 
 
 ## 健康
 
 ```bash
-curl -sS https://ccmax20.cc/health
+curl -sS http://127.0.0.1:8787/health
 ```
 
 无鉴权。含 `features`、`limitations`、`stats`。能力字面量：`passthrough`、`stream`、`verified-stream`、`protocol-convert`、`go-slot-worker`、`account-pool-failover`、`weighted-round-robin`、`tools`、`client-workspace`、`count_tokens`、`account_usage`。
@@ -216,9 +235,45 @@ curl -sS https://ccmax20.cc/health
 | `upstream_error` | 401/403/502 |
 | `api_error` | 500 |
 
-429 可能带 `retry-after`。恢复备份期间协议口 `503 restore_in_progress`。健康探测短请求在无缓存且 fail-closed 时 `503`。池耗尽返回明确耗尽，不伪装过载。
+429 可能带 `retry-after`。恢复备份期间协议口 `503 restore_in_progress`。健康探测短请求在无缓存且 fail-closed 时 `503`。
+
+号池结果分开返回，不互相伪装：
+
+| 情况 | HTTP | code | message |
+|---|---|---|---|
+| 所有合格执行位都忙，有界等待（或等待队列）用完 | 429 | `pool_overloaded` | 号池负载过高，稍后再试 |
+| 没有任何合格账号（未配置、额度 / 凭证 / 模型 / 人工关闭都不合格） | 503 | `pool_unavailable` | 号池当前没有可用账号 |
+| 已经执行过、最后一跳失败 | 上游本义 | 上游错误码（如 `incomplete_response`、429、401） | 上游本义 |
+
+`pool_overloaded` 只有在已知恢复时刻（冷却、RPM 窗口、会话窗口到期）时才带 `retry-after`。OpenAI 槽同样如此。续接 `previous_response_id` 的 Responses 请求只能在原 GPT 账号上继续；该账号已不可用时返回 `409 response_not_portable`，请带完整上下文重新发起。
 
 客户端断开不计 SLA、不处罚账号。
+
+### `502 incomplete_response`
+
+```json
+{"error":{"type":"upstream_error","code":"incomplete_response","message":"Assistant hop ended without visible output or stop_reason"}}
+```
+
+含义：请求已交给槽内 CLI，但这一轮结束时既没有可见输出（text / tool_use / refusal），也没有 `stop_reason`。只有 thinking 也算。上一次执行已经结束且尚未向客户端写出时，网关先换到别的空闲 VM 重放，没有空位才回到同一 VM；同一请求在同一 VM 上最多实际执行 3 次（含传输层隐藏重试）。都用完仍不完整，才把这个 502 交回客户端。这一次请求不停调、不写账号冷却，也不因计数重启 CLI。一开始就没有可用账号时，返回 `pool_unavailable`。客户端主动断开是 `client_cancelled`，不是这个错误。诊断钉死在某一个槽时，停在该槽并返回这个错误。
+
+常见原因与处理：
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 同一个槽的请求**全部**失败，每次约 20–30 秒才返回；面板代理探测却是绿的 | 槽容器到宿主机 `kin-egress` 网关被宿主机防火墙拦截（常见于 UFW 入站默认拒绝）。容器内 DNS 和出站 TCP 都超时，CLI 重试到放弃，没有任何输出 | 放行 `keg*` 网卡到网关端口的入站，见 [DEPLOY.md「防火墙」](DEPLOY.md#防火墙ufw--firewalld) |
+| 偶发，重试后成功 | 上游流中断或模型只返回了 thinking | 客户端重试即可；网关已先换空闲 VM 重放，同一 VM 最多 3 次 |
+| 某个槽持续失败，重启槽后恢复 | 槽内 CLI 卡死，slot 未释放 | 面板重启该槽 |
+
+面板代理探测是从宿主机本机连网关端口，不经过「容器 → 网关」这一跳，所以防火墙拦截时它仍显示正常。确认方法：
+
+```bash
+# 在宿主机上，进入出问题的槽容器测 DNS 和出站
+docker exec kin-<槽> getent hosts api.anthropic.com
+docker exec kin-<槽> curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 https://api.anthropic.com
+```
+
+两条都超时即为防火墙拦截；能解析且返回 HTTP 状态码（如 404）说明出口正常，再查上游和凭证。
 
 ## 交付与粘性
 
@@ -236,7 +291,11 @@ stateDiagram-v2
 
 - **realtime（默认）**：第一段业务 SSE 写出后不再换账号。
 - **verified**：收齐 `message_stop` 再给客户端；不完整则继续换号。
-- sticky：同一 `x-session-id`（及 routing 里其它键）在终态成功后绑槽；槽冷却 / 死票会拆粘性再选。
+- sticky：同一会话（`x-session-id` 等键）在终态成功后绑槽。绑定是偏好，不是过滤：绑定槽忙（并发、RPM、执行位满、未知 429 短冷却）时，这一轮借用同平台别的空闲合格槽，绑定不动，下一轮仍回原槽；额度 / 凭证 / 暂停等确定失效才把会话连同会话窗口迁走。
+- 重试预算：每个 VM 每请求最多 3 次实际执行；准入竞争失败不算一次执行。`failover.max_total_attempts` / `max_account_switches` 用完后只再尝试本请求还没试过的 VM，直到 `total_retry_deadline_ms`。
+- 子请求：带显式 `parent_session_id` / `root_session_id` 且父会话在本地已有绑定时，子请求计入父会话的会话窗口，不新占 `max_sessions`；每个并行子请求仍各占一个执行位、并发与 RPM。没有显式父子字段时，同设备的新会话不会被当作子请求。
+- Claude Code 子 agent：请求头带 `x-claude-code-agent-id` 时，按上一条的子请求处理，父会话是 `metadata.user_id.session_id`，子会话 ID 由它和 agent ID 派生。每个 agent 单独排队、单独占执行位，落在父会话同一 VM 的任意空闲执行位，不等父会话当前这一轮。
+- 裸 429（没有 5h/7d 头、没有套餐文案）不按模型名定范围：当前执行单元短暂让位并触发一次 `/usage` 探测，由真实用量决定是否是账号额度。上游文本点名模型的才按模型冷却，每分钟限流按 RPM 短冷却。
 
 ## 用量回包
 

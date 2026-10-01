@@ -1,12 +1,7 @@
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link, useNavigate, useParams } from '@tanstack/react-router'
-import type {
-  TestModelsPayload,
-  Vm,
-  VmKernelSnapshot,
-  VmProxySnap,
-} from '@/types/panel-vm'
+import type { Vm, VmKernelSnapshot, VmProxySnap } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import {
@@ -62,17 +57,15 @@ import { VmOverviewTab } from '@/features/vm/detail-overview-tab'
 import { VmProxyTab } from '@/features/vm/detail-proxy-tab'
 import { VmDetailSkeleton } from '@/features/vm/detail-skeleton'
 import { VmTestTab } from '@/features/vm/detail-test-tab'
-import {
-  testModelsQueryOptions,
-  vmQueryOptions,
-  vmSeedQueryOptions,
-} from '@/features/vm/queries'
+import { NodeChip } from '@/features/vm/node-chip'
+import { probeOutcome, type ProbeCheck } from '@/features/vm/probe-status'
+import { vmQueryOptions, vmSeedQueryOptions } from '@/features/vm/queries'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
 } from '@/features/vm/schedulable-switch'
 import { SeedPolicyCard } from '@/features/vm/seed-policy-card'
-import type { TestChatResult } from '@/features/vm/test-chat-types'
+import { useVmTestChat } from '@/features/vm/use-vm-test-chat'
 
 function postVm<T = unknown>(id: string, path: string, body?: unknown) {
   return api<T>(`/api/panel/vms/${encodeURIComponent(id)}${path}`, {
@@ -90,13 +83,9 @@ export function VmDetailPage() {
   const detail = useQuery(vmQueryOptions(id))
   const seed = useQuery(vmSeedQueryOptions(id))
   const routing = useQuery(routingQueryOptions())
-  const testModels = useQuery(testModelsQueryOptions(id))
+
   const [tab, setTab] = useState('overview')
-  const [prompt, setPrompt] = useState('hello')
-  const [model, setModel] = useState('')
-  const [maxTokens, setMaxTokens] = useState(8192)
-  const [reasoningEffort, setReasoningEffort] = useState('medium')
-  const [testResult, setTestResult] = useState<TestChatResult | null>(null)
+
   const [bindId, setBindId] = useState('')
   const [confirmDel, setConfirmDel] = useState(false)
   const [confirmReset, setConfirmReset] = useState(false)
@@ -109,13 +98,7 @@ export function VmDetailPage() {
   const proxy = ((data.proxy as VmProxySnap | undefined) ||
     vm.proxy ||
     {}) as VmProxySnap
-  const models = testModels.data?.items || testModels.data?.models || []
-  useEffect(() => {
-    if (!models.length) return
-    if (!model || !models.some((item) => item.id === model)) {
-      setModel(models[0].id)
-    }
-  }, [models, model])
+  const test = useVmTestChat(vm)
   const refreshAll = async () => {
     await Promise.all([
       qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
@@ -126,8 +109,14 @@ export function VmDetailPage() {
   const act = useMutation({
     mutationFn: ({ path, body }: { path: string; body?: unknown }) =>
       postVm(id, path, body),
-    onSuccess: async (_data, vars) => {
-      toast.success('已执行 ' + vars.path)
+    onSuccess: async (data, vars) => {
+      if (vars.path === '/probe') {
+        const probe = data as ProbeCheck
+        if (probe.ok === true) toast.success(probeOutcome(probe))
+        else toast.error(probeOutcome({ ...probe, ok: false }))
+      } else {
+        toast.success('已执行 ' + vars.path)
+      }
       await refreshAll()
     },
     onError: (error: Error) => toast.error(error.message),
@@ -150,35 +139,7 @@ export function VmDetailPage() {
     },
     onError: (error: Error) => toast.error(error.message),
   })
-  const testChat = useMutation({
-    mutationFn: () =>
-      postVm<TestChatResult>(id, '/test-chat', {
-        model: model || models[0]?.id,
-        prompt,
-        ...(isCodexVm(vm)
-          ? { reasoning_effort: reasoningEffort }
-          : { max_tokens: maxTokens }),
-      }),
-    onSuccess: (data) => {
-      setTestResult(data)
-      // 外层 envelope 的 ok 恒为 true（业务成败在剥壳后的 data.ok），
-      // 所以失败也会走到这里 —— 不能只 toast.success。
-      if (data?.ok) {
-        toast.success(`测试成功 · ${data.duration_ms ?? 0}ms`)
-      } else {
-        toast.error(`测试失败：${data?.error?.message || '未知错误'}`)
-      }
-    },
-    onError: (error: Error) => {
-      setTestResult({
-        ok: false,
-        duration_ms: 0,
-        log: [],
-        error: { message: error.message },
-      })
-      toast.error(error.message)
-    },
-  })
+
   const saveSeed = useMutation({
     mutationFn: (body: Record<string, unknown>) =>
       api(`/api/panel/vms/${encodeURIComponent(id)}/seed-settings`, {
@@ -216,7 +177,7 @@ export function VmDetailPage() {
   const pool = proxies.data?.proxies || []
   const boundId = String(proxy.id || vm.proxy_id || '')
   const free = pool.filter((p) => {
-    if (!p.enabled || p.status === 'dead') return false
+    if (!p.enabled || p.status === 'dead' || p.blocked_reason) return false
     const ids = p.bound_vm_ids || (p.bound_vm_id ? [p.bound_vm_id] : [])
     return !ids.includes(id) && ids.length < (p.bind_limit || 5)
   })
@@ -247,8 +208,19 @@ export function VmDetailPage() {
   const todayWriteCache = Number(
     acc.today_cache_creation_tokens ?? vm.today_cache_creation_tokens ?? 0
   )
-  const todayInput = Number(acc.tokens_in ?? vm.tokens_in ?? 0)
-  const todayHit = cacheHitPct(todayInput, todayReadCache, todayWriteCache)
+  const todayInput = Number(
+    acc.today_input_tokens ??
+      vm.today_input_tokens ??
+      acc.tokens_in ??
+      vm.tokens_in ??
+      0
+  )
+  const todayHit = cacheHitPct(
+    todayInput,
+    todayReadCache,
+    todayWriteCache,
+    isCodexVm(vm) ? 'openai' : 'anthropic'
+  )
   const credType = credTypeOf(vm)
   const officialCc = supportsOfficialCc(vm)
   const canRefresh = canRefreshCredential(vm)
@@ -295,6 +267,7 @@ export function VmDetailPage() {
             </Select>
           ) : null}
           <PlatformChip vm={vm} />
+          <NodeChip nodeId={vm.node_id} className='text-[11px]' />
           <StatusMark tone={accountStatus(vm)} variant='pill' />
           {claudeTier(vm).key !== 'none' ? (
             <StatusMark tone={claudeTier(vm)} variant='pill' />
@@ -361,6 +334,8 @@ export function VmDetailPage() {
             sess={sess}
             conc={conc}
             rpm={rpm}
+            costByModel={data.billing?.by_model}
+            billing={data.billing}
           />
           <VmAccountTab
             id={id}
@@ -412,38 +387,33 @@ export function VmDetailPage() {
                 })
                 .catch((error: Error) => toast.error(error.message))
             }
+            onProbe={() =>
+              api(`/api/panel/proxies/${boundId}/probe`, { method: 'POST' })
+                .then(() => {
+                  toast.success('探测完成')
+                  return refreshAll()
+                })
+                .catch((error: Error) => toast.error(error.message))
+            }
+            onGeo={() =>
+              api<{
+                geo?: { timezone?: string | null; country?: string | null }
+              }>(`/api/panel/proxies/${boundId}/geo`, { method: 'POST' })
+                .then((data) => {
+                  const where = [data.geo?.country, data.geo?.timezone]
+                    .filter(Boolean)
+                    .join(' · ')
+                  toast.success(where ? `出口位置 ${where}` : '已检测')
+                  return refreshAll()
+                })
+                .catch((error: Error) => toast.error(error.message))
+            }
           />
           <VmTestTab
-            models={models}
-            model={model}
-            prompt={prompt}
-            maxTokens={maxTokens}
-            reasoningEffort={reasoningEffort}
+            {...test}
             credType={credType}
             isCodex={isCodexVm(vm)}
-            result={testResult}
-            running={testChat.isPending}
-            modelsRefreshing={testModels.isFetching}
-            onModelChange={setModel}
-            onPromptChange={setPrompt}
-            onMaxTokensChange={setMaxTokens}
-            onReasoningEffortChange={setReasoningEffort}
-            onTest={() => {
-              setTestResult(null)
-              testChat.mutate()
-            }}
-            onRefreshModels={() => {
-              void (async () => {
-                try {
-                  const data = await api<TestModelsPayload>(
-                    `/api/panel/test-models?vm_id=${encodeURIComponent(id)}&refresh=1`
-                  )
-                  qc.setQueryData(testModelsQueryOptions(id).queryKey, data)
-                } catch (error) {
-                  toast.error((error as Error).message || '刷新模型失败')
-                }
-              })()
-            }}
+            dataplane={vm.resolved_dataplane}
           />
           <VmOpsTab
             vm={vm}

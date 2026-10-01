@@ -45,6 +45,7 @@ import {
   normalizePersonaAgent,
   wrapMandatoryConstraint,
 } from '../../src/lib/identity/crs-persona.mjs'
+import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
 import { officialSystemKinds } from '../../src/lib/protocol/case-features.mjs'
 import { sanitizeInboundCwd } from '../../src/lib/identity/official-cc-system-2.1.241.mjs'
 import { officialMessagesBody } from '../../src/lib/protocol/anthropic-messages.mjs'
@@ -98,7 +99,7 @@ test('empty unofficial system still writes official 4 blocks', () => {
   assert.equal(out.system[0].cache_control, undefined)
   assert.match(
     out.system[0].text,
-    /^x-anthropic-billing-header: cc_version=2\.1\.280\.[0-9a-f]{3}; cc_entrypoint=sdk-cli; cch=[0-9a-f]{5}; cc_prompt_id=[0-9a-f-]{36};$/,
+    /^x-anthropic-billing-header: cc_version=2\.1\.284\.[0-9a-f]{3}; cc_entrypoint=sdk-cli; cch=[0-9a-f]{5}; cc_prompt_id=[0-9a-f-]{36}; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;$/,
   )
   assert.equal(out.system[1].text, CRS_OFFICIAL_SYSTEM)
   assert.equal(out.system[1].cache_control, undefined)
@@ -559,17 +560,19 @@ test('personaModeFromRoutingFile rereads disk so scp applies without restart', (
   fs.rmSync(dir, { recursive: true, force: true })
 })
 
-test('official_prompt keeps billing identity overlay and skips env and injected agent', () => {
+test('official_prompt keeps billing identity overlay, slot env, and skips injected agent', () => {
   const out = applyCrsUnofficialPersona(
     {
       messages: [{ role: 'user', content: 'hello official prompt' }],
     },
     { mode: 'official_prompt', park: true },
   )
-  assert.equal(out.system.length, 2)
+  assert.equal(out.system.length, 3)
   assert.match(out.system[0].text, /x-anthropic-billing-header:/)
   assert.equal(out.system[1].text, CRS_OFFICIAL_SYSTEM)
-  assert.ok(!out.system.some((b) => String(b?.text || '').includes('# Environment')))
+  assert.match(out.system[2].text, /^# Environment\n - Timezone: /)
+  assert.equal(out.system[2].cache_control, undefined)
+  assert.ok(!out.system.some((b) => String(b?.text || '').includes(DEFAULT_AGENT_STANDING)))
   assert.ok(!out.system.some((b) => b?.text === CRS_AGENT_EXPANSION))
   assert.ok(!out.system.some((b) => b?.text === CRS_OFFICIAL_AGENT_PROMPT))
   const first = out.messages[0].content
@@ -587,10 +590,10 @@ test('official_prompt writes caller agent into the official slot and leftover af
     },
     { mode: 'official_prompt', park: false },
   )
-  assert.equal(out.system.length, 3)
+  assert.equal(out.system.length, 4)
   assert.equal(out.system[2].text, CRS_OFFICIAL_AGENT_PROMPT)
   assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '1h', scope: 'global' })
-  assert.ok(!out.system.some((b) => String(b?.text || '').includes('# Environment')))
+  assert.match(out.system[3].text, /^# Environment/)
   assert.ok(!out.system.some((b) => b?.text === '你是一个高速收费员。'))
   assert.equal(out.messages[0].role, 'user')
   assert.equal(out.messages[1].role, 'system')
@@ -605,7 +608,6 @@ test('official leftover is a mid-conversation role=system after the first user',
     },
     { mode: 'official_prompt', park: false },
   )
-  assert.equal(out.system.length, 2)
   assert.equal(out.messages.length, 2)
   assert.equal(out.messages[0].content, '你是谁？')
   assert.equal(out.messages[1].role, 'system')
@@ -1158,7 +1160,7 @@ test('zero inject writes billing prompt_version, env timezone, and leftover', ()
       identity: { timezone: 'Asia/Shanghai' },
     },
   )
-  assert.equal(out.system.length, 4)
+  assert.equal(out.system.length, 5)
   assert.match(out.system[0].text, /^x-anthropic-billing-header: /)
   assert.match(out.system[0].text, /prompt_version=<You are Anthropic Claude Agent SDK\.>/)
   assert.ok(!/\n/.test(out.system[0].text))
@@ -1167,12 +1169,31 @@ test('zero inject writes billing prompt_version, env timezone, and leftover', ()
   assert.equal(out.system[2].text, CRS_EMPTY_IDENTITY_TEXT)
   assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.ok(!out.system.some((b) => b?.text === CRS_AGENT_EXPANSION))
-  assert.ok(!out.system.some((b) => String(b?.text || '').includes('# Environment')))
-  assert.equal(out.system[3].text, '你是一个高速收费员。')
-  assert.deepEqual(officialSystemKinds(out.system), ['billing', 'identity', 'block_2', 'block_3'])
+  assert.equal(out.system[3].text, '# Environment\n - Timezone: Asia/Shanghai')
+  assert.equal(out.system[3].cache_control, undefined)
+  assert.equal(out.system[4].text, '你是一个高速收费员。')
   assert.equal(out.system.filter((block) => String(block?.text || '').trim() === CRS_OFFICIAL_SYSTEM).length, 0)
   assert.equal(firstUserContent(out), '你好呀。')
   assert.ok(!String(firstUserContent(out)).includes('<system-reminder>'))
+})
+
+test('zero inject prepends standing constraints to caller_agent', () => {
+  const agent = 'You are an interactive agent that helps users with software engineering tasks.'
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-zero-standing-'))
+  const routingFile = path.join(dir, 'routing.json')
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: { agent_standing_presets: { zero: true } } }))
+  try {
+    const out = applyCrsUnofficialPersona(
+      {
+        system: agent,
+        messages: [{ role: 'user', content: 'hi' }],
+      },
+      { mode: 'zero', routingFile },
+    )
+    assert.equal(out.system[2].text, `${DEFAULT_AGENT_STANDING}\n${agent}`)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 test('zero inject ignores persona_agent and writes env timezone without agent', () => {
@@ -1182,14 +1203,13 @@ test('zero inject ignores persona_agent and writes env timezone without agent', 
     },
     { mode: 'zero', agent: 'required', identity: { timezone: 'UTC' } },
   )
-  assert.equal(out.system.length, 3)
+  assert.equal(out.system.length, 4)
   assert.match(out.system[0].text, /prompt_version=</)
   assert.ok(!out.system.some((b) => b?.text === CRS_AGENT_PROMPT_REQUIRED))
   assert.equal(out.system[1].text, CRS_EMPTY_IDENTITY_TEXT)
   assert.equal(out.system[2].text, CRS_EMPTY_IDENTITY_TEXT)
   assert.deepEqual(out.system[2].cache_control, { type: 'ephemeral', ttl: '1h' })
-  assert.ok(!out.system.some((b) => String(b?.text || '').includes('# Environment')))
-  assert.deepEqual(officialSystemKinds(out.system), ['billing', 'identity', 'block_2'])
+  assert.equal(out.system[3].text, '# Environment\n - Timezone: UTC')
 })
 
 test('zero inject with no caller system is billing plus env timezone', () => {
@@ -1199,13 +1219,12 @@ test('zero inject with no caller system is billing plus env timezone', () => {
     },
     { mode: 'zero' },
   )
-  assert.equal(out.system.length, 3)
+  assert.equal(out.system.length, 4)
   assert.match(out.system[0].text, /prompt_version=<You are Anthropic Claude Agent SDK\.>/)
   assert.equal(out.system[1].text, CRS_EMPTY_IDENTITY_TEXT)
   assert.equal(out.system[2].text, CRS_EMPTY_IDENTITY_TEXT)
   assert.ok(!out.system.some((b) => b?.text === CRS_AGENT_EXPANSION))
-  assert.ok(!out.system.some((b) => String(b?.text || '').includes('# Environment')))
-  assert.deepEqual(officialSystemKinds(out.system), ['billing', 'identity', 'block_2'])
+  assert.match(out.system[3].text, /^# Environment\n - Timezone: \S+$/)
   assert.ok(!String(firstUserContent(out)).includes('<system-reminder>'))
 })
 
@@ -1216,14 +1235,27 @@ test('refreshOfficialSystemEnvironment rewrites zero inject timezone after VM pi
     },
     { mode: 'zero', identity: { timezone: 'UTC' } },
   )
-  assert.equal(first.system.length, 3)
-  assert.equal(first.system[1].text, CRS_EMPTY_IDENTITY_TEXT)
-  assert.equal(first.system[2].text, CRS_EMPTY_IDENTITY_TEXT)
+  assert.equal(first.system[3].text, '# Environment\n - Timezone: UTC')
   const refreshed = refreshOfficialSystemEnvironment(first, { timezone: 'Europe/London' }, 'claude-sonnet-5')
   assert.equal(refreshed.system[0].text, first.system[0].text)
   assert.equal(refreshed.system[1].text, CRS_EMPTY_IDENTITY_TEXT)
   assert.equal(refreshed.system[2].text, CRS_EMPTY_IDENTITY_TEXT)
-  assert.ok(!refreshed.system.some((b) => String(b?.text || '').includes('# Environment')))
+  assert.equal(refreshed.system[3].text, '# Environment\n - Timezone: Europe/London')
+})
+
+test('zero env follows persona_env_presets per preset', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zero-env-'))
+  const routingFile = path.join(dir, 'routing.json')
+  fs.writeFileSync(
+    routingFile,
+    JSON.stringify({ compatibility: { persona_preset: 'zero', persona_env_presets: { zero: false } } }),
+  )
+  const out = applyCrsUnofficialPersona(
+    { system: 'caller', messages: [{ role: 'user', content: 'hi' }] },
+    { routingFile, identity: { timezone: 'Asia/Tokyo' } },
+  )
+  assert.ok(!out.system.some((b) => String(b?.text || '').includes('# Environment')))
+  assert.equal(out.system.at(-1).text, 'caller')
 })
 
 test('new official identity variant plus UA and user_id skips rewrite', () => {
