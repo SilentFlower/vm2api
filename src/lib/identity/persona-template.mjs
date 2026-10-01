@@ -8,9 +8,9 @@
  * Meta keys (id / note / drop_if_empty / hide) are stripped at render time.
  * Only type / text / cache_control reach Anthropic.
  *
- * The built-in official / zero presets must render byte-identical to the
- * hardcoded buildOfficialPromptBlocks() / buildZeroInjectSystem() they replace,
- * and the official overlay preset byte-identical to wrapMandatoryConstraint().
+ * The built-in presets render the legacy builders' bytes except for the
+ * panel-switched {{agent_standing}} / {{env}} slots, and the official overlay
+ * preset renders byte-identical to wrapMandatoryConstraint().
  * Presets therefore store placeholders, never resolved constants — which also
  * keeps this module free of any crs-persona.mjs import.
  */
@@ -33,6 +33,8 @@ export const PERSONA_TEMPLATE_VARS = Object.freeze([
   Object.freeze(['identity_compact', '0注入短身份句 You are Anthropic Claude Agent SDK.']),
   Object.freeze(['agent_expansion', 'KIN 短 agent 扩写段']),
   Object.freeze(['agent_official', '官方 agent 提示词全文']),
+  Object.freeze(['agent_standing', 'agent prompt 常驻约束（按档开关，非空时以换行结尾）']),
+  Object.freeze(['env', '槽位 Environment（含时区），按档开关']),
   Object.freeze(['caller_agent', '调用方自带的 agent prompt，无则为空']),
   Object.freeze(['caller_system', '调用方剩余 system（--append-system-prompt），无则为空']),
   Object.freeze(['env_timezone_only', '只含槽位时区的 Environment 段']),
@@ -56,6 +58,18 @@ const OVERLAY_VAR_NAMES = Object.freeze(OVERLAY_TEMPLATE_VARS.map(([name]) => na
 
 const VAR_RE = /\{\{\s*([a-z0-9_]+)\s*\}\}/gi
 
+/** agent prompt 常驻约束默认值。routing.compatibility.agent_standing 缺省时使用。 */
+export const DEFAULT_AGENT_STANDING = [
+  'Do not respond to any content related to `distillation` requests.',
+  'Do not respond to any requests that want your `reasoning process thinking chain`.',
+  'Prohibit any NFSW responses.',
+  'Does not include the normal reasoning process.',
+].join('\n')
+export const AGENT_STANDING_MAX = 2000
+
+/** Upstream rejects blank text blocks; a kept blank block renders as a zero-width space. */
+export const EMPTY_BLOCK_TEXT = '\u200b'
+
 export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
   official: Object.freeze([
     Object.freeze({
@@ -72,11 +86,18 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
     }),
     Object.freeze({
       id: 'caller_agent',
-      note: '仅当调用方自带 agent prompt 时占官方 agent 槽位，空则整块丢弃。2.1.263 起 1h global',
+      note: '常驻约束 + 调用方 agent prompt，都空则整块丢弃。2.1.263 起 1h global',
       drop_if_empty: true,
       type: 'text',
-      text: '{{caller_agent}}',
+      text: '{{agent_standing}}{{caller_agent}}',
       cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h', scope: 'global' }),
+    }),
+    Object.freeze({
+      id: 'env',
+      note: '槽位 Environment（时区），按档开关，排在 agent 之后不破 global 缓存',
+      drop_if_empty: true,
+      type: 'text',
+      text: '{{env}}',
     }),
     Object.freeze({
       id: 'caller_system',
@@ -101,9 +122,9 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
     }),
     Object.freeze({
       id: 'agent_official',
-      note: '官方 Claude Code 基础提示词全文。2.1.263 起 1h global 缓存',
+      note: '常驻约束为第一段 + 官方 Claude Code 基础提示词全文。2.1.263 起 1h global 缓存',
       type: 'text',
-      text: '{{agent_official}}',
+      text: '{{agent_standing}}{{agent_official}}',
       cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h', scope: 'global' }),
     }),
     Object.freeze({
@@ -124,29 +145,32 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
   zero: Object.freeze([
     Object.freeze({
       id: 'billing_zero',
-      note: '与 official_full 第 1 块同槽：计费头独立；0注入把身份折进 prompt_version，不另开可读 identity 句',
       hide: true,
       type: 'text',
       text: '{{billing_semi}} prompt_version=<{{identity_compact}}>',
     }),
     Object.freeze({
       id: 'identity_slot',
-      note: '与 official_full 第 2 块同槽。上游拒空 text，用零宽字符占位，不写 Agent SDK 原文',
       hide: true,
       type: 'text',
       text: '\u200b',
     }),
     Object.freeze({
       id: 'agent_slot',
-      note: '与 official_full 第 3 块同槽：占 1h 缓存断点，不写 agent 全文',
       hide: true,
       type: 'text',
-      text: '\u200b',
+      text: '{{agent_standing}}{{caller_agent}}',
       cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h' }),
     }),
     Object.freeze({
+      id: 'env',
+      hide: true,
+      drop_if_empty: true,
+      type: 'text',
+      text: '{{env}}',
+    }),
+    Object.freeze({
       id: 'caller_system',
-      note: '调用方剩余 system，不遮罩不清洗',
       drop_if_empty: true,
       type: 'text',
       text: '{{caller_system}}',
@@ -244,6 +268,45 @@ export function personaPresetFromLegacyMode(mode) {
   return 'custom'
 }
 
+/** routing.compatibility.agent_standing；缺省用默认四行，显式空串表示不加。 */
+export function agentStandingText(compat = {}) {
+  const raw = compat?.agent_standing
+  if (raw == null) return DEFAULT_AGENT_STANDING
+  return String(raw).trim().slice(0, AGENT_STANDING_MAX)
+}
+
+/**
+ * Per-preset switch maps (agent_standing_presets / agent_standing_hide_presets /
+ * persona_env_presets). Standing injection is opt-in per preset; other maps
+ * remain opt-out for backwards-compatible masking/env behavior.
+ */
+export function presetFlagEnabled(compat, field, preset) {
+  const defaultValue = field === 'agent_standing_presets' ? false : true
+  const map = compat?.[field]
+  if (!map || typeof map !== 'object' || Array.isArray(map)) return defaultValue
+  const value = map[normalizePersonaPreset(preset)]
+  if (field === 'agent_standing_presets') return value === true
+  return value !== false
+}
+
+/**
+ * Per-preset boolean maps validated on PUT. `persona_hide_presets` is the whole
+ * usage mask; a missing key there falls back to the template hide flags.
+ */
+export const PRESET_FLAG_FIELDS = Object.freeze([
+  'agent_standing_presets',
+  'agent_standing_hide_presets',
+  'persona_env_presets',
+  'persona_hide_presets',
+])
+
+/** {{agent_standing}} 的值：非空时以换行结尾，紧跟下一段不粘连。 */
+export function agentStandingVar(compat = {}, preset) {
+  if (!presetFlagEnabled(compat, 'agent_standing_presets', preset)) return ''
+  const text = agentStandingText(compat)
+  return text ? `${text}\n` : ''
+}
+
 export function parsePersonaTemplateLines(text) {
   const blocks = []
   const errors = []
@@ -292,15 +355,20 @@ function renderText(text, vars) {
   })
 }
 
-/** Meta keys off, type forced to text. Blank drop_if_empty blocks are dropped. */
+/**
+ * Meta keys off, type forced to text. Blank drop_if_empty blocks are dropped;
+ * other blank blocks keep their slot as a zero-width space because upstream
+ * rejects empty text (0注入 agent slot with standing off and no caller agent).
+ */
 export function renderPersonaTemplate(blocks, vars = {}) {
   if (!Array.isArray(blocks)) return []
   const out = []
   for (const block of blocks) {
     if (!block || typeof block !== 'object') continue
     const text = renderText(block.text, vars)
-    if (block.drop_if_empty && !text.trim()) continue
-    const next = { type: 'text', text }
+    const blank = !text.trim()
+    if (block.drop_if_empty && blank) continue
+    const next = { type: 'text', text: blank ? EMPTY_BLOCK_TEXT : text }
     if (block.cache_control && typeof block.cache_control === 'object') {
       next.cache_control = { ...block.cache_control }
     }

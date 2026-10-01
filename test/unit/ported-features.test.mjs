@@ -10,7 +10,7 @@ import {
   normalizeWarmupIntercept,
   warmupMessage,
   warmupSse,
-} from '../../src/lib/protocol/warmup-intercept.mjs'
+} from '../../src/lib/protocol/client-intercept-policy.mjs'
 import { createPeakPrimeMonitor, normalizePeakPrimeConfig } from '../../src/lib/admin/peak-prime.mjs'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 

@@ -7,18 +7,49 @@ import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
 import {
+  classifyCredentialRefresh,
   hasAccessPresence,
   hasCredentialPresence,
   hasRefreshPresence,
+  needsRefresh,
+  readWorkerCredentialFile,
+  REFRESH_SKEW_MS,
   writeWorkerCredentialFile,
 } from '../oauth/oauth-credentials.mjs'
-import { refreshSlotCredentialIfNeeded } from '../oauth/host-token-refresh.mjs'
-import { hostCountTokens, hostModels, hostOauthUsage } from '../oauth/host-anthropic.mjs'
+import { isApiKeyMode } from '../oauth/credential-mode.mjs'
+import { runSlotOauth } from './slot-oauth.mjs'
+import { slotHost } from '../vm/slot-host.mjs'
 import { applyClaudeSSELineToMessage, createClaudeMessageAssembler } from '../protocol/convert.mjs'
-import { isCompleteAssistantMessage } from '../core/errors.mjs'
+import {
+  clientCancelledResult,
+  isClientCancelledResult,
+  isCompleteAssistantMessage,
+  isWrapConnectionError,
+} from '../core/errors.mjs'
 import { extraHeadersFromLimitError, isPlanLimitMessage } from '../pool/quota-window.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
+const credentialRefreshTail = new Map()
+
+function withCredentialRefreshLock(key, fn) {
+  const prev = credentialRefreshTail.get(key) || Promise.resolve()
+  let release
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  const tail = prev.catch(() => {}).then(() => gate)
+  credentialRefreshTail.set(key, tail)
+  return prev
+    .catch(() => {})
+    .then(async () => {
+      try {
+        return await fn()
+      } finally {
+        release()
+        if (credentialRefreshTail.get(key) === tail) credentialRefreshTail.delete(key)
+      }
+    })
+}
 
 export function workerPaths(exec = {}) {
   const slotRoot = exec.homeDir ? path.dirname(exec.homeDir) : null
@@ -218,6 +249,9 @@ export function usageFromSseEvent(event) {
 
 const AUTH_ERROR_TEXT =
   /authentication_error|token has been revoked|oauth_revoked|invalid_grant|invalid (?:bearer|x-api-key)|OAuth token has expired/i
+// cli-hop can flatten an organization permission denial into generic api_error.
+// Preserve the denial instead of replacing it with an empty-hop error.
+const PERMISSION_ERROR_TEXT = /organization does not have access to claude/i
 
 /**
  * The kernel cli-hop answers 200 and then streams `event: error` (sub2api
@@ -230,21 +264,21 @@ export function semanticStatusForStreamError(errorBody) {
   if (type === 'rate_limit_error' || isPlanLimitMessage(message)) return 429
   if (type === 'overloaded_error') return 529
   if (type === 'authentication_error' || AUTH_ERROR_TEXT.test(message)) return 401
-  if (type === 'permission_error') return 403
+  if (type === 'permission_error' || PERMISSION_ERROR_TEXT.test(message)) return 403
   if (type === 'invalid_request_error') return 400
   return 502
 }
 
 /**
  * Kernel `map_kernel` folds every provider failure into 502 `provider_error`.
- * A plan limit / overload inside that text is the upstream 429 / 529.
+ * Restore recognized permission denials and plan-limit / overload statuses.
  */
 export function restoreKernelErrorStatus(result = {}, { now = Date.now() } = {}) {
   if (!result || result.ok || Number(result.status) !== 502) return result
   const body = result.body
   if (!(body?.type === 'error' || body?.error)) return result
   const status = semanticStatusForStreamError(body)
-  if (status !== 429 && status !== 529) return result
+  if (status !== 403 && status !== 429 && status !== 529) return result
   const headers =
     status === 429
       ? extraHeadersFromLimitError(String(body?.error?.message || ''), result.headers || {}, now)
@@ -253,32 +287,55 @@ export function restoreKernelErrorStatus(result = {}, { now = Date.now() } = {})
 }
 
 /**
- * Uncommitted hop that streamed an error, or ended with no visible output,
- * gets a real status. A thinking/text hop already committed and never lands here.
+ * Uncommitted hop that streamed a real provider error gets that status.
+ * A hop that ended with no visible output stays on its 2xx status and is an
+ * empty hop. Promoting it to 502 makes a healthy VM look overloaded.
  */
+function unfinishedEmptyHop(result) {
+  return {
+    ...result,
+    ok: false,
+    terminalState: 'incomplete',
+    body: {
+      type: 'error',
+      error: {
+        type: 'api_error',
+        code: 'empty_response',
+        message: 'Upstream stream ended without visible output',
+      },
+    },
+  }
+}
+
 export function restoreUncommittedHop(result = {}, { now = Date.now() } = {}) {
-  if (!result || result.committed || result.ok) return result
+  if (!result || result.committed || result.ok || isClientCancelledResult(result)) return result
   if (Number(result.status) < 200 || Number(result.status) >= 300) return result
   const body = result.body
   if (body?.type === 'error' || body?.error) {
     const status = semanticStatusForStreamError(body)
+    const message = String(body?.error?.message || body?.message || '')
+    const code = String(body?.error?.code || '')
+    if (code && code !== 'empty_response') {
+      const headers = status === 429 ? extraHeadersFromLimitError(message, result.headers || {}, now) : result.headers
+      return {
+        ...result,
+        status,
+        headers,
+        terminalState: status === 502 ? result.terminalState || 'incomplete' : 'rejected',
+        streamError: status !== 502,
+      }
+    }
+    if (status === 502 && !/overload|usage policy/i.test(message)) {
+      if (isWrapConnectionError(message)) return { ...result, ok: false, terminalState: 'incomplete' }
+      return unfinishedEmptyHop(result)
+    }
     const headers =
-      status === 429
-        ? extraHeadersFromLimitError(String(body?.error?.message || ''), result.headers || {}, now)
-        : result.headers
-    // A generic 502 stream error may have left the CLI slot busy; keep it incomplete so it recycles.
+      status === 429 ? extraHeadersFromLimitError(String(message), result.headers || {}, now) : result.headers
     const terminalState = status === 502 ? result.terminalState : 'rejected'
     return { ...result, status, headers, terminalState, streamError: status !== 502 }
   }
   if (Array.isArray(body?.content) && body.content.length) return result
-  return {
-    ...result,
-    status: 502,
-    body: {
-      type: 'error',
-      error: { type: 'api_error', code: 'empty_response', message: 'Upstream stream ended without visible output' },
-    },
-  }
+  return unfinishedEmptyHop(result)
 }
 
 function dumpSessionEnvelope(envelope) {
@@ -602,6 +659,7 @@ export async function streamGoWorker({
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
       if (event.type === 'error') lastError = event
+      if (event.type === 'message_stop') sawMessageStop = true
       const evUsage = usageFromSseEvent(event)
       if (evUsage) sseUsage = mergeUsage(sseUsage, evUsage)
       if (event.message?.model) sseModel = event.message.model
@@ -613,6 +671,7 @@ export async function streamGoWorker({
     const idleMs = Math.max(0, Number(idleTimeoutMs) || 0)
     let lastChunkAt = Date.now()
     let sawChunk = false
+    let sawMessageStop = false
     let idleTimer = null
     if (firstByteMs > 0 || idleMs > 0) {
       idleTimer = setInterval(() => {
@@ -627,6 +686,9 @@ export async function streamGoWorker({
       idleTimer.unref?.()
     }
     try {
+      // message_stop is the protocol terminal event, but the kernel still sends
+      // kin_job_done and its trailers afterward. Keep reading until the worker
+      // closes the response so a normal completion is not mistaken for cancel.
       for await (const chunk of response) {
         sawChunk = true
         lastChunkAt = Date.now()
@@ -671,7 +733,7 @@ export async function streamGoWorker({
       const meta = streamMetaFromHeaders({ ...headers, ...trailers })
       const assembled = assembler.message
       const stopReason = meta.stopReason || sseStop || assembled?.stop_reason || null
-      const complete = !lastError && isCompleteAssistantMessage({ body: assembled, stopReason })
+      const complete = !lastError && isCompleteAssistantMessage({ body: assembled, stopReason, sawMessageStop })
       if (!committed && complete) await flushCommit()
       const terminalState = complete ? 'verified' : 'incomplete'
       const rateHeaders = mergeRateLimitHeaders({ ...sseRateHeaders, ...headers, ...trailers })
@@ -687,6 +749,7 @@ export async function streamGoWorker({
         usage: mergeUsage(mergeUsage(assembled?.usage || null, sseUsage), meta.usage),
         model: meta.model || sseModel || assembled?.model || null,
         stopReason,
+        sawMessageStop,
         ttftMs,
         committed,
         terminalState,
@@ -696,6 +759,13 @@ export async function streamGoWorker({
       if (idleTimer) clearInterval(idleTimer)
     }
   } catch (error) {
+    if (signal?.aborted) {
+      return clientCancelledResult({
+        via: 'go-worker-stream',
+        ttftMs,
+        committed,
+      })
+    }
     return {
       ok: false,
       status: 0,
@@ -766,24 +836,100 @@ export async function ensureWorkerCredential(exec, { force = false } = {}) {
       },
     }
   }
-  const result = await refreshSlotCredentialIfNeeded({
-    homeDir: exec.homeDir,
-    vm: exec.vm,
-    force: !!force,
+
+  const credential = readWorkerCredentialFile(exec.homeDir)
+  if (!credential) {
+    return {
+      ok: false,
+      status: 400,
+      refreshed: false,
+      error: { code: 'credential_required', message: 'slot has no credential file' },
+    }
+  }
+
+  const now = Date.now()
+  const apiKey = isApiKeyMode(credential.type || credential.mode)
+  const alreadyFresh = apiKey || (!force && !needsRefresh(credential.expires_at, now, REFRESH_SKEW_MS))
+  if (alreadyFresh) {
+    return {
+      ok: true,
+      status: 200,
+      refreshed: false,
+      refresh_class: 'already_fresh',
+      credential: credentialSummary(credential, now),
+    }
+  }
+
+  const snapshotRefresh = String(credential.refresh_token || '')
+  const lockKey = String(exec.homeDir || exec.vm?.id || 'credential')
+  return withCredentialRefreshLock(lockKey, async () => {
+    const live = readWorkerCredentialFile(exec.homeDir) || credential
+    const liveRefresh = String(live?.refresh_token || '')
+    if (snapshotRefresh && liveRefresh && snapshotRefresh !== liveRefresh) {
+      return {
+        ok: true,
+        status: 200,
+        refreshed: false,
+        refresh_class: 'already_fresh',
+        credential: credentialSummary(live, Date.now()),
+      }
+    }
+    const liveNow = Date.now()
+    if (!force && !needsRefresh(live.expires_at, liveNow, REFRESH_SKEW_MS) && !isApiKeyMode(live.type || live.mode)) {
+      return {
+        ok: true,
+        status: 200,
+        refreshed: false,
+        refresh_class: 'already_fresh',
+        credential: credentialSummary(live, liveNow),
+      }
+    }
+    const result = await runSlotOauth(exec, 'refresh', { force: !!force })
+    const body = result?.body || {}
+    const refreshedCredential = readWorkerCredentialFile(exec.homeDir)
+    const mapped = {
+      ok: !!result?.ok,
+      status: result?.status || 0,
+      refreshed: !!body.refreshed,
+      refresh_class: result?.ok ? (body.refreshed ? 'rotated' : 'already_fresh') : undefined,
+      credential: result?.ok ? credentialSummary({ ...(refreshedCredential || {}), ...body }, Date.now()) : undefined,
+      error: result?.ok ? undefined : body.error,
+    }
+    if (!mapped.ok) mapped.refresh_class = classifyCredentialRefresh(mapped)
+    return mapped
   })
+}
+
+function credentialSummary(credential, now = Date.now()) {
+  if (!credential) return undefined
+  const expiresAt = credential.expires_at ?? null
+  const expiresAtMs =
+    Number(expiresAt) && Number(expiresAt) < 10_000_000_000 ? Number(expiresAt) * 1000 : Number(expiresAt)
   return {
-    ok: !!result.ok,
-    status: result.ok ? 200 : 400,
-    refreshed: !!result.refreshed,
-    refresh_class: result.refresh_class,
-    credential: result.credential,
-    error: result.error,
+    type: credential.type || credential.mode || null,
+    mode: credential.mode || credential.type || null,
+    account_uuid: credential.account_uuid || null,
+    org_uuid: credential.org_uuid || null,
+    email: credential.email || null,
+    scope: credential.scope || null,
+    auth_scheme: credential.auth_scheme || null,
+    has_access: credential.has_access ?? !!(credential.access_token || credential.api_key),
+    has_refresh: credential.has_refresh ?? !!credential.refresh_token,
+    needs_refresh: isApiKeyMode(credential.type || credential.mode)
+      ? false
+      : needsRefresh(expiresAt, now, REFRESH_SKEW_MS),
+    expires_at: expiresAt,
+    ttl_seconds:
+      Number.isFinite(expiresAtMs) && expiresAtMs > 0 ? Math.max(0, Math.ceil((expiresAtMs - now) / 1000)) : null,
+    generation: credential._token_version || null,
   }
 }
 
 export async function importWorkerCredential(exec, credential, { timeoutMs = 60000, signal } = {}) {
   try {
     writeWorkerCredentialFile(exec.homeDir, credential)
+    // Import is the one case where the control plane's credential replaces the slot's copy.
+    await slotHost(exec.vm).onImport(exec.vm, path.dirname(exec.homeDir))
   } catch (error) {
     return {
       ok: false,
@@ -866,12 +1012,10 @@ export async function callWorkerGet(exec, requestPath, { timeoutMs = 30000, sign
     }
   }
   if (requestPath === '/internal/v1/models') {
-    const hop = await hostModels(exec, { timeoutMs })
-    return { ...hop, via: hop.via || 'host-socks' }
+    return runSlotOauth(exec, 'models', { timeoutMs })
   }
   if (requestPath === '/internal/oauth/usage') {
-    const hop = await hostOauthUsage(exec, { timeoutMs })
-    return { ...hop, via: hop.via || 'host-socks' }
+    return runSlotOauth(exec, 'usage', { timeoutMs })
   }
   try {
     const response = await workerRequest(exec, { requestPath, timeoutMs, signal })
@@ -897,10 +1041,9 @@ export async function callWorkerGet(exec, requestPath, { timeoutMs = 30000, sign
   }
 }
 
-export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs = 45000, fetchImpl } = {}) {
+export async function countTokensViaWorker(exec, { body, headers = {}, timeoutMs = 45000 } = {}) {
   if (isCrsMock()) {
     return { ok: true, status: 200, body: { input_tokens: 8 }, headers: {}, via: 'go-worker-mock' }
   }
-  const hop = await hostCountTokens(exec, { body, headers, timeoutMs, fetchImpl })
-  return { ...hop, via: hop.via || 'host-socks' }
+  return runSlotOauth(exec, 'count-tokens', { body, headers, timeoutMs })
 }

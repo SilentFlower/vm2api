@@ -320,6 +320,28 @@ test('writeWorkerCredentialFile maps setup-token inference scope to user:inferen
   fs.rmSync(home, { recursive: true, force: true })
 })
 
+test('writeWorkerCredentialFile preserves full-scope setup-token metadata', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-full-setup-'))
+  writeWorkerCredentialFile(home, {
+    type: 'setup-token',
+    access_token: 'sk-ant-oat01-SCOPE',
+    refresh_token: 'sk-ant-ort01-SCOPE',
+    scope: 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload',
+  })
+  const cred = readWorkerCredentialFile(home)
+  assert.equal(cred.type, 'setup-token')
+  assert.equal(cred.scope, 'user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload')
+  const raw = JSON.parse(fs.readFileSync(path.join(home, '.claude', 'credentials.json'), 'utf8'))
+  assert.deepEqual(raw.claudeAiOauth.scopes, [
+    'user:profile',
+    'user:inference',
+    'user:sessions:claude_code',
+    'user:mcp_servers',
+    'user:file_upload',
+  ])
+  fs.rmSync(home, { recursive: true, force: true })
+})
+
 test('writeWorkerCredentialFile stores claudeAiOauth and reads back', () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-slot-write-'))
   writeWorkerCredentialFile(home, {
@@ -378,6 +400,31 @@ test('persistOauthToVm writes scope from scopes array', () => {
   const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
   assert.equal(vm.claude.mode, 'setup-token')
   assert.equal(vm.claude.scope, 'user:inference')
+})
+
+test('persistOauthToVm writes flattened oauth_account identity', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-ident-'))
+  const vmPath = path.join(dir, 'vm-06.json')
+  fs.writeFileSync(vmPath, JSON.stringify({ id: 'vm-06', claude: { mode: 'setup-token' } }))
+  persistOauthToVm(
+    vmPath,
+    {
+      type: 'setup-token',
+      access_token: 'sk-ant-oat01-ID',
+      refresh_token: 'sk-ant-ort01-ID',
+      oauth_account: {
+        account_uuid: 'acct-persist',
+        account_email: 'persist@example.com',
+        organization_uuid: 'org-persist',
+      },
+    },
+    { acceptLiveGrant: true },
+  )
+  const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+  assert.equal(vm.claude.email, 'persist@example.com')
+  assert.equal(vm.claude.account_uuid, 'acct-persist')
+  assert.equal(vm.claude.org_uuid, 'org-persist')
+  fs.rmSync(dir, { recursive: true, force: true })
 })
 
 test('official setup-token persist omits refresh and marks mode', () => {

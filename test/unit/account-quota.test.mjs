@@ -22,25 +22,6 @@ test('ensure seeds account and is idempotent', () => {
   assert.equal(acc.unified['5h'].status, 'active')
 })
 
-test('only a manual VM tier selects policy ahead of an observed account tier', () => {
-  const q = new AccountQuota({
-    dataDir: tmpDir(),
-    config: {
-      tiers: {
-        default: { max_concurrency: 2 },
-        pro: { max_concurrency: 4 },
-        max: { max_concurrency: 16 },
-      },
-    },
-  })
-  q.ensure({ account_id: 'a-tier' })
-  q.setAccountTier('a-tier', 'pro')
-  const account = q.repo.get('a-tier')
-  assert.equal(q.policyFor(account).max_concurrency, 4)
-  assert.equal(q.policyFor(account, { tier: 'max' }).max_concurrency, 4)
-  assert.equal(q.policyFor(account, { tier: 'max', tierMode: 'manual' }).max_concurrency, 16)
-})
-
 test('a model entitlement rejection is persisted for that account and model', () => {
   const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
   q.ensure({ account_id: 'a-denied' })
@@ -481,6 +462,74 @@ test('official usage without Fable evidence does not classify an unprobed accoun
   assert.equal(acc.unified.fable, undefined)
 })
 
+test('complete official usage without Fable classifies Pro', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ingestOAuthUsage('acc-complete-pro', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: false,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    seven_day: { utilization: 0.2, status: 'allowed' },
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-complete-pro')
+  assert.equal(acc.unified.usage_has_fable, false)
+  assert.equal(acc.unified.account_tier, 'pro')
+})
+
+test('complete official usage overrides a stale profile tier', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'acc-stale-profile' })
+  q.setAccountTier('acc-stale-profile', 'max', { source: 'profile' })
+  q.ingestOAuthUsage('acc-stale-profile', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: false,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    seven_day: { utilization: 0.2, status: 'allowed' },
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-stale-profile')
+  assert.equal(acc.unified.account_tier, 'pro')
+  assert.equal(acc.unified.account_tier_source, 'usage')
+})
+
+test('setup-token usage scope failure preserves historical tier and does not mark grant dead', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'acc-setup-scope' })
+  q.setAccountTier('acc-setup-scope', 'max', { source: 'usage' })
+  q.ingestOAuthUsage('acc-setup-scope', {
+    ok: false,
+    usage_status: 403,
+    usage_scope_missing: true,
+    usage_error: '当前凭证缺少 user:profile scope，需导入完整 OAuth 后才能探测官方 /usage',
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-setup-scope')
+  assert.equal(acc.unified.account_tier, 'max')
+  assert.equal(acc.unified.fable, undefined)
+  assert.equal(acc.unified.last_probe.ok, false)
+  assert.match(acc.unified.last_probe.error, /user:profile/)
+})
+
+test('incomplete official usage without Fable does not downgrade a stored Max', () => {
+  const q = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  q.ensure({ account_id: 'acc-incomplete-max' })
+  q.setAccountTier('acc-incomplete-max', 'max', { source: 'usage' })
+  q.ingestOAuthUsage('acc-incomplete-max', {
+    ok: true,
+    usage_status: 200,
+    usage_has_fable: false,
+    five_hour: { utilization: 0.1, status: 'allowed' },
+    probed_at: new Date().toISOString(),
+  })
+  const acc = q.repo.get('acc-incomplete-max')
+  assert.equal(acc.unified.usage_has_fable, undefined)
+  assert.equal(acc.unified.account_tier, 'max')
+})
+
 test('clearGrantRevokeLeftover drops stale revoke after refresh', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
@@ -510,6 +559,8 @@ test('clearGrantRevokeLeftover keeps stored Max off leftover Fable revoke', () =
   q.ingestOAuthUsage('acc-max', {
     ok: true,
     usage_status: 200,
+    limits_present: true,
+    usage_has_fable: true,
     five_hour: { utilization: 0, status: 'allowed' },
     seven_day: { utilization: 0, status: 'allowed' },
     fable: { ok: true, status: 200, model: 'claude-fable-5' },
@@ -588,7 +639,7 @@ test('official usage without Fable hop does not turn leftover 429 into Pro', () 
   assert.equal(acc.unified.account_tier, undefined)
 })
 
-test('usage listing Fable flips stored Pro to Max even if hop is plan_denied', () => {
+test('Fable hop alone does not classify Pro; complete usage can flip stored Pro to Max', () => {
   const q = new AccountQuota({
     dataDir: tmpDir(),
     config: { quota: { safety_ratio: 0.95, block_on_5h: true, block_on_7d: true } },
@@ -601,10 +652,12 @@ test('usage listing Fable flips stored Pro to Max even if hop is plan_denied', (
     fable: { ok: false, plan_denied: true, status: 403, model: 'claude-fable-5' },
     probed_at: '2026-08-22T00:00:00Z',
   })
-  assert.equal(q.repo.get('acc-mispro').unified.account_tier, 'pro')
+  assert.equal(q.repo.get('acc-mispro').unified.account_tier, undefined)
+  q.setAccountTier('acc-mispro', 'pro', { source: 'usage' })
   q.ingestOAuthUsage('acc-mispro', {
     ok: true,
     usage_status: 200,
+    limits_present: true,
     usage_has_fable: true,
     five_hour: { utilization: 0.1, status: 'allowed' },
     seven_day: { utilization: 0.2, resets_at: '2026-08-24T00:00:00Z', status: 'allowed' },
@@ -1107,4 +1160,23 @@ test('elapsed header reset wipes Extra and becomes schedulable', () => {
   const saved = q.persistEffectiveWindows('acc-wipe')
   assert.equal(Number(saved.unified.headers['5h'].utilization), 0)
   assert.equal(saved.unified.headers['5h'].status, 'active')
+})
+
+test('complete usage may replace a profile-sourced tier', async () => {
+  const quota = new AccountQuota({ dataDir: tmpDir(), config: {} })
+  quota.ensure({ account_id: 'acct-profile', vm_id: 'vm-01' })
+  quota.setAccountTier('acct-profile', 'pro', { source: 'profile' })
+  quota.setAccountTier('acct-profile', 'max')
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'pro')
+  quota.ingestOAuthUsage('acct-profile', {
+    ok: true,
+    usage_status: 200,
+    limits_present: true,
+    usage_has_fable: true,
+    seven_day_oi: { utilization: 0.2, resets_at: '2026-09-30T00:00:00Z' },
+  })
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'max')
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier_source, 'usage')
+  quota.setAccountTier('acct-profile', 'max', { source: 'profile' })
+  assert.equal(quota.repo.get('acct-profile').unified.account_tier, 'max')
 })

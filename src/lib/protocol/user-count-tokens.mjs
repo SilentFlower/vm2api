@@ -22,6 +22,7 @@ import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
 import { listQuotaFromHeaders, publicUsageWindow, usageWindowsEmpty } from '../pool/quota-window.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { resolveInboundIdentity } from '../identity/identity-rewrite.mjs'
 import { checkClientAccess } from './client-access-policy.mjs'
 
 function rejectClientAccess(req, res, deps) {
@@ -53,7 +54,7 @@ export function usageUnsupportedError() {
   return makeError({
     type: ErrorType.INVALID_REQUEST,
     code: ErrorCode.USAGE_UNSUPPORTED,
-    message: 'usage 只支持完整 OAuth 账户，Setup Token / API Key 请用 POST /v1/messages/count_tokens',
+    message: 'usage 只支持 OAuth / Setup Token 账户，API Key 请用 POST /v1/messages/count_tokens',
     status: 400,
   })
 }
@@ -110,10 +111,16 @@ export async function peekCurrentAccount({
   usersRepo = null,
 } = {}) {
   const detected = detectInboundPlatform(model)
+  const platform = detected.ok ? detected.platform : undefined
+  const identity = resolveInboundIdentity({ inbound, body: inbound, headers: req?.headers || {} })
   const stickyKey =
-    stickyRouter?.extractPoolKey?.(req, inbound, {
-      platform: detected.ok ? detected.platform : undefined,
-    }) || null
+    (platform === 'anthropic' && identity.sessionId && stickyRouter?.sessionPoolKeys
+      ? stickyRouter.sessionPoolKeys(req, inbound, {
+          sessionId: identity.sessionId,
+          deviceId: identity.deviceId,
+          migrate: false,
+        }).stickyKey
+      : stickyRouter?.extractPoolKey?.(req, inbound, { platform })) || null
   if (!poolScheduler?.peekAccount) {
     return { ok: false, code: 'no_eligible_accounts' }
   }
@@ -128,7 +135,7 @@ function poolFail(peeked) {
   return rewritePoolErrorForClient(
     makeError({
       type: ErrorType.OVERLOADED,
-      code: peeked?.code || ErrorCode.SERVER_OVERLOADED,
+      code: peeked?.code || ErrorCode.POOL_UNAVAILABLE,
       message: peeked?.code || 'no_eligible_accounts',
       status: 503,
     }),

@@ -166,11 +166,12 @@ function parkedGrantDeath(vm: Vm | undefined): boolean {
 }
 
 function invalidCredTone(vm: Vm | undefined): StatusTone {
+  const revoked = vmRevoked(vm)
   return {
     cls: 'bad',
-    key: vmRevoked(vm) ? 'revoke' : 'bad',
-    text: '无效凭证',
-    label: '无效凭证',
+    key: revoked ? 'revoke' : 'bad',
+    text: revoked ? '已吊销' : '无效凭证',
+    label: revoked ? '已吊销' : '无效凭证',
   }
 }
 
@@ -195,6 +196,58 @@ export function credExpiry(vm: Vm): StatusTone & { ms: number | null } {
   if (left < 60 * 60 * 1000)
     return { cls: 'caution', key: 'caution', text: '即将过期', ms }
   return { cls: 'ok', key: 'ok', text: '有效', ms }
+}
+
+/**
+ * Claude 单元熔断的展示态。closed 返回 null。
+ * open 到期但还没人来探测时，后端 view 已折算成 half_open。
+ */
+export function vmCircuit(
+  vm: Vm | undefined,
+  now = Date.now()
+): {
+  state: 'open' | 'half_open'
+  failures: number
+  threshold: number
+  until: number | null
+  left: number
+} | null {
+  const c = vm?.circuit
+  if (!c || c.state === 'closed') return null
+  const until = c.state === 'open' ? Number(c.open_until || 0) || null : null
+  if (c.state === 'open' && until && until <= now) {
+    return {
+      state: 'half_open',
+      failures: c.failures,
+      threshold: c.threshold,
+      until: null,
+      left: 0,
+    }
+  }
+  return {
+    state: c.state,
+    failures: c.failures,
+    threshold: c.threshold,
+    until,
+    left: until ? until - now : 0,
+  }
+}
+
+export function vmCircuitTitle(vm: Vm | undefined, now = Date.now()): string {
+  const c = vmCircuit(vm, now)
+  if (!c) return '熔断关闭'
+  if (c.state === 'half_open')
+    return '熔断半开 · 下一个请求作为探测，成功即恢复'
+  const sec = Math.max(1, Math.ceil(c.left / 1000))
+  return `熔断中 · 连续 ${c.failures}/${c.threshold} 次 5xx · ${sec}s 后放行探测`
+}
+
+function circuitTone(vm: Vm | undefined): StatusTone | null {
+  const c = vmCircuit(vm)
+  if (!c) return null
+  return c.state === 'open'
+    ? { key: 'circuit', text: '熔断中', cls: 'bad' }
+    : { key: 'circuit', text: '熔断探测', cls: 'caution' }
 }
 
 export function vmCooldown(
@@ -430,6 +483,11 @@ export function poolStatus(vm: Vm | undefined): StatusTone {
   // 吊销 / 废票先判：它可能同时带着 off / quota 的 availability.key，照 key
   // 判会显示成「调度关」，把真正的死因盖掉。
   if (parkedGrantDeath(vm) || vmRevoked(vm)) return invalidCredTone(vm)
+  // 调度关优先于熔断：操作员关掉的槽不显示熔断。
+  if (vm?.schedule_state !== 'off') {
+    const circuit = circuitTone(vm)
+    if (circuit) return circuit
+  }
   const restricted = restrictionTone(vm)
   if (restricted) return restricted
   if (vm?.schedule_state === 'off') {
@@ -515,45 +573,70 @@ export function vmRunning(vm: Vm | undefined): boolean {
   return Boolean(vm.active || s === 'running' || s === 'ok' || !s)
 }
 
+/** Same mapping as codex-proxy-rs `plan_type_display`; unknown raw values pass through. */
+export function openaiPlanLabel(planType: unknown): string {
+  const raw = String(planType || '').trim()
+  switch (raw.toLowerCase()) {
+    case '':
+      return 'GPT'
+    case 'free':
+    case 'free_workspace':
+    case 'guest':
+      return 'Free'
+    case 'go':
+      return 'Go'
+    case 'plus':
+      return 'Plus'
+    case 'pro':
+    case 'prolite':
+      return 'Pro'
+    case 'team':
+    case 'self_serve_business_prolite':
+    case 'self_serve_business_usage_based':
+      return 'Business'
+    case 'business':
+    case 'ent26':
+    case 'enterprise_cbp_automation':
+    case 'enterprise_cbp_usage_based':
+    case 'enterprise':
+    case 'hc':
+      return 'Enterprise'
+    case 'edu':
+    case 'education':
+      return 'Edu'
+    case 'edu_plus':
+      return 'Edu Plus'
+    case 'edu_pro':
+      return 'Edu Pro'
+    default:
+      return raw
+  }
+}
+
 export function claudeTier(vm: Vm | undefined): StatusTone {
   if (isCodexVm(vm)) {
     if (!vm?.has_token)
       return { key: 'none', label: '—', cls: 'none', text: '—' }
-    return { key: 'codex', label: 'GPT', cls: 'codex', text: 'GPT' }
+    const plan = openaiPlanLabel(vm?.plan_type)
+    return { key: 'codex', label: plan, cls: 'codex', text: plan }
   }
   if (!vm?.has_token) return { key: 'none', label: '—', cls: 'none', text: '—' }
-  const fb = vm.fable || {}
+  if (vm.usage_has_fable === false)
+    return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
   const raw = String(vm.account_tier || '').toLowerCase()
-  if (vm.account_tier_mode === 'manual') {
-    if (raw === 'max')
-      return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
-    if (raw === 'pro')
-      return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-    return {
-      key: 'unknown',
-      label: '待识别',
-      cls: 'none',
-      text: '待识别',
-    }
-  }
   const oi = vm.utilization_7d_oi
   const oiN =
     oi == null ? null : Number(oi) > 1.5 ? Number(oi) / 100 : Number(oi)
   const realFable =
     vm.usage_has_fable === true ||
-    Boolean(fb.ok) ||
     (oiN != null && Boolean(vm.reset_7d_oi || oiN < 1))
   // Usage 里有 Fable 就是 Max。落盘 pro / hop 403 不能盖掉。
+  // 没有套餐证据时不要画成 Pro，否则 Max 探测未完成的槽会一直显示 Pro。
   if (realFable || raw === 'max')
     return { key: 'max', label: 'Max', cls: 'max', text: 'Max' }
-  if (raw === 'pro' || fablePlanDenied(fb))
+  if (raw === 'pro')
     return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
-  return {
-    key: 'unknown',
-    label: '待识别',
-    cls: 'none',
-    text: '待识别',
-  }
+  return { key: 'pro', label: 'Pro', cls: 'pro', text: 'Pro' }
 }
 
 export function vmBuckets(vms: Vm[]) {
@@ -655,7 +738,12 @@ export function proxyHostLabel(
   proxy: { host?: string; port?: number | string; id?: string } | undefined
 ): string {
   if (!proxy) return '—'
-  if (proxy.host)
-    return `${proxy.host}${proxy.port != null ? `:${proxy.port}` : ''}`
+  if (proxy.host) {
+    const host =
+      proxy.host.includes(':') && !proxy.host.startsWith('[')
+        ? `[${proxy.host}]`
+        : proxy.host
+    return `${host}${proxy.port != null ? `:${proxy.port}` : ''}`
+  }
   return proxy.id || '—'
 }

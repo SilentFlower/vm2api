@@ -1,10 +1,10 @@
 import { useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
-import { api } from '@/lib/api'
+import { api, isApiError } from '@/lib/api'
 import { importErrorMessage } from '@/lib/import-errors'
 import { validTimezone } from '@/lib/timezone'
-import { nextVmSeq, vmIdOf, vmNameOf } from '@/lib/vm-name'
+import { vmIdOf } from '@/lib/vm-name'
 import { Button } from '@/components/ui/button'
 import {
   Collapsible,
@@ -26,6 +26,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { PlatformChip } from '@/components/platform-chip'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import {
   KERNELS,
@@ -38,12 +39,17 @@ import {
   VM_WEIGHT_OPTIONS,
 } from '@/features/vm/create-options'
 import { KernelFeatTags } from '@/features/vm/kernel-feat-tags'
+import { preflightChecksFromError } from '@/features/vm/placement'
+import {
+  PlacementField,
+  PreflightCheckList,
+  usePlacement,
+} from '@/features/vm/placement-field'
 import { vmsListQueryOptions } from '@/features/vm/queries'
 import { TimezonePicker } from '@/features/vm/timezone-picker'
 
 /** 「之后」的 5 档，对齐 index.html `createVmFromPage()` 的派生逻辑。 */
 export type CreateVmAfter = 'idle' | 'start' | 'proxy' | 'active' | 'full'
-type AccountTierChoice = 'auto' | 'pro' | 'max'
 
 const DEFAULT_TEMPLATE = VM_TEMPLATES[0]
 
@@ -92,10 +98,6 @@ export function CreateVmFields({
   submitLabel = '创建',
 }: CreateVmFieldsProps) {
   const qc = useQueryClient()
-  const dash = useQuery(dashboardQueryOptions())
-  const listed = useQuery(vmsListQueryOptions())
-  const vms = dash.data?.vms ?? listed.data?.items ?? []
-
   const [template, setTemplate] = useState<string>(DEFAULT_TEMPLATE.id)
   const [name, setName] = useState('')
   const [kernel, setKernel] = useState<string>(DEFAULT_TEMPLATE.kernel)
@@ -109,12 +111,13 @@ export function CreateVmFields({
   const [locale, setLocale] = useState<string>(DEFAULT_TEMPLATE.locale)
   const [conc, setConc] = useState<number>(DEFAULT_TEMPLATE.conc)
   const [weight, setWeight] = useState<number>(DEFAULT_TEMPLATE.weight)
-  const [accountTier, setAccountTier] = useState<AccountTierChoice>('auto')
+  const [platform, setPlatform] = useState<'anthropic' | 'openai'>('anthropic')
   const [advOpen, setAdvOpen] = useState(false)
 
-  // 名称留空时按已占用序号推下一个可用值，仅作为 placeholder 提示与提交兜底。
-  const suggested = vmNameOf(nextVmSeq(vms))
-  const effectiveName = name.trim() || suggested
+  // 名称留空时由后端编号：它还会跳过已删除槽位留下历史用量的序号，前端推不出来。
+  const typedName = name.trim()
+  const placement = usePlacement(kernel)
+  const remoteGpt = !!placement.nodeId && platform === 'openai'
 
   /** 切模板：回填内核/区域/时区/语言/并发/权重与「之后」，对齐 `applyVmTemplate()`。 */
   function applyTemplate(id: string) {
@@ -132,14 +135,14 @@ export function CreateVmFields({
 
   const create = useMutation({
     mutationFn: async () => {
-      // legacy 的名称是数字下拉，`vmIdOf` 必定有值；这里是自由文本，纯非 ASCII
-      // 名称（如「测试槽」）会被清洗成空串 —— 那就干脆不发 id，让后端自动编号。
-      const id = vmIdOf(effectiveName) || undefined
+      // 自由文本名称：纯非 ASCII（如「测试槽」）会被清洗成空串 —— 那就不发 id，让后端自动编号。
+      const id = typedName ? vmIdOf(typedName) || undefined : undefined
+      const nodeId = placement.nodeId
       const data = await api<CreateVmResponse>('/api/panel/vms/create', {
         method: 'POST',
         body: JSON.stringify({
           id,
-          name: effectiveName,
+          ...(typedName ? { name: typedName } : {}),
           kernel,
           timezone: tz.trim(),
           locale,
@@ -148,10 +151,9 @@ export function CreateVmFields({
           max_concurrency: conc,
           weight,
           ...deriveAfter(after),
-          platform: 'anthropic',
-          family: 'claude',
-          account_tier_mode: accountTier === 'auto' ? 'auto' : 'manual',
-          account_tier: accountTier === 'auto' ? undefined : accountTier,
+          platform,
+          family: platform === 'openai' ? 'codex' : 'claude',
+          ...(nodeId ? { node_id: nodeId } : {}),
         }),
       })
       return {
@@ -177,8 +179,15 @@ export function CreateVmFields({
       // 拿不到 id 时不回调：导入向导会把它当成 `setVmId('')`，反而把已选中的槽清掉。
       if (created.id) onCreated?.(created.id)
     },
-    onError: (error: Error) => toast.error(importErrorMessage(error)),
+    onError: (error: Error) => {
+      toast.error(importErrorMessage(error))
+      // 预检在提交前后可能变了（节点掉线 / 镜像被删），刷新一次让上方检查项同步。
+      if (isApiError(error) && error.code === 'placement_preflight_failed') {
+        void placement.preflight.refetch()
+      }
+    },
   })
+  const placementChecks = preflightChecksFromError(create.error)
 
   return (
     <div className='space-y-3'>
@@ -199,32 +208,42 @@ export function CreateVmFields({
       </div>
 
       <div className='space-y-1'>
+        <Label>平台</Label>
+        <Select
+          value={platform}
+          onValueChange={(next) => {
+            if (next === 'anthropic' || next === 'openai') setPlatform(next)
+          }}
+        >
+          <SelectTrigger aria-label='槽位平台'>
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value='anthropic'>
+              <span className='inline-flex items-center gap-1.5'>
+                <PlatformChip kind='claude' />
+                默认
+              </span>
+            </SelectItem>
+            <SelectItem value='openai'>
+              <PlatformChip kind='codex' />
+            </SelectItem>
+          </SelectContent>
+        </Select>
+        {platform === 'openai' ? (
+          <p className='text-xs text-muted-foreground'>
+            可先创建空槽，账号用 OAuth 或 auth.json 稍后导入。
+          </p>
+        ) : null}
+      </div>
+
+      <div className='space-y-1'>
         <Label>名称</Label>
         <Input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          placeholder={suggested}
+          placeholder='留空自动编号'
         />
-      </div>
-
-      <div className='space-y-1'>
-        <Label>账号类型</Label>
-        <Select
-          value={accountTier}
-          onValueChange={(value) => setAccountTier(value as AccountTierChoice)}
-        >
-          <SelectTrigger>
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value='auto'>自动识别</SelectItem>
-            <SelectItem value='pro'>Pro</SelectItem>
-            <SelectItem value='max'>Max</SelectItem>
-          </SelectContent>
-        </Select>
-        <p className='text-xs text-muted-foreground'>
-          Setup Token 无法读取套餐时可手动指定，创建后仍可切换。
-        </p>
       </div>
 
       <div className='space-y-1'>
@@ -243,6 +262,12 @@ export function CreateVmFields({
         </Select>
         <KernelFeatTags kernel={kernel} className='flex flex-wrap gap-1 pt-1' />
       </div>
+
+      <PlacementField
+        placement={placement}
+        kernel={kernel}
+        gptBlocked={remoteGpt}
+      />
 
       <div className='space-y-1'>
         <Label>之后</Label>
@@ -338,6 +363,15 @@ export function CreateVmFields({
         </CollapsibleContent>
       </Collapsible>
 
+      {placementChecks.length ? (
+        <div className='space-y-1 rounded-md border border-[color:var(--status-bad)]/40 p-2'>
+          <p className='text-xs text-[color:var(--status-bad)]'>
+            目标节点预检未通过：
+          </p>
+          <PreflightCheckList checks={placementChecks} />
+        </div>
+      ) : null}
+
       <div className='flex items-center justify-end gap-2 pt-1'>
         {create.error ? (
           <p className='me-auto text-xs text-[color:var(--status-bad)]'>
@@ -351,7 +385,12 @@ export function CreateVmFields({
         ) : null}
         <Button
           onClick={() => create.mutate()}
-          disabled={create.isPending || !validTimezone(tz)}
+          disabled={
+            create.isPending ||
+            !validTimezone(tz) ||
+            placement.blocked ||
+            remoteGpt
+          }
           loading={create.isPending}
         >
           {submitLabel}

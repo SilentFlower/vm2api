@@ -6,7 +6,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson, withVmLock } from '../vm/vm-file.mjs'
-import { getVm, persistAccountTier, isCodexVm } from '../vm/vm-registry.mjs'
+import { bindVmProxy, getVm, persistAccountTier, isCodexVm } from '../vm/vm-registry.mjs'
 import { isSlotProxyDesynced } from '../vm/vm-runtime.mjs'
 import { reloadSlotReady } from '../vm/slot-runtime.mjs'
 import { resolveImportProxy } from '../vm/proxy-resolve.mjs'
@@ -14,6 +14,7 @@ import { collectSlotIdentity } from '../vm/guest-identity.mjs'
 import { importWorkerCredential } from '../transport/go-worker-client.mjs'
 import { credentialModeFromOauth, canOfficialCc } from './credential-mode.mjs'
 import { resolveAuthScheme } from './auth-scheme.mjs'
+import { flattenOauthIdentity } from './oauth-identity.mjs'
 import { persistOauthToVm, writeWorkerCredentialFile } from './oauth-credentials.mjs'
 import {
   officialCcUidGid,
@@ -21,7 +22,7 @@ import {
   materializeOfficialClaudeCredentials,
 } from './official-cc-bootstrap.mjs'
 import { normalizeTiers } from '../pool/quota-tiers.mjs'
-import { normalizeAccountTierMode } from '../pool/claude-tier.mjs'
+import { slotHost } from '../vm/slot-host.mjs'
 
 export function createImportCommit(ctx) {
   function routing() {
@@ -43,9 +44,11 @@ export function createImportCommit(ctx) {
     const allowProxyBypass = process.env.KIN_CRS_MOCK === '1' && body.require_proxy === false
     if (!resolved.ok && !allowProxyBypass) {
       const message =
-        resolved.reason === 'proxy_unavailable'
-          ? '虚拟机 SOCKS5 不可用，请先更换或探测代理再转换凭证'
-          : '虚拟机未绑定 SOCKS5，请先分配代理再转换凭证'
+        resolved.reason === 'ipv6_disabled'
+          ? 'IPv6 已关闭，请在设置 → SOCKS5 开启 IPv6 代理出口'
+          : resolved.reason === 'proxy_unavailable'
+            ? '虚拟机 SOCKS5 不可用，请先更换或探测代理再转换凭证'
+            : '虚拟机未绑定 SOCKS5，请先分配代理再转换凭证'
       return { ok: false, status: 400, message, resolved }
     }
     return { ok: true, proxyUrl: resolved.proxyUrl, resolved }
@@ -58,6 +61,7 @@ export function createImportCommit(ctx) {
       auth_scheme: oauth.auth_scheme || oauth.authScheme,
       extra: oauth.extra,
     })
+    const identity = flattenOauthIdentity(oauth)
     if (mode === 'apikey') {
       const apiKey = String(oauth.api_key || oauth.apiKey || oauth.access_token || oauth.accessToken || '').trim()
       return {
@@ -68,9 +72,9 @@ export function createImportCommit(ctx) {
         refresh_token: null,
         expires_at: null,
         base_url: oauth.base_url || oauth.baseUrl || 'https://api.anthropic.com',
-        email: oauth.email || oauth.email_address || existing.claude?.email || null,
-        account_uuid: oauth.account_uuid || oauth.accountUuid || null,
-        org_uuid: oauth.org_uuid || oauth.orgUuid || null,
+        email: identity.email || existing.claude?.email || null,
+        account_uuid: identity.account_uuid || existing.claude?.account_uuid || null,
+        org_uuid: identity.org_uuid || existing.claude?.org_uuid || null,
         scopes: [],
         auth_scheme,
       }
@@ -84,9 +88,9 @@ export function createImportCommit(ctx) {
         oauth.expires_at ||
         oauth.expiresAt ||
         (oauth.expires_in ? Math.floor(Date.now() / 1000) + Number(oauth.expires_in) : null),
-      email: oauth.email || oauth.email_address || oauth.profile?.email || existing.claude?.email || null,
-      account_uuid: oauth.account_uuid || oauth.accountUuid || null,
-      org_uuid: oauth.org_uuid || oauth.orgUuid || null,
+      email: identity.email || existing.claude?.email || null,
+      account_uuid: identity.account_uuid || existing.claude?.account_uuid || null,
+      org_uuid: identity.org_uuid || existing.claude?.org_uuid || null,
       scopes: Array.isArray(oauth.scopes)
         ? oauth.scopes
         : String(oauth.scope || '')
@@ -101,26 +105,23 @@ export function createImportCommit(ctx) {
       const accountId = accountUuid || getVm(ctx.cfg.paths.project, vmId)?.claude?.account_uuid || vmId
       if (stats?.five_hour || stats?.seven_day || stats?.seven_day_oi || stats?.extra_usage) {
         try {
-          ctx.accountQuota.ingestOAuthUsage(accountId, stats)
+          ctx.accountQuota.ingestOAuthUsage(accountId, { usage_status: 200, ok: true, ...stats })
         } catch {}
       }
-      if (stats?.account_tier === 'pro' || stats?.account_tier === 'max') {
+      if ((stats?.account_tier === 'pro' || stats?.account_tier === 'max') && stats?.limits_present === true) {
+        const source = 'usage'
         try {
-          ctx.accountQuota.setAccountTier(accountId, stats.account_tier)
+          ctx.accountQuota.setAccountTier(accountId, stats.account_tier, { source })
         } catch {}
         try {
-          persistAccountTier(ctx.cfg.paths.project, vmId, stats.account_tier)
+          persistAccountTier(ctx.cfg.paths.project, vmId, stats.account_tier, { source })
         } catch {}
         try {
           const vm = getVm(ctx.cfg.paths.project, vmId)
           if (vm && !vm.policy?.concurrencyOverride) {
             const routingConfig = routing()
-            const policyTier =
-              normalizeAccountTierMode(vm.claude?.account_tier_mode) === 'manual'
-                ? vm.claude?.account_tier
-                : stats.account_tier
             const next = Number(
-              normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)[policyTier]
+              normalizeTiers(routingConfig.tiers, routingConfig.quota, routingConfig.concurrency)[stats.account_tier]
                 ?.max_concurrency ?? 2,
             )
             if (Number(vm.policy?.maxConcurrency) !== next) {
@@ -140,6 +141,14 @@ export function createImportCommit(ctx) {
       homeDir: path.join(ctx.cfg.paths.project, 'vms', vmId, 'cli-home'),
     }
     if (process.env.KIN_CRS_MOCK !== '1') {
+      // The exchange already used the pool's SOCKS5; the slot must start on that same
+      // exit. A record whose proxy fell out of sync (null / other id) would start with
+      // no exit — on a node that is a hard refusal after the grant was already minted.
+      const bound = ctx.proxyPool?.getProxyForVm?.(vmId)
+      if (bound && existing.proxy?.id !== bound.id) {
+        bindVmProxy(ctx.cfg.paths.project, vmId, bound)
+        existing.proxy = getVm(ctx.cfg.paths.project, vmId)?.proxy || existing.proxy
+      }
       const socket = existing.runtime?.worker_socket
       const needReload = !socket || !fs.existsSync(socket) || isSlotProxyDesynced(existing, ctx.cfg.paths.project)
       if (needReload) {
@@ -210,12 +219,19 @@ export function createImportCommit(ctx) {
       materializeOfficialClaudeCredentials(workerExec.homeDir, ids)
     } catch {}
     const mode = importedCredential.mode || credentialModeFromOauth(oauth)
-    const skipCc = skipOfficialCc || isCodexVm(existing) || !canOfficialCc(mode)
+    const ccUnsupported = !slotHost(existing).supports('official_cc')
+    const skipCc = skipOfficialCc || ccUnsupported || isCodexVm(existing) || !canOfficialCc(mode)
     const routingConfig = routing()
     const officialCc = skipCc
       ? {
           scheduled: false,
-          reason: isCodexVm(existing) ? 'gpt_slot' : skipOfficialCc ? 'credential_edit' : 'credential_mode_unsupported',
+          reason: ccUnsupported
+            ? 'remote_unsupported'
+            : isCodexVm(existing)
+              ? 'gpt_slot'
+              : skipOfficialCc
+                ? 'credential_edit'
+                : 'credential_mode_unsupported',
         }
       : scheduleOfficialCcBootstrap({
           vmId,

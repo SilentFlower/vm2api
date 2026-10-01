@@ -17,18 +17,34 @@ import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { KERNEL_NATIVE_SLOT_COUNT, resolveCliSystemLayout, resolveSlotPersonaPreset } from '../vm/slot-engine.mjs'
+import {
+  CONTAINER_CLI_NODE_BIN,
+  KERNEL_NATIVE_SLOT_COUNT,
+  resolveCliSystemLayout,
+  resolveKernelDataplane,
+  resolveSlotPersonaPreset,
+} from '../vm/slot-engine.mjs'
 import {
   ensureOfficialCredentialLink,
   slotUidGidFromHomeDir,
   chownSlotRuntimeFile,
   replaceSlotOwnedFile,
 } from '../oauth/oauth-credentials.mjs'
+import { slotHost } from '../vm/slot-host.mjs'
 
 const starts = new Map()
+// Hosts whose socket path is a relay (not the kernel's own file) cannot date the kernel by socket mtime.
+const kernelStartedAt = new Map()
+
+/** Bind the VM's docker daemon into an injectable runner. */
+function slotRunner(exec, run) {
+  const env = slotHost(exec?.vm).dockerEnv()
+  if (!env) return run
+  return (args, opts = {}) => run(args, { ...opts, env })
+}
 const CONTAINER_KERNEL_BIN = '/home/kincli/.kin/kin-kernel'
 const CONTAINER_KERNEL_CONFIG = '/run/kin/kernel.json'
-export const CONTAINER_CLAUDE_BIN = '/home/kincli/.kin/cli-node'
+export const CONTAINER_CLAUDE_BIN = CONTAINER_CLI_NODE_BIN
 
 export const WRAP_SLOT_MIN = 1
 export const WRAP_SLOT_MAX = KERNEL_NATIVE_SLOT_COUNT
@@ -74,6 +90,15 @@ export function readExistingKernelConfig(configPath) {
   }
 }
 
+/** crag and cc run cc-node. Restarting that slot SIGKILLs the worker. */
+export function dataplaneUsesCcNode(exec) {
+  const configPath = rustKernelPaths(exec).configPath
+  if (!configPath) return false
+  const plane = String(readExistingKernelConfig(configPath).dataplane || '')
+    .trim()
+    .toLowerCase()
+  return plane === 'crag' || plane === 'cc' || plane === 'cc-node'
+}
 function projectRootFromExec(exec = {}) {
   if (exec?.projectRoot) return exec.projectRoot
   const home = String(exec?.homeDir || '')
@@ -119,10 +144,11 @@ export function stopRustKernel(exec = {}) {
   return { ok: result.status === 0, code: result.status }
 }
 
-function runDocker(args, { timeoutMs = 5000 } = {}) {
+function runDocker(args, { timeoutMs = 5000, env } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.env.KIN_DOCKER_BIN || 'docker', args, {
       stdio: ['ignore', 'pipe', 'pipe'],
+      ...(env ? { env } : {}),
     })
     const stdout = []
     const stderr = []
@@ -218,7 +244,8 @@ export async function ensureRustKernel(exec, { timeoutMs = 30000, runDockerExec 
   const pending = starts.get(vmId)
   if (pending && !force) return pending.promise
   const control = { cancelled: false }
-  const promise = startRustKernel(exec, { timeoutMs, vmId, control, runDockerExec, force })
+  const run = slotRunner(exec, runDockerExec)
+  const promise = startRustKernel(exec, { timeoutMs, vmId, control, runDockerExec: run, force })
   const start = { promise, control }
   starts.set(vmId, start)
   try {
@@ -243,7 +270,7 @@ async function killWrapDataplane(container, runDockerExec) {
         'for d in /proc/[0-9]*; do',
         '  exe=$(readlink "$d/exe" 2>/dev/null || true)',
         '  case "$exe" in',
-        '    */.kin/cli-node*|*/.kin/kin-kernel*|*/.kin/glibc239/ld-linux*)',
+        '    */.kin/cli-node*|*/.kin/kin-kernel*|*/.kin/glibc239/ld-linux*|/opt/kin/cli-node*|/opt/kin/kin-kernel*|/opt/kin/glibc239/ld-linux*)',
         '      kill -KILL "${d#/proc/}" 2>/dev/null || true',
         '  esac',
         'done',
@@ -255,6 +282,8 @@ async function killWrapDataplane(container, runDockerExec) {
 }
 
 export function wrapNewerThanKernel(exec) {
+  // A baked image's binaries are not the slot home's .kin copy.
+  if (slotHost(exec?.vm).bakedKernel) return false
   const home = String(exec?.homeDir || '').trim()
   const sock = rustKernelPaths(exec).socketPath
   if (!home) return false
@@ -279,6 +308,15 @@ export function credentialsNewerThanKernel(exec) {
   const home = String(exec?.homeDir || '').trim()
   const sock = rustKernelPaths(exec).socketPath
   if (!home || !sock) return false
+  if (!slotHost(exec?.vm).ownsSocketFiles) {
+    const started = kernelStartedAt.get(exec.vmId || exec.vm.id)
+    if (!started) return false
+    try {
+      return fs.statSync(path.join(home, '.claude', 'credentials.json')).mtimeMs > started + 500
+    } catch {
+      return false
+    }
+  }
   const cred = path.join(home, '.claude', 'credentials.json')
   try {
     if (!fs.existsSync(sock) || !fs.existsSync(cred)) return false
@@ -289,10 +327,12 @@ export function credentialsNewerThanKernel(exec) {
 }
 
 export async function restartRustKernel(exec, { timeoutMs = 30000, runDockerExec = runDocker } = {}) {
-  await killWrapDataplane(slotContainerName(exec), runDockerExec)
+  const run = slotRunner(exec, runDockerExec)
+  await killWrapDataplane(slotContainerName(exec), run)
   const paths = rustKernelPaths(exec)
+  // A relay socket path is not the kernel's file: removing it would cut the relay.
   try {
-    if (paths.socketPath) fs.rmSync(paths.socketPath, { force: true })
+    if (paths.socketPath && slotHost(exec?.vm).ownsSocketFiles) fs.rmSync(paths.socketPath, { force: true })
   } catch {}
   return ensureRustKernel(exec, { timeoutMs, runDockerExec, force: true })
 }
@@ -382,6 +422,7 @@ export function scheduleWrapRecycle(
 ) {
   const id = wrapVmId(exec)
   if (!id) return { ok: false, skipped: true, reason: 'missing_vm' }
+  if (dataplaneUsesCcNode(exec)) return { ok: true, skipped: true, reason: 'cc_node' }
   const prev = wrapRecycleAt.get(id)
   if (prev != null && now - prev < cooldownMs) return { ok: true, skipped: true, reason: 'cooldown' }
   wrapRecycleAt.set(id, now)
@@ -437,16 +478,29 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   const slotMismatch =
     !!paths.configPath && Number(readExistingKernelConfig(paths.configPath).slots_per_worker) !== WRAP_SLOT_MAX
   const occupied = rustKernelBusy(existing) || wrapHopInflight(exec) > 0
+  const host = slotHost(exec?.vm)
+  const slotId = exec?.vmId || exec?.vm?.id
+  // First sight of a live kernel on such a host (e.g. after a Node restart): later pulls compare against now.
+  const noteUp = () => {
+    if (!host.ownsSocketFiles && !kernelStartedAt.has(slotId)) kernelStartedAt.set(slotId, Date.now())
+  }
   if (!force && occupied && !staleWrap && !staleTicket && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
+    noteUp()
     return { ok: true, reason: 'busy', health: existing, reconcile }
   }
   if (!force && rustKernelReachable(existing) && !staleWrap && !staleTicket && !slotMismatch) {
     const reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
+    noteUp()
     return { ok: true, reason: 'already_up', health: existing, reconcile }
   }
   if (!paths.configPath || !fs.existsSync(paths.configPath)) return { ok: false, reason: 'config_missing' }
   syncKernelSlotCount(paths.configPath)
+  try {
+    await host.syncRun(exec.vm, path.dirname(paths.runDir))
+  } catch (error) {
+    return { ok: false, reason: 'slot_sync_failed', error: String(error?.message || error) }
+  }
   const container = slotContainerName(exec)
   if (!container) return { ok: false, reason: 'container_missing' }
   const wedged = rustKernelProcessUp(existing) && !rustKernelReachable(existing) && !occupied
@@ -460,7 +514,7 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
     }
   }
   try {
-    fs.rmSync(paths.socketPath, { force: true })
+    if (host.ownsSocketFiles) fs.rmSync(paths.socketPath, { force: true })
   } catch {}
   if (!pid1Kernel) await killWrapDataplane(container, runDockerExec)
   const launched = pid1Kernel
@@ -495,6 +549,7 @@ async function startRustKernel(exec, { timeoutMs, control, runDockerExec, force 
   if (!startCurrent(control)) return { ok: false, reason: 'start_cancelled' }
   const started = await waitForHealthOrExit(exec, { timeoutMs, container, runDockerExec, control })
   if (started?.ok) {
+    if (!host.ownsSocketFiles) kernelStartedAt.set(slotId, Date.now())
     started.reconcile = await reconcileCliHopRuntime(exec, { runDockerExec })
     if (pid1Kernel) {
       await runDockerExec(
@@ -557,7 +612,12 @@ export function writeKernelConfig(
   if (!secret) secret = String(previous.internal_token || '').trim()
   if (secret) replaceSlotOwnedFile(tokenPath, secret + '\n', vm)
   const testEndpoints = process.env.KIN_KERNEL_TEST_ENDPOINTS === '1'
-  const claudeBin = String(process.env.KIN_CLAUDE_BIN || '').trim() || CONTAINER_CLAUDE_BIN
+  const dataplane = resolveKernelDataplane(vm, routing || {}) || 'wrap'
+  const envBin = String(process.env.KIN_CLAUDE_BIN || '').trim()
+  // Callers pass partial vm snapshots (summaries, exec contexts); the vm json decides placement.
+  const record = getVm(projectRoot, vm.id) || vm
+  const host = slotHost(record)
+  const claudeBin = envBin || (dataplane === 'wrap' ? host.bins.cli : host.bins.cc)
   const tz = String(timezone || vm.timezone || previous.timezone || '').trim()
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
 
@@ -579,11 +639,9 @@ export function writeKernelConfig(
     runtime_kind: 'docker',
     test_endpoints: testEndpoints,
     provider: 'local_cli',
+    dataplane,
     claude_bin: claudeBin,
     slots_per_worker: wrapSlotCount(vm, routing || {}),
-    // Authoritative three-way switch (official / official_full / zero / custom).
-    // Kernel hot-reads this file. system_layout stays the layout it executes:
-    // zero → zero, every other preset → identity.
     persona_preset: resolveSlotPersonaPreset(vm, routing || {}),
     system_layout: resolveCliSystemLayout(vm, routing || {}),
     cli_version: OFFICIAL_CLI_VERSION,
@@ -598,6 +656,8 @@ export function writeKernelConfig(
     if (oauthTokenUrl) config.oauth_token_url = oauthTokenUrl
   }
   const changed = writeKernelJsonAtomically(configPath, config, vm)
+  // kin-kernel hot-reloads kernel.json: the change must reach wherever the slot reads it.
+  if (changed) host.queueSyncRun(record, path.join(projectRoot, 'vms', vm.id))
   return {
     runDir,
     socketPath,

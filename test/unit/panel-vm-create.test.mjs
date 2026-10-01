@@ -5,10 +5,11 @@ import os from 'node:os'
 import path from 'node:path'
 import { createPanelHandler } from '../../src/lib/admin/panel-routes.mjs'
 
-function makeCreateHandler(project, body, proxyPool) {
+function makeCreateHandler(project, body, proxyPool, accountQuota) {
   const response = {}
   const handlePanel = createPanelHandler({
     cfg: { paths: { project } },
+    ...(accountQuota ? { accountQuota } : {}),
     requireAuth(req) {
       req.apiKeyKind = 'master'
       req.panelRole = 'admin'
@@ -51,26 +52,6 @@ test('import-style create succeeds without seed_policy or SOCKS5', async () => {
     assert.equal(saved.seed_policy.telemetry_disabled, false)
     assert.equal(saved.proxy_required, false)
     assert.equal(saved.proxy, null)
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true })
-  }
-})
-
-test('create persists a manually selected Max account tier', async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-tier-'))
-  try {
-    const { handlePanel, response } = makeCreateHandler(root, {
-      name: 'max-slot',
-      start: false,
-      account_tier_mode: 'manual',
-      account_tier: 'max',
-    })
-    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
-    assert.equal(response.status, 200, response.body?.error?.message || JSON.stringify(response.body))
-    const id = response.body?.data?.vm?.id
-    const saved = JSON.parse(fs.readFileSync(path.join(root, 'vms', `${id}.json`), 'utf8'))
-    assert.equal(saved.claude.account_tier_mode, 'manual')
-    assert.equal(saved.claude.account_tier, 'max')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -181,6 +162,27 @@ test('create returns the persisted VM when runtime start fails', async () => {
     assert.ok(saved.schedule_disabled_reason)
   } finally {
     process.env.PATH = prevPath
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('auto-numbering skips ids a deleted VM left behind in account history', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-create-history-'))
+  try {
+    fs.mkdirSync(path.join(root, 'vms'), { recursive: true })
+    fs.writeFileSync(path.join(root, 'vms', 'vm-01.json'), JSON.stringify({ id: 'vm-01', name: '01' }))
+    // vm-02 was deleted; its account row (with email and spend) still carries vm_id 'vm-02'.
+    const accountQuota = { snapshot: () => ({ accounts: [{ account_id: 'uuid-old', vm_id: 'vm-02' }] }) }
+    const { handlePanel, response } = makeCreateHandler(
+      root,
+      { start: false, auto_allocate_proxy: false },
+      undefined,
+      accountQuota,
+    )
+    await handlePanel({ method: 'POST' }, {}, new URL('http://localhost/api/panel/vms/create'))
+    assert.equal(response.status, 200, response.body?.error?.message || JSON.stringify(response.body))
+    assert.equal(response.body?.data?.vm?.id, 'vm-03', 'a fresh slot must not inherit vm-02 history')
+  } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
 })

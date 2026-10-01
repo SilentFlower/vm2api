@@ -31,6 +31,7 @@ import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
 import { VmListSkeleton } from '@/features/vm/list-skeleton'
 import { vmsListQueryOptions } from '@/features/vm/queries'
+import { VmActionsProvider } from '@/features/vm/vm-actions-provider'
 import {
   filterVms,
   KindFilterChips,
@@ -89,18 +90,6 @@ export function VmListPage() {
       toast.success('已删除')
       setDeleteTarget(null)
       setDeleteInput('')
-      await qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })
-    },
-    onError: (error: Error) => toast.error(error.message),
-  })
-  const clearCooldown = useMutation({
-    mutationFn: (id: string) =>
-      api(`/api/panel/vms/${encodeURIComponent(id)}/cooldown/clear`, {
-        method: 'POST',
-        body: JSON.stringify({}),
-      }),
-    onSuccess: async () => {
-      toast.success('已恢复冷却并刷新状态')
       await qc.invalidateQueries({ queryKey: vmsListQueryOptions().queryKey })
     },
     onError: (error: Error) => toast.error(error.message),
@@ -199,43 +188,31 @@ export function VmListPage() {
             </Button>
           </div>
         </div>
-        {list.length ? (
-          view === 'grid' ? (
-            <VmCards
-              vms={list}
-              accounts={accounts}
-              onClearCooldown={(vm) => clearCooldown.mutate(vm.id)}
-              onReset={(vm) => {
-                setResetInput('')
-                setResetTarget(vm)
-              }}
-              onDelete={(vm) => {
-                setDeleteInput('')
-                setDeleteTarget(vm)
-              }}
-            />
+        <VmActionsProvider
+          accounts={accounts}
+          onReset={(vm) => {
+            setResetInput('')
+            setResetTarget(vm)
+          }}
+          onDelete={(vm) => {
+            setDeleteInput('')
+            setDeleteTarget(vm)
+          }}
+        >
+          {list.length ? (
+            view === 'grid' ? (
+              <VmCards vms={list} accounts={accounts} />
+            ) : (
+              <VmTable vms={list} accounts={accounts} />
+            )
           ) : (
-            <VmTable
-              vms={list}
-              accounts={accounts}
-              onClearCooldown={(vm) => clearCooldown.mutate(vm.id)}
-              onReset={(vm) => {
-                setResetInput('')
-                setResetTarget(vm)
-              }}
-              onDelete={(vm) => {
-                setDeleteInput('')
-                setDeleteTarget(vm)
-              }}
+            <EmptyState
+              reason='没有符合当前筛选的槽位。'
+              actionLabel='创建'
+              onAction={() => setCreateOpen(true)}
             />
-          )
-        ) : (
-          <EmptyState
-            reason='没有符合当前筛选的槽位。'
-            actionLabel='创建'
-            onAction={() => setCreateOpen(true)}
-          />
-        )}
+          )}
+        </VmActionsProvider>
       </QueryGate>
       <ConfirmDialog
         open={!!resetTarget}

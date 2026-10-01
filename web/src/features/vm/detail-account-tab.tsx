@@ -20,7 +20,6 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { StatusMark } from '@/components/status-mark'
-import { AccountTierEditor } from '@/features/vm/account-tier-editor'
 import { AllowedModelsCard } from '@/features/vm/allowed-models-card'
 import { AuthSchemeEditor } from '@/features/vm/auth-scheme-editor'
 import { CodexCredentialPanel } from '@/features/vm/codex-credential-panel'
@@ -30,6 +29,13 @@ import { CredentialPanel } from '@/features/vm/credential-panel'
 import { Field, Meter } from '@/features/vm/detail-section-primitives'
 import { OfficialCcCard } from '@/features/vm/official-cc-card'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
+import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
+import {
+  latestProbe,
+  probeOutcome,
+  probeSourceLabel,
+  type ProbeCheck,
+} from '@/features/vm/probe-status'
 
 type VmAccountTabProps = {
   id: string
@@ -73,10 +79,13 @@ export function VmAccountTab(props: VmAccountTabProps) {
   } = props
   const blocked = vm.can_import_credential === false
   const gpt = isCodexVm(vm)
-  const probe =
-    ((acc.last_probe as Record<string, unknown> | undefined) ||
-      vm.last_probe) ??
-    {}
+  const remote = isRemoteVm(vm)
+  const probe = latestProbe(
+    acc.last_probe_check as ProbeCheck | undefined,
+    vm.last_probe_check,
+    acc.last_probe as ProbeCheck | undefined,
+    vm.last_probe
+  )
 
   return (
     <TabsContent value='account' className='space-y-3 pt-3'>
@@ -122,16 +131,15 @@ export function VmAccountTab(props: VmAccountTabProps) {
               <Field label='状态' compact>
                 <StatusMark tone={credExpiry(vm)} variant='pill' />
               </Field>
-              <Field label='套餐' compact>
-                {gpt ? (
-                  <OpenaiPlanBadge vm={vm} />
-                ) : (
-                  <div className='flex items-center gap-2'>
+              {claudeTier(vm).key !== 'none' ? (
+                <Field label='套餐' compact>
+                  {gpt ? (
+                    <OpenaiPlanBadge vm={vm} />
+                  ) : (
                     <StatusMark tone={claudeTier(vm)} variant='pill' />
-                    <AccountTierEditor vm={vm} />
-                  </div>
-                )}
-              </Field>
+                  )}
+                </Field>
+              ) : null}
               {credType === 'apikey' ? (
                 <Field label='Key' compact>
                   {vm.has_token ? '已写入' : '—'}
@@ -223,12 +231,25 @@ export function VmAccountTab(props: VmAccountTabProps) {
               <CardContent className='divide-y pt-0'>
                 <Field label='时间' compact>
                   <span className='font-mono text-xs'>
-                    {String(probe.at || '未探测')}
+                    {probe.at || probe.probed_at
+                      ? fmtExpiresAt(probe.at || probe.probed_at)
+                      : '未探测'}
                   </span>
                 </Field>
                 <Field label='来源' compact>
-                  {String(acc.probe_source ?? vm.probe_source ?? '—')}
+                  {probeSourceLabel(
+                    probe.source ||
+                      String(acc.probe_source ?? vm.probe_source ?? '')
+                  )}
                 </Field>
+                <Field label='结果' compact>
+                  {probeOutcome(probe)}
+                </Field>
+                {probe.via === 'passive-headers' ? (
+                  <Field label='采样时间' compact>
+                    {probe.data_at ? fmtExpiresAt(probe.data_at) : '未知'}
+                  </Field>
+                ) : null}
                 {gpt ? null : (
                   <Field label='超额' compact>
                     {extraUsageText(acc.extra_usage ?? vm.extra_usage)}
@@ -284,7 +305,10 @@ export function VmAccountTab(props: VmAccountTabProps) {
       </div>
 
       {gpt ? null : officialCc ? (
-        <OfficialCcCard vmId={id} />
+        <OfficialCcCard
+          vmId={id}
+          blockedReason={remote ? REMOTE_UNSUPPORTED_TEXT : ''}
+        />
       ) : credType !== 'none' ? (
         <p className='text-xs text-muted-foreground'>
           官方 Claude Code 初装仅支持完整 OAuth 凭证，当前槽为{' '}

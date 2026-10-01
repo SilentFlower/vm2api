@@ -3,8 +3,10 @@
  * 公开仓只走 rust cli-hop（kernel → Claude Code）。Go HTTP 转发不再启用。
  * Credential import/ensure 仍可走 Go 客户端，但不参与推理 hop。
  */
+import { clientCancelledResult, isClientCancelledResult } from '../core/errors.mjs'
 import { ensureWorkerCredential } from './go-worker-client.mjs'
 import { ensureOfficialCredentialLink, slotUidGidFromHomeDir } from '../oauth/oauth-credentials.mjs'
+import { slotHost } from '../vm/slot-host.mjs'
 import {
   streamRustKernel,
   callRustKernel,
@@ -105,9 +107,10 @@ export function peekRustHealth(exec, ttlMs, now = Date.now()) {
   return hit
 }
 
-export function resolveHopEngine(_vm, _routing = {}, { rustReady = null, binPath = null } = {}) {
+export function resolveHopEngine(vm, _routing = {}, { rustReady = null, binPath = null } = {}) {
   const wanted = 'rust'
-  const bin = binPath != null ? String(binPath).trim() : kernelBinPath()
+  // A baked slot image carries its own kernel; the host binary only matters for local mounts.
+  const bin = slotHost(vm).bakedKernel ? 'image' : binPath != null ? String(binPath).trim() : kernelBinPath()
   if (rustReady === true) {
     return { engine: 'rust', wanted, reason: 'configured_rust', fallback: false }
   }
@@ -128,18 +131,21 @@ export function resolveHopEngine(_vm, _routing = {}, { rustReady = null, binPath
  * the transport restored (429 limit, 529, 401, stream error) is a response,
  * not a dead slot — SIGKILLing the CLI there is how a layout mismatch loops.
  */
-function isDeadWrapHop(result) {
+export function isDeadWrapHop(result) {
   if (!result) return false
+  if (isClientCancelledResult(result)) return false
   if (result.transportError) return true
   const msg = String(result?.body?.error?.message || '')
   if (/connection error/i.test(msg)) return true
   if (result.streamError) return false
   const status = Number(result.status) || 0
   if (status === 429 || status === 529 || status === 401 || status === 403) return false
-  return result.terminalState === 'incomplete'
+  // No visible output is not a leaked CLI. Recycling here SIGKILLs the
+  // supervisor child, then the same-account retry dies on the restart.
+  return false
 }
 
-/** Incomplete hop occupied a kernel CLI slot. Release it now; do not wait out the recycle cooldown. */
+/** Transport failure may have leaked a CLI slot. Release it now; do not wait out the recycle cooldown. */
 function releaseLeakedSlots(exec, recycleWrap) {
   clearRustHealthCache(cacheKey(exec))
   if (typeof recycleWrap === 'function') {
@@ -295,12 +301,14 @@ async function runHop({ mode, opts }) {
   try {
     result = await send(opts)
     noteWrapHop(opts.exec)
-    if (result.transportError === true && result.committed !== true) {
+    if (opts.signal?.aborted || isClientCancelledResult(result)) {
+      result = clientCancelledResult(result)
+    } else if (result.transportError === true && result.committed !== true) {
       result = await send(opts)
       result = { ...result, rust_transport_retried: true }
       noteWrapHop(opts.exec)
     }
-    if (isNeedsRefreshResult(result)) {
+    if (!isClientCancelledResult(result) && isNeedsRefreshResult(result)) {
       const ensure = opts.ensureCredential || ensureWorkerCredential
       const ensured = await ensure(opts.exec, { force: true })
       if (ensured?.ok !== true) result = credentialEnsureFailure(result, ensured)
@@ -321,7 +329,9 @@ async function runHop({ mode, opts }) {
     }
   } finally {
     endWrapHop(opts.exec)
-    if (isDeadWrapHop(result)) recycleLeakedWrap(opts.exec, opts.recycleWrap)
+    if (!opts.signal?.aborted && !isClientCancelledResult(result) && isDeadWrapHop(result)) {
+      recycleLeakedWrap(opts.exec, opts.recycleWrap)
+    }
   }
 }
 

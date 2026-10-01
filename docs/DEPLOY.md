@@ -16,6 +16,8 @@ VM2API_DB_SECRET='再一串'
 
 抄本：[deploy/env.example](deploy/env.example)。`VM2API_*` 优先于 `KIN_*`。
 
+宿主机开了 UFW / firewalld 且入站默认拒绝时，必须先放行槽出口网关，见下文「防火墙」。否则槽内请求全部 `502 incomplete_response`，面板代理探测却显示正常。
+
 ## 该看到什么容器
 
 | 容器 | 说明 |
@@ -25,6 +27,10 @@ VM2API_DB_SECRET='再一串'
 | 没有 | 未启动的槽；同机其它项目的 postgres / newapi 等 |
 
 不是一个父容器里多个子进程。
+
+原生 Claude 槽默认内存上限为 `1g`，可用 `KIN_VM_MEMORY` 显式覆盖。常驻 native host 与临时官方 CLI 同时运行会超过旧的 `500m` 上限；额度 API 探测本身不应额外启动推理 CLI。已有容器不会因控制面升级自动扩大限制，可在核对宿主余量后使用 `docker update --memory 1g --memory-swap 1g kin-<槽>`，不重建容器。
+
+出现 `native stdin: Broken pipe` 时同时检查容器 OOM 事件与 CLI 子进程，不能只看 Rust PID 1 是否存活。CLI 退出或输出管道关闭后，内核必须清零 `cli_pid` / `ready_slots`、终止在途请求并拒绝新任务，由宿主 watchdog 恢复槽；不重放已发送的推理请求。
 
 挂 `docker.sock`，`network_mode: host`。安装目录不再限定 `/opt/vm2api`：控制面自省 `docker inspect vm2api` 的 Mounts，把槽的 `-v` 源换算成宿主路径；也可用 `VM2API_HOST_ROOT` 显式指定。
 
@@ -83,6 +89,52 @@ docker exec vm2api python3 -c 'import urllib.request; print(urllib.request.urlop
 
 槽位安装、同步和模板制作优先使用 `KIN_KERNEL_BIN` / `bin/kin-kernel`；母样本或槽内快照只在主内核不可用时使用。更新或上传主内核后，仍需同步并重启目标槽。控制面重启本身不会替换正在运行的槽内进程。
 
+## 防火墙（UFW / firewalld）
+
+绑定远程 SOCKS5 的槽，出站走这条路：
+
+```
+kin-<槽> 容器 → keg* 网桥 → 宿主机 kin-egress（网关 IP:端口）→ SOCKS5 → 上游
+```
+
+控制面用 iptables 把容器的 TCP 和 DNS 重定向到宿主机上的 `kin-egress`。这一跳的目的地是宿主机本身，要经过宿主机 **INPUT** 链。UFW 默认入站 `DROP`，而 vm2api 不改你的 INPUT 规则，所以需要手动放行：
+
+| 项 | 值 |
+|---|---|
+| 网卡 | `keg` 开头，每个 SOCKS5 出口一个（`ip -br link \| grep '^keg'`） |
+| 网关 | 该网桥网段的 `.1`（`docker network inspect kin-eg-<代理id>`） |
+| 端口 | 20000–35999 内，按代理 id 固定：偶数为 TCP，下一个奇数为 DNS（TCP + UDP） |
+
+**UFW：**
+
+```bash
+sudo ufw allow in on keg+ to any port 20000:35999 proto tcp
+sudo ufw allow in on keg+ to any port 20000:35999 proto udp
+sudo ufw reload
+```
+
+**firewalld：**
+
+```bash
+for br in $(ip -br link | awk '/^keg/{print $1}'); do
+  sudo firewall-cmd --permanent --zone=trusted --add-interface="$br"
+done
+sudo firewall-cmd --reload
+```
+
+新增 SOCKS5 出口会出现新的 `keg*` 网卡。UFW 的 `keg+` 通配会自动覆盖；firewalld 需要对新网卡再执行一次。
+
+**验证**（在宿主机上，对已启动的槽）：
+
+```bash
+docker exec kin-<槽> getent hosts api.anthropic.com
+docker exec kin-<槽> curl -sS -o /dev/null -w '%{http_code}\n' --max-time 10 https://api.anthropic.com
+```
+
+能解析且打印 HTTP 状态码（如 `404`）即通。两条都超时就是仍被拦截。本地出口（`px-local`）不经过 `kin-egress`，不需要这一步。
+
+本地出口上的 GPT 槽位：控制面进程环境里有 `HTTPS_PROXY`（其次 `https_proxy`、`ALL_PROXY`、`all_proxy`；`HTTP_PROXY` 不算）时，Codex kernel 推理和目录同步、额度、token 刷新、OAuth 换票都走这个代理，代理不通就失败，不回落直连；`NO_PROXY` 对它不生效。没设就直连。本地出口上的 Claude 槽位始终直连。
+
 ## 上线后
 
 1. 打开 `/cc#/login`，用管理台密码登录（未配置时为 `admin` / `123456`）。
@@ -97,6 +149,17 @@ docker exec vm2api python3 -c 'import urllib.request; print(urllib.request.urlop
 Node 听 `:8787`。HTTPS 放在 nginx。
 
 ```nginx
+# 集群页终端是 WebSocket：必须透传 Upgrade，并直连 Node（前面若有会丢 Upgrade 的网关，也要绕过）。
+location ~ ^/api/panel/cluster/nodes/[^/]+/shell$ {
+  proxy_pass http://127.0.0.1:8787;
+  proxy_http_version 1.1;
+  proxy_set_header Host $host;
+  proxy_set_header Upgrade $http_upgrade;
+  proxy_set_header Connection "upgrade";
+  proxy_buffering off;
+  proxy_read_timeout 3600s;
+}
+
 location / {
   proxy_pass http://127.0.0.1:8787;
   proxy_http_version 1.1;
@@ -108,13 +171,15 @@ location / {
 }
 ```
 
+`Connection ""` 会剥掉 Upgrade，终端握手拿不到 101，面板里一直连不上；所以 shell 路径单独放在前面。
+
 ## 本机 Node（备选）
 
 仓内已有 `bin/kin-*`。还要 `npm ci`、`pnpm -C web install --frozen-lockfile && npm run build:web`，以及占位 `vms/active.json`。单元：[deploy/vm2api.service](deploy/vm2api.service)。细节见 [BUILD.md](BUILD.md)。
 
 ## 一键安装 / 更新
 
-`deploy/install.sh` 对齐 sub2api / CLIProxyAPI：查 GitHub 最新 Release → checkout tag → 重建控制面。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。构建前若 `.dockerignore` 挡住 `CHANGELOG.md` 会自动补 `!CHANGELOG.md` 并重试一次。
+`deploy/install.sh` 默认拉 ghcr 预构建镜像，不在目标机编译。控制台是仓内 `web/dist`，打进镜像，不再在镜像构建里跑 `pnpm build`。`--from-source` 也只拷贝这份预编译产物。不碰已有非空 `.env` 字段、`vms/`、`data/`，不 `docker rm` 槽。
 
 ### 两类安装错误
 

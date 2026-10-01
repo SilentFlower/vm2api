@@ -7,12 +7,14 @@ import {
   LayoutDashboard,
   LineChart,
   List,
+  MessageSquareText,
   Monitor,
   Network,
   Puzzle,
   ScrollText,
   Settings,
   Shield,
+  Users,
 } from 'lucide-react'
 
 export type ViewId =
@@ -26,11 +28,13 @@ export type ViewId =
   | 'models'
   | 'loadtest'
   | 'protocol'
+  | 'system'
   | 'keys'
   | 'api'
   | 'logs'
   | 'database'
   | 'settings'
+  | 'users'
   | 'wrap'
 
 export const VIEW_TITLES: Record<ViewId, string> = {
@@ -44,12 +48,14 @@ export const VIEW_TITLES: Record<ViewId, string> = {
   models: '模型',
   loadtest: '压测',
   protocol: '协议',
+  system: 'system提示词',
   keys: '密钥',
   api: 'API',
   logs: '日志',
   database: '数据库',
   settings: '设置',
-  wrap: '槽内重装',
+  users: '用户',
+  wrap: '内核',
 }
 
 export const NAV_ITEMS: {
@@ -67,9 +73,11 @@ export const NAV_ITEMS: {
   { id: 'models', url: '/models', icon: List },
   { id: 'loadtest', url: '/loadtest/reports', icon: Gauge },
   { id: 'protocol', url: '/protocol', icon: Box },
+  { id: 'system', url: '/system', icon: MessageSquareText },
   { id: 'keys', url: '/keys', icon: KeyRound },
   { id: 'logs', url: '/logs', icon: ScrollText },
   { id: 'database', url: '/database', icon: Database },
   { id: 'settings', url: '/settings/sticky', icon: Settings },
   { id: 'wrap', url: '/wrap', icon: Puzzle },
+  { id: 'users', url: '/users', icon: Users },
 ]

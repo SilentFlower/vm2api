@@ -20,18 +20,20 @@ bin/*
 !bin/kin-egress
 !bin/kin-worker
 !bin/kin-codex-kernel
-!bin/kin-cookie-auth
-share/*
+!bin/kin-oauth-auth
 !share/wrap-cli/
 !share/wrap-cli/**
 share/wrap-cli/cli-dist/
 share/wrap-cli/bun
+!share/crag/
+!share/crag/**
 .workflow/
 __pycache__/
-web/dist/
 crates/
 patches/
 .local/
+/local-src/
+/skills/
 
 # keep example
 !src/config/gateway-v2.example.json
@@ -58,3 +60,7 @@ patches/
 /worker/bin/
 /issues/
 /plan/
+
+# local-only; not part of the published tree
+/web/pnpm-workspace.yaml
+/src/lib/oauth/auth.js

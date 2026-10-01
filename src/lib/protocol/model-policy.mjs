@@ -40,6 +40,7 @@ const FABLE_51_ID = 'claude-fable-5-1'
 const FABLE_51_LEGACY_ID = 'claude-fable-5.1'
 const OPUS_55_ID = 'claude-opus-5-5'
 const OPUS_55_LEGACY_ID = 'claude-opus-5.5'
+const SONNET_55_ID = 'claude-sonnet-5-5'
 const OPUS_55_COMPUTER_FROM = 'computer_20251124'
 const OPUS_55_COMPUTER_TO = 'computer_toolset_20260801'
 
@@ -192,7 +193,7 @@ export function seedDefaultPolicy() {
       pass_context_1m: false,
     },
     params: { max_tokens_default: 16384, max_tokens_cap: 64000, on_adaptive: 'passthrough' },
-    aliases: ['sonnet'],
+    aliases: [],
   })
 
   add('claude-opus-4-6', {
@@ -244,12 +245,30 @@ export function seedDefaultPolicy() {
     capabilities: CAP_ADAPTIVE_ONLY,
     betas: { pass_context_1m: true },
     params: {
-      max_tokens_default: 16384,
+      max_tokens_default: 64000,
       max_tokens_cap: 128000,
       on_adaptive: 'passthrough',
       on_enabled: 'passthrough',
     },
     aliases: [],
+  })
+
+  // Claude Code 2.1.284 default Sonnet. Same tier_2_10 price as Sonnet 5.
+  // disabled thinking 400s; default effort is medium; max output default is the cap.
+  add(SONNET_55_ID, {
+    display_name: 'Sonnet 5.5',
+    family: 'sonnet',
+    sort: 31,
+    capabilities: CAP_ADAPTIVE_ONLY,
+    betas: { pass_context_1m: true },
+    params: {
+      max_tokens_default: 128000,
+      max_tokens_cap: 128000,
+      on_adaptive: 'passthrough',
+      on_enabled: 'convert_to_adaptive',
+      default_effort: 'medium',
+    },
+    aliases: ['sonnet'],
   })
 
   add('claude-opus-5', {
@@ -330,7 +349,7 @@ export function seedDefaultPolicy() {
     },
     models,
     aliases: {
-      sonnet: 'claude-sonnet-4-6',
+      sonnet: 'claude-sonnet-5-5',
       opus: 'claude-opus-5',
       haiku: 'claude-haiku-4-5-20251001',
       'claude-haiku-4-5': 'claude-haiku-4-5-20251001',
@@ -731,22 +750,24 @@ export function isOpus55Model(model = '') {
 }
 
 /**
- * Claude Code 2.1.280 Opus 5.5 wire rules.
- * disabled thinking and budget_tokens 400 at every effort.
- * tool_choice any/tool 400. computer_20251124 400.
+ * Opus 5.5 and Sonnet 5.5 reject forced tool choice and legacy thinking.
+ * Keep the existing auto + strict compatibility policy; strict constrains
+ * arguments, not whether the model calls a tool. Computer migration is Opus-only.
  * The patched CLI forwards caller fields, so this has to happen before the hop.
  */
-export function applyOpus55RequestRules(body = {}) {
-  if (!body || typeof body !== 'object' || !isOpus55Model(body.model)) return body
+export function applyModelRequestRules(body = {}) {
+  if (!body || typeof body !== 'object') return body
   const canonical = resolvePolicyModelId(body.model)
-  if (canonical === OPUS_55_ID) body.model = OPUS_55_ID
+  const opus55 = isOpus55Model(body.model)
+  if (!opus55 && canonical !== SONNET_55_ID) return body
+  if (canonical === OPUS_55_ID || canonical === SONNET_55_ID) body.model = canonical
   if (body.thinking && typeof body.thinking === 'object') {
     const type = String(body.thinking.type || '').toLowerCase()
     if (type === 'disabled' || type === 'enabled' || body.thinking.budget_tokens != null) {
       body.thinking = adaptiveOnlyThinking(body.thinking)
     }
   }
-  if (Array.isArray(body.tools)) {
+  if (opus55 && Array.isArray(body.tools)) {
     body.tools = body.tools.map((tool) => {
       if (!tool || typeof tool !== 'object') return tool
       if (tool.type !== OPUS_55_COMPUTER_FROM) return tool
@@ -763,7 +784,9 @@ export function applyOpus55RequestRules(body = {}) {
   if (choiceType === 'any' || choiceType === 'tool' || choiceType === 'required') {
     const name = choice && typeof choice === 'object' ? choice.name : ''
     if (choiceType === 'tool' && name && Array.isArray(body.tools)) {
-      body.tools = body.tools.map((tool) => (tool?.name === name ? { ...tool, strict: true } : tool))
+      body.tools = body.tools.map((tool) =>
+        tool?.name === name && tool.input_schema ? { ...tool, strict: true } : tool,
+      )
     }
     body.tool_choice = { type: 'auto' }
   }

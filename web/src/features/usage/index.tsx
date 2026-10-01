@@ -117,9 +117,7 @@ function Meter({ value }: { value: number }) {
 }
 
 function FableCell({ row }: { row: UsageAccountRow }) {
-  // 用量行没有 tier 判定所需的 has_token/account_tier 同源字段，直接按「有 fable 对象」
-  // 判定即可 —— Pro 档账号根本不会有 fable.ok，因此不需要单独传 tierKey='pro'。
-  const state = fableState(row, '')
+  const state = fableState(row, String(row.account_tier || ''))
   if (state.usedPct != null) return <Meter value={state.usedPct} />
   return <StatusMark tone={state.tone} />
 }
@@ -154,7 +152,18 @@ function AccountRow({ row, vm }: { row: UsageAccountRow; vm?: Vm }) {
             '—'
           )}
           {row.credential_mode ? (
-            <CredLaneChip type={credTypeFromMode(row.credential_mode)} />
+            vm ? (
+              <CredLaneChip vm={vm} />
+            ) : (
+              // 用量行的 credential_mode 只对 Claude 槽有值；没有槽位时按默认方案归类。
+              <CredLaneChip
+                endpoint={
+                  credTypeFromMode(row.credential_mode) === 'apikey'
+                    ? 'api'
+                    : 'console'
+                }
+              />
+            )
           ) : null}
         </div>
       </div>

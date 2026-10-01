@@ -7,6 +7,7 @@ import {
   prepareAnthropicRequest,
   rewriteToolNames,
   sanitizeAnthropicBodyForBetaTokens,
+  ensureFastModeBeta,
   ensureClearThinkingContextManagement,
   stripInvalidThinkingBlocks,
   alignSamplingWithThinking,
@@ -14,6 +15,7 @@ import {
 } from './anthropic-policy.mjs'
 import { liftMidConversationSystemMessages } from './sanitize.mjs'
 import { ensureUnofficialAdaptiveThinking, ensureUnofficialEffortHigh, normalizeThinkingForModel } from './thinking.mjs'
+import { ensureOutputConfigSchema } from './request-rectifier.mjs'
 import {
   applyCrsIdentityReplace,
   extractCallerSession,
@@ -37,12 +39,15 @@ import {
 } from '../identity/official-cc-system-2.1.241.mjs'
 import {
   applyCacheTtlToBody,
+  applyMessageBreakpoints,
+  DEFAULT_CACHE_TTL,
   enforceCacheTtlOrder,
+  normalizeCacheTtl,
   removeCacheControlFields,
   stripIllegalCacheControlFields,
 } from './cache-ttl.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from './claude-code-betas.mjs'
-import { applyOpus55RequestRules } from './model-policy.mjs'
+import { applyModelRequestRules } from './model-policy.mjs'
 import { isApiKeyMode, isSetupTokenMode } from '../oauth/credential-mode.mjs'
 
 export const INFERENCE_UA = 'kin-inference/1.0'
@@ -152,7 +157,8 @@ function stabilizeMessageBudgets(body) {
 }
 
 /**
- * Caller fields only. CLI owns UA / billing / metadata / layoutSystemBlocks.
+ * Caller fields plus Node-owned message breakpoints.
+ * CLI owns persona layout and system/tools markers; kernel only forwards.
  *
  * role=system turns stay where the caller put them, including a trailing one:
  * Claude Code ends most turns with a reminder (SessionStart context, then
@@ -162,15 +168,12 @@ function stabilizeMessageBudgets(body) {
  * This must not depend on client classification: relays strip the billing
  * block and rewrite the UA, so relayed Claude Code looks third-party.
  */
-export function prepareCliHopBody(canonicalBody, { stream = true, repaired = false } = {}) {
+export function prepareCliHopBody(
+  canonicalBody,
+  { stream = true, repaired = false, cacheTtl = DEFAULT_CACHE_TTL } = {},
+) {
   let body = officialMessagesBody(canonicalBody, { stream })
   delete body.metadata
-  // Wrap CLI (Claude Code) throws a fatal "max_output_tokens" error if response reaches max_tokens.
-  // Probes, ping tests, and third-party UI connection checks send max_tokens: 1 (or small numbers).
-  // Ensure a safe minimum for cli-hop so output finishes with end_turn rather than hitting max_tokens.
-  if (body.max_tokens != null && Number(body.max_tokens) <= 64) {
-    body.max_tokens = 1024
-  }
   const leftover = stripCliOwnedSystem(body.system)
   if (leftover == null) delete body.system
   else body.system = leftover
@@ -187,10 +190,12 @@ export function prepareCliHopBody(canonicalBody, { stream = true, repaired = fal
     body = ensureClearThinkingContextManagement(body)
   }
   body = stripInvalidThinkingBlocks(body)
-  body = applyOpus55RequestRules(body)
+  body = applyModelRequestRules(body)
+  body = ensureOutputConfigSchema(body)
   body = alignSamplingWithThinking(body)
   body = stripIllegalCacheControlFields(body)
   body = removeCacheControlFields(body)
+  body = applyMessageBreakpoints(body, normalizeCacheTtl(cacheTtl), 'rewrite')
   return body
 }
 /** Wrap CLI process is spawned as sonnet-5/adaptive. Haiku rejects thinking. */
@@ -216,6 +221,11 @@ export function prepareOutboundAttempt({
   accountId = '',
   boundSessionId = '',
   boundAccountId = '',
+  boundVmId = '',
+  vmId = '',
+  epoch,
+  mode,
+  routing,
   clientDiscriminator = undefined,
   clientIp = '',
   userAgent = '',
@@ -231,6 +241,11 @@ export function prepareOutboundAttempt({
     accountId,
     boundSessionId,
     boundAccountId,
+    boundVmId,
+    vmId,
+    epoch,
+    mode,
+    routing,
     clientDiscriminator,
     clientIp,
     userAgent: userAgent || reqHeaders?.['user-agent'] || '',
@@ -255,7 +270,8 @@ export function prepareOutboundAttempt({
   if (identity) {
     identified = refreshOfficialSystemEnvironment(identified, identity, identified.model)
   }
-  if (!keepCallerSession && String(sessionIdOverride || '').trim()) {
+  const stampOwnedBilling = String(sessionIdOverride || '').trim() && (mode !== 'passthrough' || !keepCallerSession)
+  if (stampOwnedBilling) {
     identified = stampBillingPromptId(identified, sessionId, firstUserText)
   }
   // Official Claude Code places its own breakpoints; adding ours would shift the
@@ -303,6 +319,11 @@ export function prepareOutboundEnvelope({
   accountId = '',
   boundSessionId = '',
   boundAccountId = '',
+  boundVmId = '',
+  vmId = '',
+  epoch,
+  mode,
+  routing,
   clientDiscriminator,
   clientIp = '',
   userAgent = '',
@@ -328,6 +349,11 @@ export function prepareOutboundEnvelope({
     accountId,
     boundSessionId,
     boundAccountId,
+    boundVmId,
+    vmId,
+    epoch,
+    mode,
+    routing,
     clientDiscriminator,
     clientIp,
     userAgent,
@@ -354,6 +380,10 @@ export function prepareOutboundEnvelope({
     delete headers.Authorization
   }
   if (stream) headers.accept = 'text/event-stream'
+  if (!isSetupTokenMode(credentialMode)) {
+    const beta = ensureFastModeBeta(headers['anthropic-beta'] || '', prepared.body)
+    if (beta) headers['anthropic-beta'] = beta
+  }
   const body = sealClaudeCodeCch(sanitizeAnthropicBodyForBetaTokens(prepared.body, headers?.['anthropic-beta'] || ''))
   return { body, headers, toolNames: prepared.toolNames }
 }

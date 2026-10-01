@@ -72,12 +72,30 @@ export function kindFromModel(
 
 export function slotAccountLabel(
   vm?: Vm,
-  fallback?: { email?: string | null; vmId?: string | null }
+  fallback?: {
+    email?: string | null
+    vmId?: string | null
+    /** Shown when there is no VM at all, e.g. a request that never got an execution seat. */
+    emptyLabel?: string
+  }
 ): string {
   const email = String(vm?.email || fallback?.email || '').trim()
   if (email) return email
   const id = String(fallback?.vmId || vm?.id || '').trim()
-  return id || '未绑定账号'
+  return id || fallback?.emptyLabel || '未绑定账号'
+}
+
+/** `vm-01` without an email is unbound. A custom slot id is the name and stays visible. */
+export function slotNameLabel(vm?: {
+  id?: string | null
+  name?: string | null
+  email?: string | null
+}): string {
+  const name = String(vm?.name || vm?.id || '').trim()
+  const email = String(vm?.email || '').trim()
+  if (email || (name && !/^vm-\d+$/i.test(String(vm?.id || '').trim())))
+    return name || '未绑定账号'
+  return '未绑定账号'
 }
 
 /** 卡片 / 表格用：本地段优先，域名过长只留尾标。完整地址走 title。 */

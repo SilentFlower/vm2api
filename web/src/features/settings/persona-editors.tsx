@@ -1,3 +1,4 @@
+import { Plus, Trash2 } from 'lucide-react'
 import { PERSONA_TEMPLATE_VARS, type RawBlock } from '@/lib/persona-template'
 import { Button } from '@/components/ui/button'
 import {
@@ -6,119 +7,36 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
-import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 
-export function RadioRow<T extends string>({
-  name,
-  value,
-  options,
-  disabled,
-  onChange,
-}: {
-  name: string
-  value: T
-  options: [T, string][]
-  disabled?: boolean
-  onChange: (v: T) => void
-}) {
-  return (
-    <RadioGroup
-      value={value}
-      onValueChange={(v) => onChange(v as T)}
-      disabled={disabled}
-      className='flex flex-wrap gap-x-5 gap-y-2'
-    >
-      {options.map(([v, label]) => (
-        <div key={v} className='flex items-center gap-2'>
-          <RadioGroupItem id={`${name}-${v}`} value={v} />
-          <Label htmlFor={`${name}-${v}`} className='text-sm font-normal'>
-            {label}
-          </Label>
-        </div>
-      ))}
-    </RadioGroup>
-  )
-}
-
 export function VarsHint({ vars }: { vars: [string, string][] }) {
   return (
-    <p className='text-xs leading-relaxed text-muted-foreground'>
-      可用占位符：
-      {vars.map(([name, desc], i) => (
-        <span key={name}>
-          {i ? ' · ' : ''}
-          <code className='font-mono'>{`{{${name}}}`}</code> {desc}
-        </span>
-      ))}
-    </p>
-  )
-}
-
-/** 块含义表：flex 行，不用 <table>（component-guidelines）。 */
-export function BlockNotes({ blocks }: { blocks: RawBlock[] }) {
-  if (!blocks.length) {
-    return (
-      <p className='text-xs text-muted-foreground'>
-        模板为空，出站会回落内置预设。
-      </p>
-    )
-  }
-  return (
-    <div className='rounded-md border border-border/60'>
-      <div className='flex h-7 items-center border-b border-border/60 bg-muted/30 px-3 text-[11px] font-medium text-muted-foreground/80'>
-        <div className='min-w-[100px] flex-1'>块</div>
-        <div className='min-w-[180px] flex-[3] px-1.5'>含义</div>
-        <div className='min-w-[120px] flex-1 px-1.5'>行为</div>
-      </div>
-      {blocks.map((block, i) => (
-        <div
-          key={`${String(block.id ?? '')}-${i}`}
-          className='flex items-center border-b border-border/40 px-3 py-1.5 text-xs last:border-b-0'
+    <div className='flex flex-wrap gap-1'>
+      {vars.map(([name, note]) => (
+        <code
+          key={name}
+          title={note}
+          className='rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground'
         >
-          <div className='min-w-[100px] flex-1 truncate font-mono'>
-            {String(block.id ?? '-')}
-          </div>
-          <div className='min-w-[180px] flex-[3] px-1.5 text-muted-foreground'>
-            {String(block.note ?? '')}
-          </div>
-          <div className='min-w-[120px] flex-1 px-1.5 text-muted-foreground'>
-            {block.hide ? '遮罩' : '—'} ·{' '}
-            {block.drop_if_empty ? '空则丢弃' : '必写'}
-            {cacheControlLabel(block)}
-          </div>
-        </div>
+          {`{{${name}}}`}
+        </code>
       ))}
     </div>
   )
-}
-
-function cacheRecord(block: RawBlock): Record<string, unknown> | null {
-  const cc = block.cache_control
-  if (!cc || typeof cc !== 'object' || Array.isArray(cc)) return null
-  return cc as Record<string, unknown>
-}
-
-function cacheControlLabel(block: RawBlock): string {
-  const cc = cacheRecord(block)
-  if (!cc) return ''
-  const ttl = typeof cc.ttl === 'string' ? cc.ttl : ''
-  const scope = typeof cc.scope === 'string' ? cc.scope : ''
-  if (!ttl && !scope) return ''
-  return ` · 缓存 ${[ttl, scope].filter(Boolean).join(' ')}`
 }
 
 function cacheControlOf(block: RawBlock): {
   ttl: string
   scope: string
 } {
-  const cc = cacheRecord(block)
-  if (!cc) return { ttl: '', scope: '' }
+  const cc = block.cache_control
+  if (!cc || typeof cc !== 'object' || Array.isArray(cc))
+    return { ttl: '', scope: '' }
+  const rec = cc as Record<string, unknown>
   return {
-    ttl: typeof cc.ttl === 'string' ? cc.ttl : '',
-    scope: typeof cc.scope === 'string' ? cc.scope : '',
+    ttl: typeof rec.ttl === 'string' ? rec.ttl : '',
+    scope: typeof rec.scope === 'string' ? rec.scope : '',
   }
 }
 
@@ -144,6 +62,17 @@ function withCacheControl(
   return next
 }
 
+function withFlag(
+  block: RawBlock,
+  key: 'hide' | 'drop_if_empty',
+  on: boolean
+): RawBlock {
+  const next = { ...block }
+  if (on) next[key] = true
+  else delete next[key]
+  return next
+}
+
 function PersonaBlockCard({
   block,
   index,
@@ -156,112 +85,92 @@ function PersonaBlockCard({
   onRemove: () => void
 }) {
   const cache = cacheControlOf(block)
+  const n = index + 1
   return (
-    <div className='space-y-2 rounded-md border border-border/60 p-3'>
-      <div className='flex flex-wrap items-center gap-2'>
+    <div className='rounded-lg border border-border/60 bg-card'>
+      <div className='flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-border/40 px-3 py-2'>
+        <span className='w-4 font-mono text-[11px] text-muted-foreground tabular-nums'>
+          {n}
+        </span>
         <Input
-          className='h-8 w-36 font-mono text-xs'
+          className='h-7 w-32 font-mono text-xs'
           value={String(block.id ?? '')}
           placeholder='id'
-          aria-label={`第 ${index + 1} 块 id`}
+          aria-label={`第 ${n} 块 id`}
           onChange={(e) => onChange({ ...block, id: e.target.value })}
         />
-        <Input
-          className='h-8 min-w-[10rem] flex-1 text-xs'
-          value={String(block.note ?? '')}
-          placeholder='这块的含义'
-          aria-label={`第 ${index + 1} 块含义`}
-          onChange={(e) => onChange({ ...block, note: e.target.value })}
-        />
-        <Button type='button' size='sm' variant='ghost' onClick={onRemove}>
-          删除
-        </Button>
-      </div>
-      <Textarea
-        className='h-20 font-mono text-xs'
-        value={typeof block.text === 'string' ? block.text : ''}
-        aria-label={`第 ${index + 1} 块内容`}
-        onChange={(e) => onChange({ ...block, text: e.target.value })}
-      />
-      <div className='flex flex-wrap items-center gap-x-4 gap-y-2'>
-        <label className='flex items-center gap-2 text-xs'>
+        <label className='flex cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground'>
           <Switch
             checked={block.hide === true}
-            onCheckedChange={(on) => {
-              const next = { ...block }
-              if (on) next.hide = true
-              else delete next.hide
-              onChange(next)
-            }}
+            onCheckedChange={(on) => onChange(withFlag(block, 'hide', on))}
           />
-          遮罩 usage
+          遮罩
         </label>
-        <label className='flex items-center gap-2 text-xs'>
+        <label className='flex cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground'>
           <Switch
             checked={block.drop_if_empty === true}
-            onCheckedChange={(on) => {
-              const next = { ...block }
-              if (on) next.drop_if_empty = true
-              else delete next.drop_if_empty
-              onChange(next)
-            }}
+            onCheckedChange={(on) =>
+              onChange(withFlag(block, 'drop_if_empty', on))
+            }
           />
-          空则丢弃
+          空丢
         </label>
-        <label className='flex items-center gap-2 text-xs'>
-          cache_control
+        <Button
+          type='button'
+          size='icon'
+          variant='ghost'
+          className='ml-auto size-7 cursor-pointer text-muted-foreground hover:text-foreground'
+          aria-label={`删除第 ${n} 块`}
+          onClick={onRemove}
+        >
+          <Trash2 />
+        </Button>
+      </div>
+      <div className='space-y-2 p-3'>
+        <Textarea
+          className='min-h-16 font-mono text-xs'
+          spellCheck={false}
+          value={typeof block.text === 'string' ? block.text : ''}
+          aria-label={`第 ${n} 块内容`}
+          onChange={(e) => onChange({ ...block, text: e.target.value })}
+        />
+        <div className='flex items-center gap-2'>
+          <span className='font-mono text-[10px] text-muted-foreground'>
+            cache
+          </span>
           <Input
-            className='h-7 w-20 font-mono text-xs'
+            className='h-7 w-16 font-mono text-xs'
             value={cache.ttl}
             placeholder='ttl'
-            aria-label={`第 ${index + 1} 块 cache ttl`}
+            aria-label={`第 ${n} 块 cache ttl`}
             onChange={(e) =>
               onChange(withCacheControl(block, e.target.value, cache.scope))
             }
           />
           <Input
-            className='h-7 w-24 font-mono text-xs'
+            className='h-7 w-20 font-mono text-xs'
             value={cache.scope}
             placeholder='scope'
-            aria-label={`第 ${index + 1} 块 cache scope`}
+            aria-label={`第 ${n} 块 cache scope`}
             onChange={(e) =>
               onChange(withCacheControl(block, cache.ttl, e.target.value))
             }
           />
-        </label>
+        </div>
       </div>
     </div>
   )
 }
 
-export function PersonaBlockFields({
+function PersonaBlockFields({
   blocks,
   onChange,
 }: {
   blocks: RawBlock[]
   onChange: (blocks: RawBlock[]) => void
 }) {
-  if (!blocks.length) {
-    return (
-      <div className='space-y-2'>
-        <p className='text-xs text-muted-foreground'>
-          当前方案没有块。保存后出站会回落内置预设。也可以加一块自己写。
-        </p>
-        <Button
-          type='button'
-          size='sm'
-          variant='outline'
-          onClick={() =>
-            onChange([{ id: 'block_1', note: '', type: 'text', text: '' }])
-          }
-        >
-          加一块
-        </Button>
-      </div>
-    )
-  }
   return (
-    <div className='space-y-3'>
+    <div className='space-y-2'>
       {blocks.map((block, index) => (
         <PersonaBlockCard
           key={`${String(block.id ?? '')}-${index}`}
@@ -277,40 +186,34 @@ export function PersonaBlockFields({
         type='button'
         size='sm'
         variant='outline'
+        className='cursor-pointer'
         onClick={() =>
           onChange([
             ...blocks,
-            {
-              id: `block_${blocks.length + 1}`,
-              note: '',
-              type: 'text',
-              text: '',
-            },
+            { id: `block_${blocks.length + 1}`, type: 'text', text: '' },
           ])
         }
       >
+        <Plus />
         加一块
       </Button>
     </div>
   )
 }
 
+/** 块表单 + JSONL 原文。JSONL 有错时只给原文，修好前块表单不可用。 */
 export function PersonaTemplateEditor({
   text,
   blocks,
   hasErrors,
-  customEmpty,
   onTextChange,
   onBlocksChange,
-  onReset,
 }: {
   text: string
   blocks: RawBlock[]
   hasErrors: boolean
-  customEmpty: boolean
   onTextChange: (text: string) => void
   onBlocksChange: (blocks: RawBlock[]) => void
-  onReset: () => void
 }) {
   const jsonl = (
     <Textarea
@@ -321,39 +224,27 @@ export function PersonaTemplateEditor({
       onChange={(e) => onTextChange(e.target.value)}
     />
   )
+  if (hasErrors) return jsonl
   return (
-    <>
-      <div className='flex items-center justify-between gap-2'>
-        <Label className='text-sm'>
-          {hasErrors ? 'system 模板（JSONL 有错误，先修这一段）' : 'system 块'}
-        </Label>
-        <Button type='button' size='sm' variant='ghost' onClick={onReset}>
-          恢复预设
-        </Button>
-      </div>
-      {hasErrors ? (
-        jsonl
-      ) : (
-        <PersonaBlockFields blocks={blocks} onChange={onBlocksChange} />
-      )}
-      <VarsHint vars={PERSONA_TEMPLATE_VARS} />
-      {customEmpty ? (
-        <Notice tone='caution'>
-          自定义模板是空的。网关此时<b>不是「什么都不注入」</b>
-          ，而是静默回落到官方提示词预设。真要清空，写一个 text 为空的块。
-        </Notice>
-      ) : null}
-      {hasErrors ? null : (
-        <Collapsible>
-          <CollapsibleTrigger asChild>
-            <Button type='button' size='sm' variant='ghost'>
-              高级：JSONL
-            </Button>
-          </CollapsibleTrigger>
-          <CollapsibleContent className='pt-2'>{jsonl}</CollapsibleContent>
-        </Collapsible>
-      )}
-    </>
+    <div className='space-y-3'>
+      <PersonaBlockFields blocks={blocks} onChange={onBlocksChange} />
+      <Collapsible>
+        <CollapsibleTrigger asChild>
+          <Button
+            type='button'
+            size='sm'
+            variant='ghost'
+            className='cursor-pointer font-mono text-xs'
+          >
+            JSONL
+          </Button>
+        </CollapsibleTrigger>
+        <CollapsibleContent className='space-y-2 pt-2'>
+          {jsonl}
+          <VarsHint vars={PERSONA_TEMPLATE_VARS} />
+        </CollapsibleContent>
+      </Collapsible>
+    </div>
   )
 }
 

@@ -4,7 +4,7 @@
  * One writer for the hard columns the scheduler gates on:
  *   429 → rate_limit_reset_at (+ session_window rejected)
  *   529 → overload_until
- *   empty stream → temp_unschedulable (short cooldown)
+ * An incomplete hop is a request failure. It does not park the account.
  * Passive Extra utilization stays in account-quota for the panel; it never
  * clears these columns. Only a live `5h-status=allowed` header or the reset
  * passing lifts a rate limit (sub2api UpdateSessionWindow → ClearRateLimit).
@@ -96,19 +96,31 @@ export class RateLimitService {
 
   /**
    * sub2api HandleUpstreamError: writes the hard column for this failure. Returns the block, or null.
-   * The classifier decides the scope; a model / Fable 429 stays a model cooldown.
-   * Empty hops are parked by the failover loop via tempUnschedule after same-account retries.
+   * The classifier decides the scope; a model / Fable / RPM 429 stays a short cooldown.
+   * An unknown bare 429 writes no hard block: the scope is unproven, so one
+   * bounded usage probe decides whether the account window is really spent.
    */
   handleUpstreamError({ accountId, vmId, result = {}, policy = null, now = Date.now() } = {}) {
     if (!accountId || !this.runtimeRepo || result?.committed) return null
     const reason = String(policy?.reason || '')
-    if (policy?.scope === 'account' && (reason === 'account_quota_exhausted' || reason === 'rate_limited')) {
+    if (policy?.scope === 'account' && reason === 'account_quota_exhausted') {
       return this.handle429({ accountId, vmId, result, now })
+    }
+    if (reason === 'rate_limited_unknown') {
+      this.requestUsageProbe({ accountId, vmId })
+      return null
     }
     if (reason === 'provider_overloaded' && Number(result?.status) === 529) {
       return this.handle529({ accountId, vmId, now })
     }
     return null
+  }
+
+  requestUsageProbe({ accountId, vmId }) {
+    if (typeof this.onUsageProbe !== 'function') return
+    try {
+      this.onUsageProbe({ accountId, vmId })
+    } catch {}
   }
 
   handle429({ accountId, vmId, result = {}, now = Date.now() }) {
@@ -131,11 +143,7 @@ export class RateLimitService {
         countRequest: false,
       })
     } catch {}
-    if (fallback && typeof this.onUsageProbe === 'function') {
-      try {
-        this.onUsageProbe({ accountId, vmId })
-      } catch {}
-    }
+    if (fallback) this.requestUsageProbe({ accountId, vmId })
     return { kind: 'rate_limited', until: resetAt, window: parsed?.window || null, fallback }
   }
 
@@ -143,12 +151,6 @@ export class RateLimitService {
     const until = now + this.config.overload_cooldown_min * 60_000
     this.runtimeRepo.updateWindow?.(accountId, { vmId, overloadUntil: until })
     return { kind: 'overloaded', until }
-  }
-
-  tempUnschedule({ accountId, vmId, now = Date.now() }) {
-    const until = now + this.config.empty_response_cooldown_sec * 1000
-    this.runtimeRepo.markCooldown?.(accountId, { vmId, until, reason: EMPTY_RESPONSE_REASON, status: 'cooldown' })
-    return { kind: 'empty_response', until }
   }
 
   /**

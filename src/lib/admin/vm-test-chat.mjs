@@ -6,7 +6,7 @@
  * Pin with master-only x-kin-vm. Does not call the Go worker directly.
  *
  * Full OAuth Claude slots mimic official Claude Code (UA + 4-block rewrite).
- * Setup Token / Console Key are inference-only: unofficial test UA, no
+ * Setup Token / Console Key use inference-style inbound: unofficial test UA, no
  * official four-gate inbound (context-1m / CC session scope would 401).
  */
 import http from 'node:http'
@@ -16,8 +16,8 @@ import path from 'node:path'
 import { readRoutingConfigFile } from '../core/config.mjs'
 import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { summarizeCodexSlot, readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
-import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
+import { summarizeCodexSlot, readCodexAccounts, writeCodexAccounts } from '../vm/codex-slot.mjs'
+import { hostProxyUrlForVm, isLocalEgressProxy } from '../vm/egress.mjs'
 import { loadVmIdentity } from '../identity/vm-identity.mjs'
 import { snapshotOauth } from '../vm/execution-context.mjs'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
@@ -27,9 +27,19 @@ import { credentialModeFromOauth, credentialModeOfVm } from '../oauth/credential
 import { isModelEnabled, getModelParams, getCapabilities, listPolicyModels } from '../protocol/model-policy.mjs'
 import { listGptPolicyModels, isGptModelEnabled, syncGptIdsIntoPolicy } from '../protocol/gpt-model-policy.mjs'
 import { listOfficialModels, validateOfficialModel } from '../protocol/models.mjs'
-import { fetchChatgptModelCatalog, refreshCodexAccessToken, CODEX_USER_AGENT } from '../protocol/codex-models.mjs'
+import {
+  fetchChatgptModelCatalog,
+  refreshCodexAccessToken,
+  resolveCodexCatalogVersion,
+  CODEX_USER_AGENT,
+} from '../protocol/codex-models.mjs'
 import { isGptSeriesId } from '../protocol/gpt-ids.mjs'
-import { resolveInferenceEngine, resolveOfficialCcInference, resolveCliSystemLayout } from '../vm/slot-engine.mjs'
+import {
+  resolveInferenceEngine,
+  resolveOfficialCcInference,
+  resolveCliSystemLayout,
+  resolveKernelDataplane,
+} from '../vm/slot-engine.mjs'
 import {
   codexTextInput,
   DEFAULT_CODEX_REASONING_EFFORT,
@@ -105,22 +115,35 @@ export function testModelsView(platform) {
   }
 }
 
-function pickCodexVmForCatalog(projectRoot, vm) {
-  if (vm && isCodexVm(vm)) return vm
+function listCodexVmsForCatalog(projectRoot, vm) {
+  if (vm && isCodexVm(vm)) return [vm]
   const dir = path.join(projectRoot, 'vms')
-  if (!fs.existsSync(dir)) return null
+  if (!fs.existsSync(dir)) return []
+  const out = []
   for (const name of fs.readdirSync(dir)) {
     if (!name.endsWith('.json') || name === 'active.json') continue
     try {
       const raw = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'))
-      if (raw?.id && isCodexVm(raw)) return raw
+      if (raw?.id && isCodexVm(raw)) out.push(raw)
     } catch {}
   }
-  return null
+  return out
 }
 
-function persistRefreshedCodexAccount(projectRoot, vmId, patch = {}) {
-  upsertCodexAccount(projectRoot, vmId, patch)
+function persistRefreshedCodexAccount(projectRoot, vmId, patch = {}, previous = {}) {
+  const accounts = readCodexAccounts(projectRoot, vmId)
+  let idx = accounts.findIndex(
+    (row) =>
+      (previous.refresh_token && row.refresh_token === previous.refresh_token) ||
+      (previous.access_token && row.access_token === previous.access_token),
+  )
+  if (idx < 0) idx = 0
+  const cur = { ...(accounts[idx] || {}), ...patch }
+  if (!cur.id) cur.id = cur.email || cur.chatgpt_account_id || 'codex'
+  if (!accounts.length) accounts.push(cur)
+  else accounts[idx] = cur
+  writeCodexAccounts(projectRoot, vmId, accounts)
+  return cur
 }
 
 /**
@@ -128,89 +151,144 @@ function persistRefreshedCodexAccount(projectRoot, vmId, patch = {}) {
  * rotate=true (panel sync) may refresh OAuth via refresh_token.
  * rotate=false (test-models probe) never rotates.
  */
-export async function syncCodexCatalog({ projectRoot, vmId, fetchImpl, rotate = true } = {}) {
+export async function syncCodexCatalog({
+  projectRoot,
+  vmId,
+  fetchImpl,
+  rotate = true,
+  catalogClientVersion = 'auto',
+} = {}) {
   if (!projectRoot) {
     return { ok: false, error: 'invalid_request', message: 'projectRoot required', ids: [], synced: 0 }
   }
   const vm = vmId ? getVm(projectRoot, vmId) : null
-  const target = pickCodexVmForCatalog(projectRoot, vm && isCodexVm(vm) ? vm : null)
-  if (!target) {
+  const targets = listCodexVmsForCatalog(projectRoot, vm && isCodexVm(vm) ? vm : null)
+  if (!targets.length) {
     return { ok: false, error: 'no_codex_slot', message: '没有可用的 GPT OAuth 槽', ids: [], synced: 0 }
   }
-  const direct = isLocalEgressProxy(target.proxy)
-  const proxyUrl = boundProxyUrl(target.proxy)
-  if (!proxyUrl && !fetchImpl && !direct) {
+  const catalogVersion = await resolveCodexCatalogVersion({
+    configuredVersion: catalogClientVersion,
+    cachePath: path.join(
+      String(process.env.KIN_DATA_DIR || '').trim() || path.join(projectRoot, 'data'),
+      'codex-catalog-client.json',
+    ),
+    // Unit callers can provide the already resolved version while keeping
+    // their fetch mock reserved for ChatGPT catalog traffic.
+  })
+  if (!catalogVersion.ok) {
     return {
       ok: false,
-      error: 'proxy_required',
-      message: 'GPT 槽未绑定 SOCKS5',
-      vm_id: target.id,
+      error: catalogVersion.error,
+      message: '无法获取 Codex catalog client 版本',
       ids: [],
       synced: 0,
     }
   }
-  const first = readCodexAccounts(projectRoot, target.id)[0] || {}
-  let access = first.access_token || target.codex?.access_token
-  const accountId = first.chatgpt_account_id || target.codex?.chatgpt_account_id
-  const refreshToken = first.refresh_token || target.codex?.refresh_token
-  const fetchOnce = () =>
-    fetchChatgptModelCatalog({
-      accessToken: access,
-      accountId,
-      proxyUrl,
-      fetchImpl,
-      direct,
-    })
-
-  let live = await fetchOnce()
-  if (live.error === 'upstream_auth' && rotate && refreshToken) {
-    const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl })
-    if (!tok.ok) {
-      return {
+  const merged = new Map()
+  let usedVm = null
+  let lastError = null
+  for (const target of targets) {
+    const direct = isLocalEgressProxy(target.proxy)
+    const proxyUrl = hostProxyUrlForVm(target)
+    if (!proxyUrl && !fetchImpl && !direct) {
+      lastError = {
         ok: false,
-        error: tok.error || 'refresh_failed',
-        message: 'GPT OAuth 刷新失败，请重新登录',
+        error: 'proxy_required',
+        message: 'GPT 槽未绑定 SOCKS5',
         vm_id: target.id,
-        ids: [],
-        synced: 0,
+      }
+      continue
+    }
+    const accounts = readCodexAccounts(projectRoot, target.id)
+    const rows = accounts.length ? accounts : [target.codex || {}]
+    for (const account of rows) {
+      let access = account.access_token || target.codex?.access_token
+      const accountId = account.chatgpt_account_id || target.codex?.chatgpt_account_id
+      const refreshToken = account.refresh_token || target.codex?.refresh_token
+      const fetchOnce = () =>
+        fetchChatgptModelCatalog({
+          accessToken: access,
+          accountId,
+          proxyUrl,
+          fetchImpl,
+          direct,
+          catalogVersion: catalogVersion.version,
+        })
+      let live = await fetchOnce()
+      if (live.error === 'upstream_auth' && rotate && refreshToken) {
+        const tok = await refreshCodexAccessToken({ refreshToken, proxyUrl, fetchImpl })
+        if (!tok.ok) {
+          lastError = {
+            ok: false,
+            error: tok.error || 'refresh_failed',
+            message: 'GPT OAuth 刷新失败，请重新登录',
+            vm_id: target.id,
+          }
+          continue
+        }
+        persistRefreshedCodexAccount(
+          projectRoot,
+          target.id,
+          {
+            access_token: tok.access_token,
+            refresh_token: tok.refresh_token,
+            id_token: tok.id_token || account.id_token,
+            expires_at: tok.expires_at || account.expires_at,
+          },
+          account,
+        )
+        access = tok.access_token
+        live = await fetchOnce()
+      }
+      if (!live.ok || !live.ids?.length) {
+        const auth = live.error === 'upstream_auth'
+        lastError = {
+          ok: false,
+          error: live.error || 'empty_catalog',
+          message: auth ? 'GPT OAuth 已过期，请重新登录' : '同步 GPT 目录失败',
+          vm_id: target.id,
+        }
+        continue
+      }
+      usedVm = target.id
+      const rowsLive = live.models?.length ? live.models : live.ids.map((id) => ({ id }))
+      for (const row of rowsLive) {
+        const id = String(row?.id || row || '').trim()
+        if (!id) continue
+        merged.set(id.toLowerCase(), typeof row === 'object' ? row : { id })
       }
     }
-    persistRefreshedCodexAccount(projectRoot, target.id, {
-      access_token: tok.access_token,
-      refresh_token: tok.refresh_token,
-      id_token: tok.id_token || first.id_token,
-      expires_at: tok.expires_at || first.expires_at,
-    })
-    access = tok.access_token
-    live = await fetchOnce()
   }
-  if (!live.ok || !live.ids?.length) {
-    const auth = live.error === 'upstream_auth'
+  if (!merged.size) {
     return {
       ok: false,
-      error: live.error || 'empty_catalog',
-      message: auth ? 'GPT OAuth 已过期，请重新登录' : '同步 GPT 目录失败',
-      vm_id: target.id,
-      ids: live.ids || [],
+      error: lastError?.error || 'empty_catalog',
+      message: lastError?.message || '同步 GPT 目录失败',
+      vm_id: lastError?.vm_id || targets[0].id,
+      catalog_version: catalogVersion.version,
+      ids: [],
       synced: 0,
     }
   }
-  syncGptIdsIntoPolicy(live.models?.length ? live.models : live.ids)
+  const models = [...merged.values()]
+  syncGptIdsIntoPolicy(models)
   return {
     ok: true,
-    vm_id: target.id,
-    ids: live.ids,
-    synced: live.ids.length,
-    source: live.source || 'chatgpt',
+    vm_id: usedVm,
+    catalog_version: catalogVersion.version,
+    ids: models.map((row) => row.id),
+    synced: models.length,
+    source: 'chatgpt',
   }
 }
 
-async function refreshCodexCatalogFromSlot({ projectRoot, vm, fetchImpl } = {}) {
+async function refreshCodexCatalogFromSlot({ projectRoot, vm, fetchImpl, catalogClientVersion = 'auto' } = {}) {
   const result = await syncCodexCatalog({
     projectRoot,
     vmId: vm?.id,
     fetchImpl,
     rotate: false,
+    catalogClientVersion,
   })
   if (!result.ok) return { ok: false, error: result.error, ids: result.ids || [] }
   return { ok: true, ids: result.ids, source: result.source }
@@ -220,7 +298,14 @@ async function refreshCodexCatalogFromSlot({ projectRoot, vm, fetchImpl } = {}) 
  * Panel test-model dropdown. vm_id wins over platform.
  * refresh=true hops ChatGPT /backend-api/models via the slot SOCKS; 401 does not rotate OAuth.
  */
-export async function resolveTestModels({ projectRoot, vmId, platform, refresh = false, fetchImpl } = {}) {
+export async function resolveTestModels({
+  projectRoot,
+  vmId,
+  platform,
+  refresh = false,
+  fetchImpl,
+  catalogClientVersion = 'auto',
+} = {}) {
   const vm = vmId && projectRoot ? getVm(projectRoot, vmId) : null
   const kind = vm ? (isCodexVm(vm) ? 'openai' : 'anthropic') : normalizeTestPlatform(platform)
   let source = 'policy'
@@ -229,6 +314,7 @@ export async function resolveTestModels({ projectRoot, vmId, platform, refresh =
       projectRoot,
       vm: vm && isCodexVm(vm) ? vm : null,
       fetchImpl,
+      catalogClientVersion,
     })
     if (live.ok) source = 'chatgpt'
   }
@@ -807,9 +893,14 @@ export async function runVmTestChat(opts = {}) {
   const codex = isCodexVm(vm)
   const inferenceEngine = codex ? null : resolveInferenceEngine(vm, routing)
   const cliHop = !codex && resolveOfficialCcInference(vm, routing) === 'cli-hop'
+  const dataplane = codex ? null : resolveKernelDataplane(vm, routing) || 'wrap'
   push(
     'info',
-    codex ? '推理 codex-kernel / ChatGPT' : `推理 ${inferenceEngine} / ${cliHop ? 'cli-hop wrap' : 'http hop'}`,
+    codex
+      ? '推理 codex-kernel / ChatGPT'
+      : cliHop
+        ? `推理 ${inferenceEngine} / cli-hop ${dataplane}`
+        : `推理 ${inferenceEngine} / http hop`,
   )
 
   const credMode = testChatCredentialMode(vm)
@@ -1017,7 +1108,7 @@ export async function runVmTestChat(opts = {}) {
         push('info', 'Codex hop 401，尝试刷新 OAuth')
         const tok = await refreshCodexAccessToken({
           refreshToken,
-          proxyUrl: boundProxyUrl(vm.proxy),
+          proxyUrl: hostProxyUrlForVm(vm),
           fetchImpl: opts.fetchImpl,
         })
         if (tok.ok) {
@@ -1126,6 +1217,7 @@ export async function runVmTestChat(opts = {}) {
     via: 'v1-loopback',
     credential_mode: credMode,
     inference_engine: inferenceEngine,
+    dataplane,
     official_cc_inference: codex ? null : cliHop ? 'cli-hop' : 'http',
     debug: {
       path: v1Path,
@@ -1146,6 +1238,7 @@ export async function runVmTestChat(opts = {}) {
       hit_vm: result?.vm_id || null,
       upstream_model: result?.model || result?.body?.model || null,
       inference_engine: inferenceEngine,
+      dataplane,
       official_cc_inference: codex ? null : cliHop ? 'cli-hop' : 'http',
     },
     log,

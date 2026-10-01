@@ -28,6 +28,7 @@ import {
 import { accountTierKey, isNearLimit, normalizeTiers, resolveTierPolicy } from './quota-tiers.mjs'
 import { resolvePolicyModelId } from '../protocol/model-policy.mjs'
 import { SessionLimitRegistry } from './session-limit.mjs'
+import { applyVmQuotaConfig, applyVmQuotaPolicy } from './vm-quota-override.mjs'
 import { isFablePlanDenied, isInventedFableWindow, isOfficialUsageRateLimited } from '../oauth/crs-usage-probe.mjs'
 import { normalizeUsage } from '../admin/pricing.mjs'
 import { isTestProbeSource } from './schedule-eligibility.mjs'
@@ -63,6 +64,8 @@ export class AccountQuota {
     this.inflight = new Map() // accountId → count
     this.rpmBuckets = new Map() // accountId → number[] timestamps ms
     this.sessions = config?.sessions instanceof SessionLimitRegistry ? config.sessions : new SessionLimitRegistry()
+    // vm_id → normalized `vm.policy.quota`; vm.json is the source of truth, this is the hot-path copy.
+    this.vmQuota = new Map()
     // seed accounts
     for (const a of accounts || []) this.ensure(a)
   }
@@ -335,6 +338,7 @@ export class AccountQuota {
       }
     }
     const usageOk = probe.ok === true || (probe.usage_status > 0 && probe.usage_status < 400)
+    const completeOfficialUsage = usageOk && probe.limits_present === true
     const leftoverFable = acc.unified.fable || {}
     const hasFableUsage =
       probe.usage_has_fable === true ||
@@ -345,15 +349,26 @@ export class AccountQuota {
         '7d_oi': oi,
       }) &&
         (oiNorm != null || oi?.resets_at || oi?.reset || oi?.status))
-    if (probe.usage_has_fable === true || hasFableUsage) acc.unified.usage_has_fable = true
-    else if (probe.usage_has_fable === false) acc.unified.usage_has_fable = false
+    if (completeOfficialUsage && (probe.usage_has_fable === true || hasFableUsage)) acc.unified.usage_has_fable = true
+    else if (completeOfficialUsage && probe.usage_has_fable === false) {
+      acc.unified.usage_has_fable = false
+      delete acc.unified['7d_oi']
+      if (acc.unified.headers) delete acc.unified.headers['7d_oi']
+      delete acc.unified.fable
+    }
+    if (completeOfficialUsage) {
+      if (probe.usage_has_fable === true || hasFableUsage) acc.unified.account_tier = 'max'
+      else if (probe.usage_has_fable === false) acc.unified.account_tier = 'pro'
+      if (acc.unified.account_tier === 'pro' || acc.unified.account_tier === 'max')
+        acc.unified.account_tier_source = 'usage'
+    }
     if (probe.fable && !fableTransport) {
-      const planDenied = usageOk && !hasFableUsage && isFablePlanDenied(probe.fable)
+      const planDenied = completeOfficialUsage && !hasFableUsage && isFablePlanDenied(probe.fable)
       acc.unified.fable = {
         limited: oiRejected,
         banned: !!probe.fable.banned && !usageOk && (probe.usage_status === 401 || probe.usage_status === 403),
         plan_denied: planDenied,
-        ok: (!!probe.fable.ok && !oiRejected) || hasFableUsage,
+        ok: completeOfficialUsage && hasFableUsage,
         status: probe.fable.status || 0,
         reset: probe.fable.reset_at || acc.unified['7d_oi']?.reset || null,
         utilization: oiNorm ?? probe.fable.utilization ?? acc.unified['7d_oi']?.utilization ?? null,
@@ -361,13 +376,16 @@ export class AccountQuota {
         error: usageOk && Number(probe.fable.status) === 401 ? null : probe.fable.error || null,
         probed_at: probe.probed_at || new Date().toISOString(),
       }
-      const stored = String(acc.unified.account_tier || '').toLowerCase()
-      if (hasFableUsage || acc.unified.fable.ok) acc.unified.account_tier = 'max'
-      else if (acc.unified.fable.plan_denied && stored !== 'max') acc.unified.account_tier = 'pro'
+      // Only a complete official /usage classifies the plan; Fable hop only fills metadata.
+      if (completeOfficialUsage && hasFableUsage) {
+        acc.unified.account_tier = 'max'
+        acc.unified.account_tier_source = 'usage'
+      }
     } else if (usageOk) {
       const leftover = leftoverFable
-      if (hasFableUsage) {
+      if (completeOfficialUsage && hasFableUsage) {
         acc.unified.account_tier = 'max'
+        acc.unified.account_tier_source = 'usage'
         if (leftover.plan_denied || leftover.ok === false) {
           acc.unified.fable = {
             ...leftover,
@@ -461,28 +479,51 @@ export class AccountQuota {
    * Pre-flight check: can this account take another request?
    * @returns {{ ok: true } | { ok: false, reason, detail }}
    */
-  policyFor(acc, { tier, tierMode = 'auto' } = {}) {
-    // 自动模式继续信任较新的账号探测结果；仅手动模式覆盖探测套餐。
-    const accountTier = acc?.unified?.account_tier || acc?.account_tier
-    const policyTier = tierMode === 'manual' ? tier || accountTier : accountTier || tier
-    return resolveTierPolicy(
-      {
-        tiers: this.tiers,
-        quota: this.config,
-        concurrency: this.concurrency,
-      },
-      policyTier,
+  policyFor(acc, { tier } = {}) {
+    return applyVmQuotaPolicy(
+      resolveTierPolicy(
+        {
+          tiers: this.tiers,
+          quota: this.config,
+          concurrency: this.concurrency,
+        },
+        acc?.unified?.account_tier || acc?.account_tier || tier,
+      ),
+      this.vmQuotaOverrideFor(acc),
     )
   }
 
-  canAccept(accountId, { sessionKey = null, tier = null, tierMode = 'auto' } = {}) {
+  /** Global `quota` block (block switches, weekly split) with the account's VM override applied. */
+  quotaConfigFor(acc) {
+    return applyVmQuotaConfig(this.config, this.vmQuotaOverrideFor(acc))
+  }
+
+  vmQuotaOverrideFor(acc) {
+    return acc?.vm_id ? this.vmQuota.get(acc.vm_id) || null : null
+  }
+
+  /** @param {string} vmId @param {object|null} override normalized (`vmQuotaOverrideOf`) */
+  setVmQuotaOverride(vmId, override) {
+    if (!vmId) return
+    if (override) this.vmQuota.set(vmId, override)
+    else this.vmQuota.delete(vmId)
+  }
+
+  /** Replace every VM override from `listVms` summaries (boot / backup restore). */
+  loadVmQuotaOverrides(vms) {
+    this.vmQuota.clear()
+    for (const vm of vms || []) this.setVmQuotaOverride(vm?.id, vm?.quota_override || null)
+  }
+
+  canAccept(accountId, { sessionKey = null, tier = null } = {}) {
     const acc = this.ensure({ account_id: accountId })
-    const policy = this.policyFor(acc, { tier, tierMode })
+    const policy = this.policyFor(acc, { tier })
     const ratio = Number(policy.limit_5h ?? policy.safety_ratio ?? this.config.safety_ratio ?? 0.85)
     const weeklyRatio = Number(
       policy.limit_7d ?? policy.weekly_safety_ratio ?? this.config.weekly_safety_ratio ?? ratio,
     )
     const warnRatio = Number(policy.warn_ratio ?? this.config.warn_ratio ?? 0.75)
+    const quotaConfig = this.quotaConfigFor(acc)
     const inflight = this.inflight.get(accountId) || 0
 
     const limit = this.limitFor(acc, policy)
@@ -494,7 +535,7 @@ export class AccountQuota {
       }
     }
 
-    if (this.config.block_on_5h && headerHardBlocked(acc.unified, '5h')) {
+    if (quotaConfig.block_on_5h && headerHardBlocked(acc.unified, '5h')) {
       const h5 = headerWindow(acc.unified, '5h')
       acc.last_blocked = { at: new Date().toISOString(), window: '5h', status: h5.status, source: 'headers' }
       this.repo.save(acc)
@@ -508,7 +549,7 @@ export class AccountQuota {
         },
       }
     }
-    if (this.config.block_on_7d && headerHardBlocked(acc.unified, '7d')) {
+    if (quotaConfig.block_on_7d && headerHardBlocked(acc.unified, '7d')) {
       const h7 = headerWindow(acc.unified, '7d')
       acc.last_blocked = { at: new Date().toISOString(), window: '7d', status: h7.status, source: 'headers' }
       this.repo.save(acc)
@@ -528,7 +569,7 @@ export class AccountQuota {
     const u5 = asUtilRatio(w5.utilization)
     const u7 = asUtilRatio(w7.utilization)
 
-    if (this.config.block_on_5h && safetyTripped(u5, ratio, inflight)) {
+    if (quotaConfig.block_on_5h && safetyTripped(u5, ratio, inflight)) {
       acc.last_blocked = { at: new Date().toISOString(), window: '5h', utilization: u5, status: w5.status }
       this.repo.save(acc)
       return {
@@ -545,7 +586,7 @@ export class AccountQuota {
       }
     }
 
-    if (this.config.block_on_7d && safetyTripped(u7, weeklyRatio, inflight)) {
+    if (quotaConfig.block_on_7d && safetyTripped(u7, weeklyRatio, inflight)) {
       acc.last_blocked = { at: new Date().toISOString(), window: '7d', utilization: u7, status: w7.status }
       this.repo.save(acc)
       return {
@@ -598,7 +639,7 @@ export class AccountQuota {
     }
     const acc = this.ensure({ account_id: accountId })
     const inflight = this.inflight.get(accountId) || 0
-    const limit = this.limitFor(acc, this.policyFor(acc, { tier: opts.tier, tierMode: opts.tierMode }))
+    const limit = this.limitFor(acc, this.policyFor(acc, { tier: opts.tier }))
     if (inflight >= limit) {
       return { ok: false, reason: 'concurrency_limit', detail: { inflight, max: limit, source: 'quota-reservation' } }
     }
@@ -641,10 +682,10 @@ export class AccountQuota {
     return utilization * 100 >= percent
   }
 
-  /** Experimental 50/50 weekly split. Off unless quota.weekly_split.enabled. */
+  /** Experimental 50/50 weekly split. Off unless quota.weekly_split.enabled (or the VM override). */
   weeklySplitOf(accountId) {
-    const cfg = weeklySplitConfig(this.config)
     const acc = this.repo.get(accountId)
+    const cfg = weeklySplitConfig(this.quotaConfigFor(acc))
     const u = acc?.unified || {}
     return computeWeeklySplit({
       enabled: cfg.enabled,
@@ -943,14 +984,16 @@ export class AccountQuota {
     return this.repo.save(acc)
   }
 
-  setAccountTier(accountId, tier) {
+  setAccountTier(accountId, tier, { source = null } = {}) {
     const key = String(tier || '').toLowerCase()
     if (!accountId || (key !== 'pro' && key !== 'max')) return null
     const acc = this.repo.get(accountId)
     if (!acc) return null
-    if (acc.unified?.account_tier === key) return acc
+    if (acc.unified?.account_tier_source === 'profile' && source !== 'profile' && source !== 'usage') return acc
+    if (acc.unified?.account_tier === key && (acc.unified?.account_tier_source || null) === source) return acc
     acc.unified = acc.unified || {}
     acc.unified.account_tier = key
+    acc.unified.account_tier_source = source
     acc.unified.updated_at = new Date().toISOString()
     return this.repo.save(acc)
   }

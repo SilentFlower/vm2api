@@ -6,10 +6,10 @@
 import crypto from 'node:crypto'
 import { getVm } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
-import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
+import { hostProxyUrlForVm, isLocalEgressProxy } from '../vm/egress.mjs'
 import { readCodexAccounts, upsertCodexAccount, persistCodexQuotaSnapshot } from '../vm/codex-slot.mjs'
 import { buildCodexUsageView, extraToCodexSnapshot, normalizeCodexLimits } from '../protocol/codex-usage.mjs'
-import { CODEX_OAUTH_ORIGINATOR, makeSocksFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
+import { CODEX_OAUTH_ORIGINATOR, makeProxyFetch, refreshCodexAccessToken } from '../protocol/codex-models.mjs'
 
 export const CHATGPT_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
 export const CHATGPT_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
@@ -36,6 +36,15 @@ function firstString(...values) {
   return ''
 }
 
+function accountIdFromToken(accessToken) {
+  try {
+    const payload = JSON.parse(Buffer.from(String(accessToken).split('.')[1], 'base64url'))
+    return firstString(payload?.['https://api.openai.com/auth']?.chatgpt_account_id)
+  } catch {
+    return ''
+  }
+}
+
 export function buildOpenaiQuotaHeaders({ accessToken, accountId, fedRamp = false } = {}) {
   const headers = {
     authorization: `Bearer ${String(accessToken || '').trim()}`,
@@ -48,7 +57,7 @@ export function buildOpenaiQuotaHeaders({ accessToken, accountId, fedRamp = fals
     'sec-fetch-dest': 'empty',
     priority: 'u=4, i',
   }
-  const account = firstString(accountId)
+  const account = firstString(accountIdFromToken(accessToken), accountId)
   if (account) headers['chatgpt-account-id'] = account
   if (fedRamp) headers['x-openai-fedramp'] = 'true'
   return headers
@@ -240,7 +249,7 @@ async function loadSlot(projectRoot, vmId) {
   if (!access && !refresh) {
     return { ok: false, error: 'no_oauth_token', message: 'GPT 槽没有 OAuth 凭证', status: 400 }
   }
-  const proxyUrl = boundProxyUrl(vm.proxy)
+  const proxyUrl = hostProxyUrlForVm(vm)
   return {
     ok: true,
     vm,
@@ -254,7 +263,7 @@ async function loadSlot(projectRoot, vmId) {
 }
 
 async function quotaFetch(url, { method = 'GET', headers, body, proxyUrl, fetchImpl, timeoutMs, direct = false } = {}) {
-  const fetchFn = fetchImpl || makeSocksFetch(proxyUrl, timeoutMs || OPENAI_QUOTA_TIMEOUT_MS)
+  const fetchFn = fetchImpl || makeProxyFetch(proxyUrl, timeoutMs || OPENAI_QUOTA_TIMEOUT_MS)
   if (!fetchImpl && !proxyUrl && !direct)
     return { ok: false, error: 'proxy_required', message: 'GPT 槽未绑定 SOCKS5', status: 400 }
   try {
@@ -371,6 +380,7 @@ async function queryUpstream(slot, { fetchImpl, rotate = true, projectRoot, vmId
   const persistable = resetCredits.available_count <= 0 || resetCredits.credits.length > 0 ? resetCredits : null
   persistCodexQuotaSnapshot(projectRoot, vmId, {
     extra,
+    planType: pack.usage.payload?.plan_type || pack.usage.payload?.planType,
     ...(persistable ? { resetCredits: persistable } : {}),
   })
   return {

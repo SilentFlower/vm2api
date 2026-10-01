@@ -36,6 +36,8 @@
 | 本机构建 | Rust stable、Go 1.25、pnpm 10 |
 | 网 | 每槽一条出口：远程 SOCKS5，或本地出口 |
 
+IPv6 地址的 SOCKS5 代理出口**默认关闭**，在管理台 **设置 → SOCKS5 → IPv6 代理出口** 开启。导入使用 `[2001:db8::1]:1080` 或 `socks5h://user:pass@[2001:db8::1]:1080`，不要使用含糊的裸 IPv6 `host:port`。关闭后不可探测、绑定或运行使用，但可继续导入、编辑、复制记录；已有槽位、绑定和探测历史保留，网络状态显示「IPv6 已关闭」而非代理故障。远端不可达时会提示出口未同步，并在节点恢复连接后重新应用关闭策略。此开关只针对 IPv6 literal 代理地址，不启用 Docker 网桥双栈，不改变 hostname 的 DNS 解析、DNS 或路由策略。
+
 ### Docker Compose（推荐）
 
 生产就用这条。**拉预构建镜像，不在服务器上构建**；安装目录任意。
@@ -268,7 +270,7 @@ git push origin v1.3.14
    `bin/kin-*` 为 **755**、挂了 `docker.sock`、控制面容器名与 `VM2API_CONTAINER_NAME` 一致（自省宿主路径用）。先添加本地出口再启动槽——首次启动会自动补一个本机出口 `px-local`。
 
 8. **`exec: "/usr/local/bin/kin-kernel": permission denied`？**  
-   `chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker bin/kin-codex-kernel bin/kin-cookie-auth`。不要用 `700`。
+   `chmod 755 bin/kin-kernel bin/kin-egress bin/kin-worker bin/kin-codex-kernel`。不要用 `700`。
 
 9. **本机 `curl 127.0.0.1:8787` 失败，容器却是 healthy？**  
    Docker Desktop 的 `network_mode: host` 不在 WSL/macOS localhost。用 `docker exec vm2api …` 探活，或改 Ubuntu + Docker Engine。

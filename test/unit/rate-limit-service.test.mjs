@@ -104,6 +104,23 @@ test('model-scoped 429 does not write an account hard block', () => {
   }
 })
 
+test('#163: an unknown bare 429 asks for one usage probe and fabricates no 5h block', () => {
+  const { service, runtimeRepo, probes, close } = setup()
+  try {
+    const block = service.handleUpstreamError({
+      accountId: 'acc-1',
+      vmId: 'vm-01',
+      result: limitResult('Rate limited'),
+      policy: { scope: 'account', reason: 'rate_limited_unknown' },
+    })
+    assert.equal(block, null)
+    assert.equal(runtimeRepo.get('acc-1').rate_limit_reset_at, null)
+    assert.deepEqual(probes, [{ accountId: 'acc-1', vmId: 'vm-01' }])
+  } finally {
+    close()
+  }
+})
+
 test('529 writes overload_until for the configured minutes', () => {
   const { service, runtimeRepo, close } = setup({ overload_cooldown_min: 10 })
   try {
@@ -184,6 +201,24 @@ test('clearExpired drops elapsed rate limit and overload columns', () => {
     const state = runtimeRepo.get('acc-1')
     assert.equal(state.rate_limit_reset_at, null)
     assert.equal(state.overload_until, null)
+  } finally {
+    close()
+  }
+})
+
+test('an incomplete hop does not write an empty_response cooldown', () => {
+  const { service, runtimeRepo, close } = setup({ empty_response_cooldown_sec: 60 })
+  try {
+    const block = service.handleUpstreamError({
+      accountId: 'acc-1',
+      vmId: 'vm-01',
+      result: { status: 200, committed: false, terminalState: 'incomplete' },
+      policy: { reason: 'empty_response', scope: 'stream' },
+      now: 1_700_000_000_000,
+    })
+    assert.equal(block, null)
+    assert.equal(runtimeRepo.get('acc-1').cooldown_until, null)
+    assert.equal(typeof service.noteDistinctEmptyHop, 'undefined')
   } finally {
     close()
   }

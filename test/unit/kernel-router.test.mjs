@@ -8,6 +8,7 @@ import {
   resolveHopEngine,
   dispatchStreamInference,
   dispatchCallInference,
+  isDeadWrapHop,
   rustHealthTtlMs,
   rustSlotWaitMs,
   resolveHopSlotWaitMs,
@@ -41,6 +42,40 @@ import { socksUidFor } from '../../src/lib/vm/vm-runtime.mjs'
 
 const unix = process.platform !== 'win32'
 const unixTest = unix ? test : test.skip
+
+test('empty assistant hop does not SIGKILL the supervisor', () => {
+  assert.equal(
+    isDeadWrapHop({
+      ok: false,
+      status: 200,
+      terminalState: 'incomplete',
+      transportError: false,
+      body: { type: 'message', role: 'assistant', content: [], stop_reason: null },
+    }),
+    false,
+  )
+  assert.equal(
+    isDeadWrapHop({
+      ok: false,
+      status: 499,
+      clientCancelled: true,
+      terminalState: 'cancelled',
+      transportError: false,
+      body: { error: { code: 'client_cancelled', message: 'Client closed the connection' } },
+    }),
+    false,
+  )
+  assert.equal(
+    isDeadWrapHop({
+      ok: false,
+      status: 0,
+      terminalState: 'transport_error',
+      transportError: true,
+      body: { error: { message: 'socket hang up' } },
+    }),
+    true,
+  )
+})
 
 test('wrap system error is not a credential ensure; 401 still is', () => {
   assert.equal(
@@ -660,6 +695,20 @@ test('writeKernelConfig cli-hop writes local_cli without secrets', () => {
   assert.equal(doc.proxy_required, false)
   assert.doesNotMatch(raw, /sk-ant-|oat01|password=/i)
   fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('writeKernelConfig points cc and crag at cc-node', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-kernel-cc-cfg-'))
+  try {
+    for (const dataplane of ['cc', 'crag']) {
+      const written = writeKernelConfig(root, { id: 'vm-09', dataplane }, { token: 'tok' })
+      const doc = JSON.parse(fs.readFileSync(written.configPath, 'utf8'))
+      assert.equal(doc.dataplane, dataplane)
+      assert.equal(doc.claude_bin, '/home/kincli/.kin/cc-node')
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })
 
 test('writeKernelConfig uses identity layout when persona_inject is rewrite', () => {

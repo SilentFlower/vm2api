@@ -1,3 +1,0 @@
-interface:
-  display_name: "Commit PR Release"
-  short_description: "PR, then HostDzire verify, then merge and release"

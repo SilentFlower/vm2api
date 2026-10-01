@@ -16,7 +16,6 @@ import { cleanPersonaRules, personaRulesFromCompat } from '@/lib/persona-rules'
 import {
   personaInjectFromPreset,
   personaPresetFromCompat,
-  protocolPersonaSaveToast,
 } from '@/lib/persona-template'
 import { cn } from '@/lib/utils'
 import { isCodexVm } from '@/lib/vm-kind'
@@ -44,7 +43,6 @@ import {
 import { NotifyPane } from '@/features/settings/notify-pane'
 import { OfficialCcSettingsPane } from '@/features/settings/official-cc-pane'
 import { PeakPrimePane } from '@/features/settings/peak-prime-pane'
-import { PersonaPane } from '@/features/settings/persona-pane'
 import { PersonaRulesPane } from '@/features/settings/persona-rules-pane'
 import { PoolPane } from '@/features/settings/pool-pane'
 import { inheritProtocolOnSlots } from '@/features/settings/protocol-authority'
@@ -67,9 +65,6 @@ export function SettingsPage() {
   const routing = useQuery(routingQueryOptions())
   const qc = useQueryClient()
   const [draft, setDraft] = useState<Record<string, unknown>>({})
-  // persona 面板把校验结果上报到这里，保存前拦住畸形模板，避免吞一个后端 400
-  const [personaProblems, setPersonaProblems] = useState<string[]>([])
-  // 放弃草稿时 +1：persona 等面板持有内部草稿，靠重挂载从重置后的 draft 重新播种
   const [discardKey, setDiscardKey] = useState(0)
   useEffect(() => {
     if (routing.data) setDraft(routing.data)
@@ -178,10 +173,6 @@ export function SettingsPage() {
     tab === 'telemetry' ||
     tab === 'backup' ||
     tab === 'about'
-  // 两个 tab 都写 compatibility，而 persona_templates 是在协议页编辑的：
-  // 只拦协议页的话，用户可以带着畸形模板切到白名单页保存，照样吃后端 400。
-  const blocked =
-    (tab === 'protocol' || tab === 'whitelist') && personaProblems.length > 0
 
   // dirty = 草稿偏离服务端快照。两边对象来自同一份 JSON，展开更新不改键序，
   // 串比较足够；首帧 draft 还是 {} 时不算 dirty。
@@ -194,7 +185,6 @@ export function SettingsPage() {
 
   const discard = () => {
     setDraft(routing.data ?? {})
-    setPersonaProblems([])
     setDiscardKey((k) => k + 1)
   }
 
@@ -204,10 +194,6 @@ export function SettingsPage() {
       if (!(e.metaKey || e.ctrlKey) || e.key !== 's') return
       e.preventDefault()
       if (!dirty || hideSave || save.isPending) return
-      if (blocked) {
-        toast.error(personaProblems[0])
-        return
-      }
       save.mutate()
     }
     window.addEventListener('keydown', onKey)
@@ -435,16 +421,6 @@ export function SettingsPage() {
                     value={inference}
                     onChange={(next) => setDraft({ ...draft, inference: next })}
                   />
-                  <PersonaPane
-                    compat={
-                      (draft.compatibility as
-                        Record<string, unknown> | undefined) || {}
-                    }
-                    onChange={(next) =>
-                      setDraft({ ...draft, compatibility: next })
-                    }
-                    onProblemsChange={setPersonaProblems}
-                  />
                   <CacheBreakpointsPane
                     compat={
                       (draft.compatibility as
@@ -493,8 +469,18 @@ export function SettingsPage() {
                     healthProbe={
                       draft.health_probe as Record<string, unknown> | undefined
                     }
+                    compatibility={
+                      (draft.compatibility as
+                        Record<string, unknown> | undefined) || {}
+                    }
                     onFailoverChange={(next) =>
                       setDraft({ ...draft, failover: next })
+                    }
+                    onHealthProbeChange={(next) =>
+                      setDraft({ ...draft, health_probe: next })
+                    }
+                    onCompatibilityChange={(next) =>
+                      setDraft({ ...draft, compatibility: next })
                     }
                   />
                 </>
@@ -515,7 +501,6 @@ export function SettingsPage() {
       </div>
       {showSaveBar ? (
         <SaveBar
-          blockedReason={blocked ? personaProblems[0] : undefined}
           saving={save.isPending}
           onSave={() => save.mutate()}
           onDiscard={discard}
@@ -531,8 +516,16 @@ function settingsSaveToast(
   inherited: number,
   kernel?: { updated?: number } | null
 ) {
-  if (tab === 'protocol')
-    return protocolPersonaSaveToast(compat, inherited, kernel)
+  if (tab === 'protocol') {
+    const hot =
+      kernel && typeof kernel.updated === 'number'
+        ? kernel.updated > 0
+          ? `缓存 TTL 已热更新 ${kernel.updated} 个槽`
+          : 'kernel 配置已一致'
+        : '已写入'
+    if (!inherited) return `已保存 · ${hot}`
+    return `已保存 · ${inherited} 个槽位改为跟随全局 · ${hot}`
+  }
   if (tab === 'whitelist') {
     const count = cleanPersonaRules(personaRulesFromCompat(compat)).length
     return `已保存 · ${count} 条规则`
@@ -542,7 +535,7 @@ function settingsSaveToast(
 
 function protocolFollowError(message: string) {
   if (/config_missing|kernel_start_failed|wrap_cli_missing/i.test(message)) {
-    return 'wrap 配置缺失，先到 Wrap 页同步母样本，再切 rust cli-hop'
+    return '内核文件缺失，先到内核页拉取 wrap/crag 二进制再同步'
   }
   return message
 }

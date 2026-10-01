@@ -6,13 +6,22 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
-import { listVms, getVm, persistAccountTier, persistVmSessionSlots, setVmSchedulable } from '../vm/vm-registry.mjs'
+import {
+  listVms,
+  getVm,
+  persistAccountTier,
+  persistVmQuotaOverride,
+  persistVmSessionSlots,
+  setVmSchedulable,
+} from '../vm/vm-registry.mjs'
 import { normalizeInferenceConfig, normalizeSessionSlots } from '../vm/slot-engine.mjs'
 
 import { accountTierKey, mergeTierMaps, normalizeTiers } from '../pool/quota-tiers.mjs'
+import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { setManualScheduleWins } from '../pool/schedule-policy.mjs'
 import { PoolScheduler } from '../pool/pool-scheduler.mjs'
 import { FailoverRunner } from '../pool/failover-runner.mjs'
+import { unitCircuit } from '../pool/unit-circuit.mjs'
 import { RateLimitService } from '../pool/rate-limit-service.mjs'
 import { AccountRuntimeRepo } from '../db/repos/account-runtime-repo.mjs'
 import { RequestAttemptsRepo } from '../db/repos/request-attempts-repo.mjs'
@@ -25,7 +34,7 @@ import { markVmRefreshError } from '../oauth/oauth-credentials.mjs'
 import { shouldMarkMissingRefresh } from '../pool/schedule-eligibility.mjs'
 import { normalizeCodexRouting } from '../protocol/codex-route.mjs'
 import { normalizeClientAccess } from '../protocol/client-access-policy.mjs'
-import { normalizeWarmupIntercept } from '../protocol/warmup-intercept.mjs'
+import { normalizeWarmupIntercept } from '../protocol/client-intercept-policy.mjs'
 import { normalizePeakPrimeConfig } from './peak-prime.mjs'
 import { normalizeFableWeeklyLimit } from '../pool/account-quota.mjs'
 import { rustKernelHealth } from '../transport/rust-kernel-client.mjs'
@@ -87,6 +96,14 @@ export function createRoutingRuntime(ctx) {
     return persistVmSessionSlots(ctx.cfg.paths.project, id, normalizeSessionSlots(n), { override })
   }
 
+  /** `override` is already parsed (`parseVmQuotaOverride`); null = follow global quota. */
+  function applyVmQuotaOverride(id, override) {
+    const vm = persistVmQuotaOverride(ctx.cfg.paths.project, id, override)
+    if (!vm) return null
+    ctx.accountQuota.setVmQuotaOverride(vm.id, vmQuotaOverrideOf(vm))
+    return vm
+  }
+
   function applyRoutingSessionSlots(n) {
     const value = normalizeSessionSlots(n)
     const applied = { updated: 0, skipped: 0 }
@@ -107,7 +124,9 @@ export function createRoutingRuntime(ctx) {
     const v = Math.max(0, Math.min(256, Number(n) || 0))
     const skip = []
     for (const vm of listVms(ctx.cfg.paths.project)) {
-      if (vm.policy?.concurrencyOverride) {
+      // listVms returns flattened summaries; override flags live in the raw record.
+      const storedVm = getVm(ctx.cfg.paths.project, vm.id)
+      if (storedVm?.policy?.concurrencyOverride) {
         skip.push(vm.id)
         if (vm.account_uuid) skip.push(vm.account_uuid)
         continue
@@ -122,7 +141,9 @@ export function createRoutingRuntime(ctx) {
     const stored = String(vm.account_tier || vm.claude?.account_tier || '').toLowerCase()
     if (stored === 'pro' || stored === 'max') return stored
     const acc = ctx.accountQuota.repo.get(vm.claude?.account_uuid || vm.account_uuid || vm.id)
-    return accountTierKey(acc)
+    const accountTier = accountTierKey(acc)
+    if (accountTier !== 'default') return accountTier
+    return vm.claude?.has_access || vm.has_token ? 'pro' : accountTier
   }
 
   function applyRoutingTierConcurrency(tiers) {
@@ -131,7 +152,9 @@ export function createRoutingRuntime(ctx) {
     const skip = []
     const applied = { default: 0, pro: 0, max: 0, skipped: 0 }
     for (const vm of listVms(ctx.cfg.paths.project)) {
-      if (vm.policy?.concurrencyOverride) {
+      // listVms returns flattened summaries; override flags live in the raw record.
+      const storedVm = getVm(ctx.cfg.paths.project, vm.id)
+      if (storedVm?.policy?.concurrencyOverride) {
         skip.push(vm.id)
         if (vm.account_uuid) skip.push(vm.account_uuid)
         if (vm.claude?.account_uuid) skip.push(vm.claude.account_uuid)
@@ -140,7 +163,7 @@ export function createRoutingRuntime(ctx) {
       }
       const key = vmTierKey(vm)
       const next = Number(policies[key]?.max_concurrency ?? 2)
-      const cur = Number(vm.policy?.maxConcurrency)
+      const cur = Number(storedVm?.policy?.maxConcurrency)
       if (cur === next) continue
       applyVmConcurrency(vm.id, next, { override: false })
       applied[key] += 1
@@ -155,7 +178,9 @@ export function createRoutingRuntime(ctx) {
     const skip = []
     const applied = { default: 0, pro: 0, max: 0, skipped: 0 }
     for (const vm of listVms(ctx.cfg.paths.project)) {
-      if (vm.policy?.rpmOverride) {
+      // listVms returns flattened summaries; override flags live in the raw record.
+      const storedVm = getVm(ctx.cfg.paths.project, vm.id)
+      if (storedVm?.policy?.rpmOverride) {
         skip.push(vm.id)
         if (vm.account_uuid) skip.push(vm.account_uuid)
         if (vm.claude?.account_uuid) skip.push(vm.claude.account_uuid)
@@ -164,7 +189,7 @@ export function createRoutingRuntime(ctx) {
       }
       const key = vmTierKey(vm)
       const next = Number(policies[key]?.max_rpm ?? 0)
-      const cur = Number(vm.policy?.maxRpm)
+      const cur = Number(storedVm?.policy?.maxRpm)
       if (cur === next) continue
       applyVmRpm(vm.id, next, { override: false })
       applied[key] += 1
@@ -394,6 +419,10 @@ export function createRoutingRuntime(ctx) {
       config: poolSchedulerConfig(),
     })
     setPool(poolScheduler)
+    unitCircuit.configure({
+      failureThreshold: routingConfig.pool?.circuit_failure_threshold,
+      openMs: routingConfig.pool?.circuit_open_ms,
+    })
     ctx.accountQuota.onQuotaCooldownCleared = () => {
       try {
         poolScheduler.notifyCapacity()
@@ -481,6 +510,7 @@ export function createRoutingRuntime(ctx) {
     applyVmConcurrency,
     applyVmRpm,
     applyVmSessionSlots,
+    applyVmQuotaOverride,
     storedAccountTier,
     vmTierKey,
   }

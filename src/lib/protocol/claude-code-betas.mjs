@@ -28,7 +28,7 @@ export const BETA_CONTEXT_1M = 'context-1m-2025-08-07'
 export const HAIKU_BETA_HEADER = `${BETA_OAUTH},${BETA_INTERLEAVED}`
 
 /**
- * Claude Code 2.1.280 official main Messages order (linux-x64 sdk-cli, no context-1m).
+ * Claude Code 2.1.281 official main Messages order (linux-x64 sdk-cli, no context-1m).
  * advanced-tool-use is back, next to mid-conversation-system-clear-at.
  * thinking-binding-controls stays. extended-cache-ttl and cache-diagnosis are on the wire.
  * mid-conversation-tool-changes and fallback-credit are not in this capture.
@@ -76,7 +76,7 @@ export function apiKeyBetaHeader(header = '') {
   return stripped || API_KEY_BETAS.join(',')
 }
 
-/** Setup Token is user:inference only. Claude Code session betas 401 it. */
+/** Setup Token runtime uses the inference-compatible beta set. Claude Code session betas 401 it. */
 export function setupTokenBetaHeader(modelId = '') {
   if (/haiku/i.test(String(modelId || ''))) return HAIKU_BETA_HEADER
   return joinBetas([BETA_OAUTH, BETA_INTERLEAVED, BETA_CONTEXT_MANAGEMENT])
