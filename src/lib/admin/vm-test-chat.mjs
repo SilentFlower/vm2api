@@ -17,7 +17,8 @@ import { readRoutingConfigFile } from '../core/config.mjs'
 import { getVm, vmHasClaudeCredential } from '../vm/vm-registry.mjs'
 import { isCodexVm } from '../vm/vm-kind.mjs'
 import { summarizeCodexSlot, readCodexAccounts, writeCodexAccounts } from '../vm/codex-slot.mjs'
-import { hostProxyUrlForVm, isLocalEgressProxy } from '../vm/egress.mjs'
+import { isLocalEgressProxy } from '../vm/egress.mjs'
+import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { loadVmIdentity } from '../identity/vm-identity.mjs'
 import { snapshotOauth } from '../vm/execution-context.mjs'
 import { atomicWriteJson } from '../vm/vm-file.mjs'
@@ -471,7 +472,7 @@ export function testChatCredentialMode(vm = {}) {
     flavor: vm.claude?.flavor,
     source: vm.claude?.source,
   })
-  if (inferred === 'setup-token' || inferred === 'apikey') return inferred
+  if (inferred === 'setup-token' || inferred === 'official-setup-token' || inferred === 'apikey') return inferred
   return credentialModeOfVm(vm)
 }
 
@@ -491,11 +492,12 @@ export function slotTestIdentity(projectRoot, vm) {
   if (vm.fingerprint?.session_id !== sessionId && sessionId) {
     try {
       const vmPath = path.join(projectRoot, 'vms', `${vm.id}.json`)
+      const disk = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
       atomicWriteJson(
         vmPath,
         {
-          ...vm,
-          fingerprint: { ...(vm.fingerprint || {}), session_id: sessionId },
+          ...disk,
+          fingerprint: { ...(disk.fingerprint || {}), session_id: sessionId },
           updated_at: new Date().toISOString(),
         },
         { mode: 0o600 },
@@ -927,7 +929,13 @@ export async function runVmTestChat(opts = {}) {
     })
   }
   const unofficial =
-    !codex && (cliHop || opts.unofficial === true || credMode === 'setup-token' || credMode === 'apikey')
+    !codex &&
+    (cliHop ||
+      opts.unofficial === true ||
+      credMode === 'setup-token' ||
+      credMode === 'official-setup-token' ||
+      credMode === 'apikey')
+
   const cliLayout = !codex && cliHop ? resolveCliSystemLayout(vm, routing) : null
   push(
     'info',
@@ -1148,7 +1156,7 @@ export async function runVmTestChat(opts = {}) {
   const text = result?.text || extractText(result?.body)
   const usage = result?.usage || result?.body?.usage || null
   let errObj = result?.ok ? null : extractError(result, { wrapHop: !codex })
-  if (errObj && result?.status === 401 && credMode === 'setup-token') {
+  if (errObj && result?.status === 401 && (credMode === 'setup-token' || credMode === 'official-setup-token')) {
     errObj = {
       ...errObj,
       code: 'setup_token_invalid',

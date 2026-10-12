@@ -300,12 +300,17 @@ export async function createAndStartContainer(connect, input) {
   return { id, name: spec.name, image: spec.image }
 }
 
-export async function containerAction(connect, id, action) {
+export async function containerAction(connect, id, action, { t } = {}) {
   if (!['start', 'stop', 'restart'].includes(action)) {
     throw new ClusterError(400, 'invalid_action', '不支持的容器操作')
   }
   // 304 = already in the requested state; treat as success.
-  await dockerJson(connect, { method: 'POST', path: `${containerPath(id)}/${action}`, timeoutMs: 60_000 }, [204, 304])
+  const q = action === 'stop' && Number.isFinite(Number(t)) ? `?t=${Math.max(0, Number(t))}` : ''
+  await dockerJson(
+    connect,
+    { method: 'POST', path: `${containerPath(id)}/${action}${q}`, timeoutMs: 60_000 },
+    [204, 304],
+  )
 }
 
 export async function removeContainer(connect, id) {
@@ -359,6 +364,102 @@ export async function execDetached(connect, id, cmd, { user } = {}) {
     [201],
   )
   await dockerJson(connect, { method: 'POST', path: `/exec/${created.Id}/start`, body: { Detach: true } }, [200])
+}
+
+const EXEC_ID_RE = /^[a-f0-9]{64}$/
+
+function execPath(execId) {
+  if (!EXEC_ID_RE.test(String(execId || ''))) throw new ClusterError(400, 'invalid_exec', 'exec ID 不合法')
+  return `/exec/${execId}`
+}
+
+/**
+ * `docker exec -it` over the Engine API. The start call is hijacked
+ * (`Upgrade: tcp`); with Tty the stream is raw, no 8-byte frame headers.
+ * No `User`: the session runs as the container's configured user.
+ * @returns {Promise<{ execId: string, stream: import('node:stream').Duplex }>}
+ */
+export async function openExecTty(connect, id, { cmd, env = [], workingDir, cols = 80, rows = 24 } = {}) {
+  const created = await dockerJson(
+    connect,
+    {
+      method: 'POST',
+      path: `${containerPath(id)}/exec`,
+      body: {
+        Cmd: cmd,
+        Env: env,
+        Tty: true,
+        AttachStdin: true,
+        AttachStdout: true,
+        AttachStderr: true,
+        ...(workingDir ? { WorkingDir: workingDir } : {}),
+      },
+    },
+    [201],
+  )
+  const start = `${execPath(created.Id)}/start`
+  const socket = await connect()
+  const payload = Buffer.from(JSON.stringify({ Detach: false, Tty: true, ConsoleSize: [rows, cols] }))
+  const agent = new http.Agent({ keepAlive: false })
+  agent.createConnection = () => socket
+  const stream = await new Promise((resolve, reject) => {
+    const req = http.request({
+      method: 'POST',
+      path: start,
+      host: 'docker',
+      agent,
+      headers: {
+        'content-type': 'application/json',
+        'content-length': payload.length,
+        connection: 'Upgrade',
+        upgrade: 'tcp',
+      },
+    })
+    const timer = setTimeout(() => {
+      req.destroy(new ClusterError(504, 'docker_timeout', `Docker API 超时：POST ${start}`))
+    }, 30_000)
+    req.on('upgrade', (_res, raw, head) => {
+      clearTimeout(timer)
+      if (head?.length) raw.unshift(head)
+      resolve(raw)
+    })
+    // Only a refusal answers without 101 (no such exec, container stopped).
+    req.on('response', (res) => {
+      clearTimeout(timer)
+      const chunks = []
+      res.on('data', (chunk) => chunks.push(chunk))
+      res.on('end', () => {
+        socket.destroy()
+        const status = res.statusCode === 404 || res.statusCode === 409 ? res.statusCode : 502
+        reject(
+          new ClusterError(
+            status,
+            'docker_exec_failed',
+            dockerMessage({ status: res.statusCode, body: Buffer.concat(chunks) }),
+          ),
+        )
+      })
+    })
+    req.on('error', (err) => {
+      clearTimeout(timer)
+      socket.destroy()
+      reject(
+        err instanceof ClusterError
+          ? err
+          : new ClusterError(502, 'docker_io_failed', `Docker API 失败：${err.message}`),
+      )
+    })
+    req.end(payload)
+  })
+  return { execId: created.Id, stream }
+}
+
+export async function resizeExec(connect, execId, { cols, rows }) {
+  await dockerJson(connect, { method: 'POST', path: `${execPath(execId)}/resize?h=${rows}&w=${cols}` }, [200, 201])
+}
+
+export async function inspectExec(connect, execId) {
+  return dockerJson(connect, { path: `${execPath(execId)}/json`, timeoutMs: 10_000 })
 }
 
 export async function imagePresent(connect, ref) {

@@ -7,8 +7,9 @@ import path from 'node:path'
 import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { CRS_OFFICIAL_AGENT_PROMPT } from '../../src/lib/identity/crs-persona.mjs'
+import { sessionIdFromOutboundBody } from '../../src/lib/identity/identity-rewrite.mjs'
 import { DEFAULT_AGENT_STANDING } from '../../src/lib/identity/persona-template.mjs'
-import { resolveInferenceBackend, messagesUrl } from '../../src/lib/pool/api-protocol.mjs'
+import { resolveInferenceBackend, messagesUrl, runApiInference } from '../../src/lib/pool/api-protocol.mjs'
 
 function fakeResponse() {
   return { headersSent: false, on() {}, once() {}, off() {}, write() {}, end() {} }
@@ -211,6 +212,82 @@ test('OAuth cli-hop applies the resolved Protocol custom persona template', asyn
     assert.ok(prepared?.body)
     assert.equal(prepared.body.system.length, 1)
     assert.equal(prepared.body.system[0].text, 'CUSTOM_PERSONA UTC')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('logs the session id actually sent upstream, not the caller one', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-outbound-session-'))
+  const routingFile = path.join(root, 'routing.json')
+  fs.writeFileSync(routingFile, JSON.stringify({ compatibility: {} }))
+  const vm = { id: 'vm-01', claude: { mode: 'oauth' } }
+  const selected = {
+    vmId: vm.id,
+    accountId: 'account-1',
+    vm,
+    exec: { vmId: vm.id, vm, homeDir: path.join(root, 'home'), oauth: { account_uuid: 'account-1' } },
+  }
+  let prepared = null
+  let logged = null
+  const response = { ...fakeResponse(), on: (event, fn) => event === 'finish' && (response.finish = fn) }
+  const handler = createHandleProtocol({
+    json: (_res, status, body) => {
+      response.status = status
+      return body
+    },
+    writeSSEHeaders() {},
+    readBody: async () => ({
+      model: 'claude-haiku-4-5',
+      messages: [{ role: 'user', content: 'hello' }],
+      metadata: { user_id: JSON.stringify({ device_id: 'caller-dev', session_id: 'caller-sess' }) },
+    }),
+    requireAuth: () => true,
+    cfg: {
+      rewrite: { enabled: false },
+      intercept: { rules: [] },
+      distill: { enabled: false },
+      limits: { max_body_bytes: 1024 * 1024, upstream_timeout_ms: 2000, stream_idle_timeout_ms: 2000 },
+      paths: { data: root, project: root },
+    },
+    requestLog: {
+      start: () => ({ request_id: 'outbound-session-test', mode: 'normal' }),
+      finish: (_ctx, extra) => {
+        logged = extra
+      },
+    },
+    stickyRouter: { extractPoolKey: () => null, collectPoolKeys: () => [] },
+    accountQuota: {},
+    apiKeyStore: {},
+    apiScheduler: {},
+    apiEndpointStore: {},
+    stats: { errors: 0, requests: 0, by_route: {}, passthrough: 0, rewrite: 0, convert: 0 },
+    routingConfigPath: routingFile,
+    routingConfig: { compatibility: {}, failover: {} },
+    failoverRunner: {
+      async run(opts) {
+        prepared = await opts.applyAttempt(opts.canonicalBody, selected)
+        return { ok: false, status: 503, body: { error: { type: 'server_error', code: 'x', message: 'stop' } } }
+      },
+    },
+    groupsRepo: { rateMultiplier: () => 1 },
+  })
+  const req = {
+    method: 'POST',
+    url: '/v1/messages',
+    headers: { authorization: 'Bearer master', 'user-agent': 'claude-cli/2.1.241 (external, cli)' },
+    apiKeyKind: 'master',
+    once() {},
+    off() {},
+  }
+  try {
+    await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+    response.finish?.()
+    const sent = sessionIdFromOutboundBody(prepared.body) || prepared.meta.sessionId
+    assert.ok(sent)
+    assert.equal(logged.session_id, 'caller-sess')
+    assert.equal(logged.outbound_session_id, sent)
+    assert.notEqual(logged.outbound_session_id, 'caller-sess')
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
@@ -522,6 +599,30 @@ test('inbound session and device keys match across API keys at the protocol entr
   }
 })
 
+test('the protocol entry hands the device seat key to the pool, independent of the API key', async () => {
+  const { dir, router } = realStickyRouter()
+  try {
+    const turn = {
+      messages: [{ role: 'user', content: 'please refactor the scheduler module and explain every single change' }],
+    }
+    const a = await captureRunOpts({
+      body: sessionBody({ device_id: 'dev-seat', session_id: 'sess-seat' }, turn),
+      stickyRouter: router,
+      apiKeyRecord: { id: 'key-a', group_id: 1 },
+    })
+    const b = await captureRunOpts({
+      body: sessionBody({ device_id: 'dev-seat', session_id: 'sess-other' }, turn),
+      stickyRouter: router,
+      apiKeyRecord: { id: 'key-b', group_id: 1 },
+    })
+    assert.equal(a.skipSessionSeat, false)
+    assert.equal(a.seatKey, 'seat:dev:dev-seat')
+    assert.equal(b.seatKey, a.seatKey)
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
 test('shared API key keeps different devices apart at the protocol entry', async () => {
   const { dir, router } = realStickyRouter()
   try {
@@ -642,7 +743,9 @@ test('Claude Code sub-agent hops run as child sessions of the main session', asy
     const nested = await agentHop('agent-c', 'agent-a')
 
     assert.equal(main.stickyKey, 'sess:main-sess')
-    assert.equal(main.windowKey, undefined)
+    // A one-shot short turn ('hello') holds no seat even with a device id.
+    assert.equal(main.skipSessionSeat, true)
+    assert.equal(main.seatKey, null)
     // Each agent queues on its own session, never behind the main one.
     const keys = [main.stickyKey, a.stickyKey, b.stickyKey, nested.stickyKey]
     assert.equal(new Set(keys).size, keys.length)
@@ -650,8 +753,6 @@ test('Claude Code sub-agent hops run as child sessions of the main session', asy
     assert.deepEqual(a.stickyKeys, [a.stickyKey])
     for (const child of [a, b, nested]) {
       assert.match(child.stickyKey, /^sess:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
-      // Session seat counts against the main session; placement follows its VM.
-      assert.equal(child.windowKey, 'sess:main-sess')
       assert.equal(child.familyKey, 'family2:main-sess')
       assert.equal(child.familyVmId, 'vm-cc')
       assert.equal(child.deviceKey, main.deviceKey)
@@ -703,5 +804,141 @@ test('one-shot test call skips the session seat but keeps its sticky key', async
     assert.equal(turn.skipSessionSeat, false)
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('Responses API backend keeps parallel done-only tools in one stream state', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-tools-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const items = [0, 1].map((index) => ({
+    type: 'function_call',
+    id: `fc_${index}`,
+    call_id: `call_${index}`,
+    name: 'edit',
+    arguments: JSON.stringify({ path: `${index}.txt` }),
+  }))
+  const events = [
+    ...items.map((item, index) => ({
+      type: 'response.output_item.added',
+      output_index: index,
+      item: { ...item, arguments: '' },
+    })),
+    ...items.map((item, index) => ({
+      type: 'response.function_call_arguments.done',
+      output_index: index,
+      item_id: item.id,
+      arguments: item.arguments,
+    })),
+    { type: 'response.completed', response: { output: items } },
+  ]
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n')
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  let wire = ''
+  const res = {
+    headersSent: false,
+    write: (chunk) => {
+      wire += chunk
+    },
+  }
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res,
+      protocol: 'openai.chat',
+      clientStream: true,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'edit' }] },
+      inbound: {},
+      converters: {
+        writeSSEHeaders: () => {
+          res.headersSent = true
+        },
+      },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'gpt-5.4',
+        }),
+      },
+    })
+    assert.equal(result.ok, true)
+    const chunks = wire
+      .split('\n\n')
+      .filter((line) => line.startsWith('data: {'))
+      .map((line) => JSON.parse(line.slice(6)))
+    const calls = chunks.flatMap((chunk) => chunk.choices[0].delta.tool_calls || [])
+    for (let index = 0; index < items.length; index++) {
+      const tool = calls.filter((call) => call.index === index)
+      assert.equal(tool.find((call) => call.id)?.id, items[index].call_id)
+      assert.deepEqual(JSON.parse(tool.map((call) => call.function?.arguments || '').join('')), {
+        path: `${index}.txt`,
+      })
+    }
+    assert.equal(chunks.at(-1).choices[0].finish_reason, 'tool_calls')
+    assert.equal(wire.split('data: [DONE]').length - 1, 1)
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('Responses API backend returns 502 for conflicting tool arguments when the client is not streaming', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-api-tools-ns-'))
+  const socket = path.join(root, 'run', 'api-kernel.sock')
+  fs.mkdirSync(path.dirname(socket), { recursive: true })
+  const events = [
+    {
+      type: 'response.output_item.added',
+      output_index: 0,
+      item: { type: 'function_call', id: 'fc_0', call_id: 'call_0', name: 'edit', arguments: '' },
+    },
+    { type: 'response.function_call_arguments.delta', output_index: 0, item_id: 'fc_0', delta: '{"path":"a' },
+    { type: 'response.function_call_arguments.done', output_index: 0, item_id: 'fc_0', arguments: '{"path":"b.txt"}' },
+    { type: 'response.completed', response: { output: [] } },
+  ]
+  const kernel = http.createServer((req, res) => {
+    req.resume()
+    req.on('end', () => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.end(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join('') + 'data: [DONE]\n\n')
+    })
+  })
+  await new Promise((resolve) => kernel.listen(socket, resolve))
+  try {
+    const result = await runApiInference({
+      cfg: { paths: { data: root } },
+      res: { headersSent: false, write: () => {} },
+      protocol: 'anthropic.messages',
+      clientStream: false,
+      deliveryMode: 'verified',
+      convertedBody: { model: 'claude-opus-5-5', messages: [{ role: 'user', content: 'edit' }] },
+      inbound: {},
+      converters: { writeSSEHeaders: () => {} },
+      scheduler: {
+        pick: () => ({
+          ok: true,
+          endpoint: { id: 'ep', kind: 'openai', protocol: 'openai', base_url: 'https://fixture.invalid' },
+          key: { id: 'key', api_key: 'fixture' },
+          upstream_model: 'gpt-5.4',
+        }),
+      },
+    })
+    assert.equal(result.ok, false)
+    assert.equal(result.status, 502)
+    assert.equal(result.body.error.code, 'tool_arguments_mismatch')
+  } finally {
+    kernel.closeAllConnections()
+    await new Promise((resolve) => kernel.close(resolve))
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })

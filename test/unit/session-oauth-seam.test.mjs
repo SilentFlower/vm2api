@@ -42,10 +42,19 @@ test('fake branch still rejects non-sid keys', async () => {
   delete process.env.KIN_FAKE_SESSION_OAUTH
 })
 
-test('sessionKeyToOAuth requires a non-empty VM SOCKS5 in production', async () => {
+test('sessionKeyToOAuth refuses an unbound VM in production', async () => {
   await assert.rejects(
-    () => sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', { proxyUrl: '' }),
+    () => sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', { proxyUrl: null }),
     (e) => e.code === 'proxy_required',
+  )
+})
+
+// Spawns the shipped bin/kin-oauth-auth: a bundle with an unbound constant
+// fails with ReferenceError before dialing, instead of a transport error.
+test('sessionKeyToOAuth binary dials the claude.ai organizations hop', async () => {
+  await assert.rejects(
+    () => sessionKeyToOAuth('sk-ant-sid01-testaaaaaaaa', { scope: 'inference', proxyUrl: 'socks5://127.0.0.1:1' }),
+    (e) => e.code === 'get_organizations_transport' && /claude\.ai\/api\/organizations/.test(e.message),
   )
 })
 
@@ -246,7 +255,6 @@ function makeStrictOAuthFetch(seen, opts = {}) {
       assert.equal(body.code_challenge_method, 'S256')
       assert.ok(body.code_challenge)
       assert.ok(body.state)
-      assert.equal(Object.prototype.hasOwnProperty.call(body, 'organization_uuid'), false)
       const status = opts.authorizeStatus || 200
       if (status >= 400) return response(status, opts.authorizeBody || { error: 'authorize failed' })
       return response(200, { redirect_uri: `${REDIRECT_URI}?code=auth-code&state=${body.state}` })
@@ -255,7 +263,7 @@ function makeStrictOAuthFetch(seen, opts = {}) {
       seen.push({ stage: 'token' })
       const body = JSON.parse(init.body)
       assert.equal(init.method, 'POST')
-      assert.equal(headers['user-agent'] || headers['User-Agent'], 'claude-cli/2.1.284 (external, sdk-cli)')
+      assert.equal(headers['user-agent'] || headers['User-Agent'], 'claude-cli/2.1.293 (external, sdk-cli)')
       assert.equal(headers['x-app'], 'cli')
       assert.equal(body.grant_type, 'authorization_code')
       assert.equal(body.redirect_uri, REDIRECT_URI)
@@ -278,7 +286,7 @@ function makeStrictOAuthFetch(seen, opts = {}) {
     if (url === 'https://api.anthropic.com/api/claude_cli/bootstrap?entrypoint=claude-vscode&model=claude-opus-5') {
       seen.push({ stage: 'bootstrap' })
       assert.equal(init.method, 'GET')
-      assert.equal(headers['user-agent'], 'claude-cli/2.1.284 (external, sdk-cli)')
+      assert.equal(headers['user-agent'], 'claude-cli/2.1.293 (external, sdk-cli)')
       assert.equal(headers['x-app'], 'cli')
       assert.equal(headers['anthropic-beta'], 'oauth-2025-04-20')
       assert.equal(headers.authorization, 'Bearer sk-ant-oat01-token')
@@ -293,7 +301,7 @@ function makeStrictOAuthFetch(seen, opts = {}) {
     if (url === 'https://platform.claude.com/api/oauth/account/settings') {
       seen.push({ stage: 'grove' })
       assert.equal(init.method, 'PATCH')
-      assert.equal(headers['user-agent'], 'claude-cli/2.1.284 (external, sdk-cli)')
+      assert.equal(headers['user-agent'], 'claude-cli/2.1.293 (external, sdk-cli)')
       assert.deepEqual(JSON.parse(init.body), { grove_enabled: true })
       if (opts.groveStatus) return response(opts.groveStatus, { error: 'unsupported path' })
       return response(200, { ok: true })

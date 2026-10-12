@@ -12,6 +12,7 @@ import {
 } from 'lucide-react'
 import { credTypeLabel, credTypeOf } from '@/lib/cred-type'
 import { fmtExpiresAt, fmtNum, fmtUsd } from '@/lib/format'
+import { cn } from '@/lib/utils'
 import { compactEmail, isCodexVm, slotNameLabel } from '@/lib/vm-kind'
 import {
   accountStatus,
@@ -19,6 +20,7 @@ import {
   credExpiry,
   poolStatus,
   restrictionCopy,
+  seatTitle,
   vmRunning,
 } from '@/lib/vm-status'
 import {
@@ -46,6 +48,7 @@ import { restrictionTitle } from '@/features/vm/clear-restriction'
 import { Field } from '@/features/vm/detail-section-primitives'
 import { NodeChip } from '@/features/vm/node-chip'
 import { OpenaiPlanBadge } from '@/features/vm/openai-plan-badge'
+import { RuntimeChip } from '@/features/vm/runtime-chip'
 import {
   SchedulableSwitch,
   vmSchedulableProps,
@@ -53,7 +56,7 @@ import {
 import { VmUsageWindows } from '@/features/vm/usage-windows'
 import { refreshBlockedReason } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
-import { VmQuotaField } from '@/features/vm/vm-quota-editor'
+import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
 
 function Section({
   title,
@@ -81,7 +84,8 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
   const tier = claudeTier(vm)
   const blocked = refreshBlockedReason(vm)
   const restricted = restrictionTitle(vm)
-  const inflight = Number(vm.inflight) || Number(vm.session_active) || 0
+  const inflight = Number(vm.inflight) || 0
+  const queued = Number(vm.queue_depth) || 0
   return (
     <>
       <div className='flex flex-wrap items-center gap-1.5'>
@@ -95,6 +99,18 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
           {vmRunning(vm) ? '运行' : '停止'}
           {inflight > 0 ? ` · 在飞 ${inflight}` : ''}
         </span>
+        {vm.seats_max != null ? (
+          <span
+            className={cn(
+              'text-xs text-muted-foreground tabular-nums',
+              queued > 0 && 'text-[color:var(--status-warn)]'
+            )}
+            title={seatTitle(vm)}
+          >
+            席位 {Number(vm.seats_used) || 0}/{vm.seats_max}
+            {queued > 0 ? ` · 排队 ${queued}` : ''}
+          </span>
+        ) : null}
         <div className='ms-auto flex items-center gap-1.5 text-xs text-muted-foreground'>
           调度
           <SchedulableSwitch {...vmSchedulableProps(vm)} />
@@ -106,7 +122,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
         <VmUsageWindows vm={vm} accounts={accounts} quotaActions />
       </Section>
 
-      {codex ? null : <VmQuotaField vm={vm} />}
+      <VmSchedulingBlock vm={vm} />
 
       <div className='grid gap-2 sm:grid-cols-2'>
         <Section title='今日'>
@@ -271,6 +287,7 @@ export function VmDetailCard({
         <DialogHeader>
           <DialogTitle className='flex min-w-0 items-center gap-1.5 text-base'>
             {vm ? <SlotIdentity vm={vm} compact /> : '槽位详情'}
+            {vm ? <RuntimeChip vm={vm} /> : null}
             {vm ? <NodeChip nodeId={vm.node_id} /> : null}
           </DialogTitle>
           <DialogDescription className='sr-only'>槽位详情</DialogDescription>

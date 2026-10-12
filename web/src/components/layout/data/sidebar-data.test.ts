@@ -12,4 +12,23 @@ describe('sidebar permissions', () => {
 
     expect(urls).toEqual(['/overview', '/logs'])
   })
+
+  it('keeps the monitoring pages together in hub order', () => {
+    const groups = navGroupsFor([
+      'usage',
+      'logs',
+      'statistics',
+      'overview',
+      'vm',
+    ])
+
+    expect(groups[0].title).toBe('监控')
+    expect(groups[0].items.map((item) => item.url)).toEqual([
+      '/overview',
+      '/statistics',
+      '/logs',
+      '/usage',
+    ])
+    expect(groups[1].items.map((item) => item.url)).toEqual(['/vm'])
+  })
 })

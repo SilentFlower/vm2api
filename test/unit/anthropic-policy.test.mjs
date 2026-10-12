@@ -234,22 +234,47 @@ test('Haiku lifts messages role=system because the model rejects it', () => {
   assert.equal(body.messages[1].role, 'system')
 })
 
-test('Sonnet keeps mid-conversation role=system when the beta is present', () => {
-  const body = {
-    model: 'claude-sonnet-5',
-    messages: [
-      { role: 'user', content: 'hi' },
-      { role: 'system', content: 'parked leftover' },
-    ],
+test('documented models keep mid-conversation role=system; Sonnet 5 and 4.x lift it', () => {
+  const header = `oauth-2025-04-20,${MID_CONVERSATION_SYSTEM_BETA}`
+  const roles = (model) =>
+    sanitizeAnthropicBodyForBetaTokens(
+      {
+        model,
+        messages: [
+          { role: 'user', content: 'hi' },
+          { role: 'system', content: 'parked leftover' },
+        ],
+      },
+      header,
+    ).messages.map((message) => message.role)
+  for (const model of [
+    'claude-fable-5',
+    'claude-fable-5-1',
+    'claude-fable-5.1[1m]',
+    'claude-mythos-5',
+    'claude-mythos-5-1',
+    'claude-opus-5-5',
+    'claude-opus-5',
+    'claude-opus-4-8',
+    'claude-sonnet-5-5',
+    'claude-haiku-5-5',
+  ]) {
+    assert.deepEqual(roles(model), ['user', 'system'], model)
   }
-  const kept = sanitizeAnthropicBodyForBetaTokens(body, `oauth-2025-04-20,${MID_CONVERSATION_SYSTEM_BETA}`)
-  assert.equal(kept.messages[1].role, 'system')
-  assert.equal(kept.messages[1].content, 'parked leftover')
+  for (const model of [
+    'claude-sonnet-5',
+    'claude-sonnet-5-fast',
+    'claude-opus-4-7',
+    'claude-sonnet-4-6',
+    'claude-mythos-preview',
+  ]) {
+    assert.deepEqual(roles(model), ['user'], model)
+  }
 })
 
-test('Sonnet without mid-conversation-system beta lifts role=system', () => {
+test('Sonnet 5.5 without mid-conversation-system beta lifts role=system', () => {
   const body = {
-    model: 'claude-sonnet-5',
+    model: 'claude-sonnet-5-5',
     system: [{ type: 'text', text: 'billing' }],
     messages: [
       { role: 'user', content: 'hi' },
@@ -422,6 +447,23 @@ test('unofficial fills omitted when caller thinking has no display', () => {
     { unofficial: true },
   )
   assert.deepEqual(body.thinking, { type: 'adaptive', display: 'omitted' })
+})
+
+test('beta sanitize rewrites thinking.display updates only without the gate token', () => {
+  const updates = { model: 'claude-opus-5-5', thinking: { type: 'adaptive', display: 'updates' } }
+  const dropped = sanitizeAnthropicBodyForBetaTokens(updates, 'oauth-2025-04-20,interleaved-thinking-2025-05-14')
+  assert.deepEqual(dropped.thinking, { type: 'adaptive', display: 'omitted' })
+  const kept = sanitizeAnthropicBodyForBetaTokens(updates, 'oauth-2025-04-20,thinking-display-updates-2026-08-18')
+  assert.equal(kept.thinking.display, 'updates')
+  const summarized = sanitizeAnthropicBodyForBetaTokens(
+    { thinking: { type: 'adaptive', display: 'summarized' } },
+    'oauth-2025-04-20',
+  )
+  assert.equal(summarized.thinking.display, 'summarized')
+  const omitted = sanitizeAnthropicBodyForBetaTokens({ thinking: { type: 'adaptive', display: 'omitted' } }, '')
+  assert.equal(omitted.thinking.display, 'omitted')
+  const spaced = sanitizeAnthropicBodyForBetaTokens(updates, 'oauth-2025-04-20, thinking-display-updates-2026-08-18 ')
+  assert.equal(spaced.thinking.display, 'updates')
 })
 
 test('unofficial does not overwrite caller thinking display, effort, or max_tokens', () => {

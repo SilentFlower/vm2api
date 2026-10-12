@@ -1,7 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
-import { SessionLimitRegistry } from '../../src/lib/pool/session-limit.mjs'
 
 class Scheduler {
   constructor(candidates) {
@@ -49,7 +48,7 @@ function candidate(number) {
   return {
     vmId: `vm-0${number}`,
     accountId: `account-${number}`,
-    selectionReason: number === 1 ? 'sticky' : 'weighted-round-robin',
+    selectionReason: number === 1 ? 'sticky' : 'balanced',
     waitMs: 0,
   }
 }
@@ -69,6 +68,38 @@ function success(text = 'ok') {
     },
   }
 }
+
+test('unsupported classifier runtime stops without counting execution or cooling accounts', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const runner = new FailoverRunner({ scheduler })
+  let calls = 0
+  const result = await runner.run({
+    requestId: 'classifier-runtime',
+    model: 'claude-sonnet-4-6',
+    canonicalBody: { model: 'claude-sonnet-4-6' },
+    callAttempt: async () => {
+      calls++
+      return {
+        ok: false,
+        status: 400,
+        upstreamExecutions: 0,
+        terminalState: 'rejected',
+        body: {
+          error: {
+            type: 'invalid_request_error',
+            code: 'classifier_runtime_unsupported',
+            message: 'unsupported runtime',
+          },
+        },
+      }
+    },
+  })
+  assert.equal(calls, 1)
+  assert.equal(result.attemptCount, 0)
+  assert.equal(result.body.error.code, 'classifier_runtime_unsupported')
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.equal(scheduler.selectCalls, 1)
+})
 
 test('account1 quota exhausted rotates to account2 and commits final sticky', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
@@ -320,32 +351,6 @@ test('committed realtime stream failure never switches accounts', async () => {
   assert.equal(scheduler.selectCalls, 1)
 })
 
-test('committed incomplete hop keeps the session window', async () => {
-  const sessions = new SessionLimitRegistry()
-  sessions.touch('account-1', 'conversation-1')
-  const scheduler = new Scheduler([candidate(1), candidate(2)])
-  scheduler.accountQuota = { sessions }
-  const runner = new FailoverRunner({ scheduler })
-  const result = await runner.run({
-    requestId: 'req-committed-incomplete-session',
-    canonicalBody: { model: 'claude-opus-test' },
-    model: 'claude-opus-test',
-    stickyKey: 'conversation-1',
-    callAttempt: ({ onCommit }) => {
-      onCommit()
-      return {
-        ok: false,
-        status: 200,
-        committed: true,
-        terminalState: 'incomplete',
-        body: { error: { message: 'stream closed' } },
-      }
-    },
-  })
-  assert.equal(result.finalState, 'incomplete')
-  assert.equal(sessions.snapshot('account-1').active, 1)
-})
-
 test('cloudflare 403 does not trigger SOCKS disconnect', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
   const failures = []
@@ -458,6 +463,57 @@ test('signature error is repaired once on the same account when enabled', async 
   assert.equal(result.ok, true)
   assert.equal(result.attemptCount, 2)
   assert.equal(calls, 2)
+})
+
+test('search history repair still runs when the rejected hop outlived the deadline', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { total_retry_deadline_ms: 20 } })
+  const bodies = []
+  const result = await runner.run({
+    requestId: 'req-search-slow-400',
+    canonicalBody: {
+      model: 'claude-opus-test',
+      messages: [
+        { role: 'user', content: 'find it' },
+        {
+          role: 'assistant',
+          content: [
+            { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: { query: 'mac mini' } },
+            {
+              type: 'web_search_tool_result',
+              tool_use_id: 'srvtoolu_1',
+              content: [{ type: 'web_search_result', title: 'T', url: 'https://a.example', encrypted_content: 'AAAA' }],
+            },
+            { type: 'text', text: 'found' },
+          ],
+        },
+        { role: 'user', content: 'go on' },
+      ],
+    },
+    model: 'claude-opus-test',
+    callAttempt: async ({ body }) => {
+      bodies.push(body)
+      if (bodies.length === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 40))
+        return {
+          ok: false,
+          status: 400,
+          terminalState: 'rejected',
+          body: {
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              message: 'messages.1.content.0: Invalid `encrypted_content` in `search_result` block',
+            },
+          },
+        }
+      }
+      return success('repaired')
+    },
+  })
+  assert.equal(result.ok, true)
+  assert.equal(bodies.length, 2)
+  assert.equal(JSON.stringify(bodies[1]).includes('encrypted_content'), false)
 })
 
 test('signature 400 is not repaired when signature_repair is off', async () => {
@@ -1057,7 +1113,8 @@ test('pool exhaustion details include the scheduler snapshot', async () => {
     model: 'claude-sonnet-test',
     callAttempt: () => success(),
   })
-  assert.equal(result.status, 429)
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.type, 'overloaded_error')
   assert.equal(result.body.error.code, 'pool_overloaded')
   assert.equal(result.body.error.message, '号池负载过高，稍后再试')
   assert.equal(result.retryAfterSec, 10_064)
@@ -1067,6 +1124,75 @@ test('pool exhaustion details include the scheduler snapshot', async () => {
   assert.equal(result.body.error.details.sticky_cleared, true)
   assert.equal(result.body.error.details.eligible, 2)
   assert.deepEqual(result.body.error.details.wait_reasons, ['account_cooldown'])
+})
+
+test('a seat queue timeout is a 529 overloaded_error with the planner retry-after', async () => {
+  const scheduler = {
+    async selectAndReserve() {
+      return { ok: false, reason: 'pool_queue_timeout', waitMs: 3000, retry_after_ms: 2_500, eligible: 2 }
+    },
+    markCooldown() {},
+    markSuccess() {},
+  }
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-queue-timeout',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: () => success(),
+  })
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.type, 'overloaded_error')
+  assert.equal(result.body.error.code, 'pool_overloaded')
+  assert.equal(result.body.error.details.reason, 'pool_queue_timeout')
+  assert.equal(result.retryAfterSec, 3)
+})
+
+test('every account in an upstream cooldown: 529 cooldown is capacity, 429 cooldown is a 429', async () => {
+  const cases = [
+    ['pool_overload_cooldown', 529, 'overloaded_error', 'pool_overloaded'],
+    ['pool_rate_limited', 429, 'rate_limit_error', 'pool_rate_limited'],
+  ]
+  for (const [reason, status, type, code] of cases) {
+    const scheduler = {
+      async selectAndReserve() {
+        return { ok: false, reason, retry_after_ms: 41_200, eligible: 0 }
+      },
+      markCooldown() {},
+      markSuccess() {},
+    }
+    const result = await new FailoverRunner({ scheduler }).run({
+      requestId: `req-${reason}`,
+      canonicalBody: { model: 'claude-sonnet-test' },
+      model: 'claude-sonnet-test',
+      callAttempt: () => success(),
+    })
+    assert.equal(result.status, status, reason)
+    assert.equal(result.body.error.type, type, reason)
+    assert.equal(result.body.error.code, code, reason)
+    assert.equal(result.retryAfterSec, 42, reason)
+  }
+})
+
+test('a full pool queue answers 529 immediately with retry-after >= 1s', async () => {
+  const scheduler = {
+    async selectAndReserve() {
+      throw Object.assign(new Error('Claude pool queue is full'), { code: 'pool_wait_queue_full', retryAfterMs: null })
+    },
+    markCooldown() {},
+    markSuccess() {},
+  }
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-queue-full',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: () => success(),
+  })
+  assert.equal(result.status, 529)
+  assert.equal(result.body.error.type, 'overloaded_error')
+  assert.equal(result.body.error.details.reason, 'pool_wait_queue_full')
+  assert.equal(result.retryAfterSec, 1)
 })
 
 test('one VM gets at most three executions for a request, hidden retries included', async () => {
@@ -1102,6 +1228,37 @@ test('one VM gets at most three executions for a request, hidden retries include
   assert.equal(result.vmId, 'vm-01')
   assert.equal(result.attemptCount, 2)
   assert.deepEqual(seen, ['vm-01', 'vm-01'])
+})
+
+test('a hop that failed with a kernel-named cause ends with that cause, not incomplete_response', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const seen = []
+  const runner = new FailoverRunner({
+    scheduler,
+    config: { same_account_retry_delay_ms: 0 },
+  })
+  const result = await runner.run({
+    requestId: 'req-network',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    callAttempt: ({ candidate: selected }) => {
+      seen.push(selected.vmId)
+      return {
+        ok: false,
+        status: 502,
+        committed: false,
+        terminalState: 'incomplete',
+        body: {
+          type: 'error',
+          error: { type: 'api_error', code: 'upstream_network_error', message: 'fetch failed: ECONNRESET' },
+        },
+      }
+    },
+  })
+  assert.equal(result.status, 502)
+  assert.equal(result.body.error.code, 'upstream_network_error')
+  assert.ok(seen.includes('vm-02'), 'a network failure moves on to another VM')
+  assert.deepEqual(scheduler.cooldowns, [], 'no account is penalised for it')
 })
 
 test('the fifth candidate is reached after four VMs fail', async () => {

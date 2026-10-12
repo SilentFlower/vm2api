@@ -1,8 +1,10 @@
 import http from 'node:http'
+import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { prepareOutboundHeaders } from '../protocol/outbound-attempt.mjs'
 import { sanitizeAnthropicBodyForBetaTokens } from '../protocol/anthropic-policy.mjs'
+import { withRequestProtocolBetas } from '../protocol/claude-code-betas.mjs'
 import { sealClaudeCodeCch } from '../identity/cch.mjs'
 import { credentialModeFromOauth } from '../oauth/credential-mode.mjs'
 import { isCrsMock, writeCrsTrace, mockCrsPayload, emitMockSse } from './crs-mock.mjs'
@@ -88,7 +90,11 @@ function workerRequest(
       requestHeaders['content-type'] = 'application/json'
       requestHeaders['content-length'] = String(payload.length)
     }
-    if (internalToken) requestHeaders['x-kin-internal-token'] = internalToken
+    if (internalToken) {
+      // Rust/Codex kernels use the namespaced header; retain the legacy worker header.
+      requestHeaders['x-kin-internal-token'] = internalToken
+      requestHeaders['x-internal-token'] = internalToken
+    }
     let timer = null
     const clearTimer = () => {
       if (timer) {
@@ -123,6 +129,30 @@ function workerRequest(
     if (payload) req.write(payload)
     req.end()
   })
+}
+
+/**
+ * Client went away: name the hop to the kernel so it cancels that job on the
+ * CLI right now. The dropped socket alone left the kernel guessing whether
+ * the CLI still owned the job. Best effort: the kernel also sees the drop,
+ * and an old worker without the route just answers 404.
+ */
+function cancelOnAbort(exec, signal, requestId) {
+  if (!signal || signal.aborted) return () => {}
+  const onAbort = () => {
+    workerRequest(exec, {
+      method: 'POST',
+      requestPath: '/internal/v1/cancel',
+      body: { request_id: requestId },
+      timeoutMs: 3000,
+    })
+      .then((res) => res.resume())
+      .catch((error) => {
+        console.warn(`[kernel-cancel] ${exec?.vmId || 'slot'} ${requestId}: ${error?.code || error?.message || error}`)
+      })
+  }
+  signal.addEventListener('abort', onAbort, { once: true })
+  return () => signal.removeEventListener('abort', onAbort)
 }
 
 async function readAll(stream, limit = MAX_BODY) {
@@ -162,10 +192,10 @@ function publicHeaders(headers = {}) {
   return result
 }
 
-/** Flatten wrap `X-Kin-Rate-Limit-Headers` JSON into Anthropic Extra keys. */
+/** Flatten wrap `X-Rate-Limit-Headers` JSON into Anthropic Extra keys. */
 function mergeRateLimitHeaders(headers = {}) {
   const out = { ...headers }
-  const packed = headers['x-kin-rate-limit-headers']
+  const packed = headers['x-rate-limit-headers']
   if (!packed) return out
   try {
     const parsed = typeof packed === 'string' ? JSON.parse(packed) : packed
@@ -181,18 +211,18 @@ function mergeRateLimitHeaders(headers = {}) {
   return out
 }
 
-/** Parse the X-Kin-Usage / X-Kin-Model / X-Kin-Stop-Reason worker metadata. */
+/** Parse the X-Usage / X-Model / X-Stop-Reason worker metadata. */
 function streamMetaFromHeaders(headers = {}) {
   let usage = null
-  if (headers['x-kin-usage']) {
+  if (headers['x-usage']) {
     try {
-      usage = JSON.parse(headers['x-kin-usage'])
+      usage = JSON.parse(headers['x-usage'])
     } catch {}
   }
   return {
     usage,
-    model: headers['x-kin-model'] || null,
-    stopReason: headers['x-kin-stop-reason'] || null,
+    model: headers['x-model'] || null,
+    stopReason: headers['x-stop-reason'] || null,
   }
 }
 
@@ -213,7 +243,7 @@ function mergeUsage(current, next) {
 export function isDownstreamCommitEvent(event) {
   if (!event || typeof event !== 'object') return false
   const t = String(event.type || '')
-  if (t === 'error' || t === 'message_start' || t === 'kin_response_headers') return false
+  if (t === 'error' || t === 'message_start' || t === 'response_headers') return false
   if (t === 'message_stop' || t === 'response.completed' || t === 'response.done' || t === 'message_delta') return false
 
   if (t === 'content_block_delta') {
@@ -261,7 +291,12 @@ const PERMISSION_ERROR_TEXT = /organization does not have access to claude/i
 export function semanticStatusForStreamError(errorBody) {
   const type = String(errorBody?.error?.type || errorBody?.type || '')
   const message = String(errorBody?.error?.message || errorBody?.message || '')
-  if (type === 'rate_limit_error' || isPlanLimitMessage(message)) return 429
+  if (isPlanLimitMessage(message)) return 429
+  // The kernel names the status the job failed with; older kernels did not.
+  // Codex Responses Lite error events put it on the outer object (`{type,status,error}`).
+  const explicit = Number(errorBody?.error?.status ?? errorBody?.status)
+  if (explicit >= 400 && explicit < 600) return explicit
+  if (type === 'rate_limit_error') return 429
   if (type === 'overloaded_error') return 529
   if (type === 'authentication_error' || AUTH_ERROR_TEXT.test(message)) return 401
   if (type === 'permission_error' || PERMISSION_ERROR_TEXT.test(message)) return 403
@@ -316,7 +351,9 @@ export function restoreUncommittedHop(result = {}, { now = Date.now() } = {}) {
     const message = String(body?.error?.message || body?.message || '')
     const code = String(body?.error?.code || '')
     if (code && code !== 'empty_response') {
-      const headers = status === 429 ? extraHeadersFromLimitError(message, result.headers || {}, now) : result.headers
+      const retryAfter = body?.error?.retry_after
+      const coded = retryAfter ? { ...(result.headers || {}), 'retry-after': String(retryAfter) } : result.headers
+      const headers = status === 429 ? extraHeadersFromLimitError(message, coded || {}, now) : coded
       return {
         ...result,
         status,
@@ -374,11 +411,16 @@ export function finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m
     credentialMode: credMode,
     want1m: want1m === true,
   })
-  const gated = cliHop ? body : sanitizeAnthropicBodyForBetaTokens(body, headers?.['anthropic-beta'] || '')
+  const betas = withRequestProtocolBetas(String(headers?.['anthropic-beta'] || '').split(','), body)
+  headers['anthropic-beta'] = betas.join(',')
+  // Envelope headers are discarded; the existing MessageRequest.betas channel
+  // carries request gates to the native CLI, which builds the actual HTTP wire.
+  const gated = cliHop ? { ...body, betas } : sanitizeAnthropicBodyForBetaTokens(body, headers['anthropic-beta'])
   return { headers, body: sealClaudeCodeCch(gated) }
 }
 
 function workerEnvelope({
+  requestContext = null,
   body,
   reqHeaders,
   exec,
@@ -392,6 +434,7 @@ function workerEnvelope({
 } = {}) {
   const finalized = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m, cliHop })
   const envelope = {
+    ...(requestContext ? { request_context: requestContext } : {}),
     body: finalized.body,
     headers: finalized.headers,
     stream: !!stream,
@@ -413,6 +456,7 @@ function mockScenario(exec) {
 }
 
 export async function callGoWorker({
+  requestContext = null,
   exec,
   body,
   reqHeaders = {},
@@ -439,23 +483,28 @@ export async function callGoWorker({
       stopReason: mock.body?.stop_reason || null,
     }
   }
+  const requestId = randomUUID()
+  const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
-      body:
-        envelope ||
-        workerEnvelope({
-          body,
-          reqHeaders,
-          exec,
-          identity,
-          stream: false,
-          want1m,
-          cacheTtl,
-          preserveCacheBreakpoints,
-          cliHop,
-        }),
+      body: {
+        ...(envelope ||
+          workerEnvelope({
+            body,
+            reqHeaders,
+            exec,
+            identity,
+            stream: false,
+            want1m,
+            cacheTtl,
+            preserveCacheBreakpoints,
+            cliHop,
+            requestContext,
+          })),
+        request_id: requestId,
+      },
       signal,
       timeoutMs,
     })
@@ -471,7 +520,7 @@ export async function callGoWorker({
       usage: parsed?.usage || null,
       model: parsed?.model || null,
       stopReason: parsed?.stop_reason || null,
-      terminalState: headers['x-kin-terminal-state'] || null,
+      terminalState: headers['x-terminal-state'] || null,
       transportError: false,
     })
   } catch (error) {
@@ -491,10 +540,13 @@ export async function callGoWorker({
       terminalState: 'transport_error',
       transportError: true,
     }
+  } finally {
+    stopCancel()
   }
 }
 
 export async function streamGoWorker({
+  requestContext = null,
   exec,
   body,
   reqHeaders = {},
@@ -582,24 +634,29 @@ export async function streamGoWorker({
   let committed = false
   const startedAt = Date.now()
   let ttftMs = null
+  const requestId = randomUUID()
+  const stopCancel = cancelOnAbort(exec, signal, requestId)
   try {
     const response = await workerRequest(exec, {
       method: 'POST',
       requestPath,
-      body:
-        envelope ||
-        workerEnvelope({
-          body,
-          reqHeaders,
-          exec,
-          identity,
-          stream: true,
-          deliveryMode,
-          want1m,
-          cacheTtl,
-          preserveCacheBreakpoints,
-          cliHop,
-        }),
+      body: {
+        ...(envelope ||
+          workerEnvelope({
+            body,
+            reqHeaders,
+            exec,
+            identity,
+            stream: true,
+            deliveryMode,
+            want1m,
+            cacheTtl,
+            preserveCacheBreakpoints,
+            cliHop,
+            requestContext,
+          })),
+        request_id: requestId,
+      },
       signal,
       timeoutMs,
       timeoutMode: 'first-byte',
@@ -615,7 +672,7 @@ export async function streamGoWorker({
         body: parseJson(data),
         headers,
         committed: false,
-        terminalState: headers['x-kin-terminal-state'] || 'error',
+        terminalState: headers['x-terminal-state'] || 'error',
         transportError: false,
       })
     }
@@ -655,7 +712,7 @@ export async function streamGoWorker({
     }
     const observeSseEvent = (event) => {
       if (!event) return event
-      if (event.type === 'kin_response_headers' && event.headers && typeof event.headers === 'object') {
+      if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
       if (event.type === 'error') lastError = event
@@ -687,7 +744,7 @@ export async function streamGoWorker({
     }
     try {
       // message_stop is the protocol terminal event, but the kernel still sends
-      // kin_job_done and its trailers afterward. Keep reading until the worker
+      // job_done and its trailers afterward. Keep reading until the worker
       // closes the response so a normal completion is not mistaken for cancel.
       for await (const chunk of response) {
         sawChunk = true
@@ -784,6 +841,8 @@ export async function streamGoWorker({
       terminalState: committed ? 'incomplete' : 'transport_error',
       transportError: true,
     }
+  } finally {
+    stopCancel()
   }
 }
 

@@ -1,3 +1,5 @@
+import type { RuntimeType } from '@/types/panel-vm'
+
 /** `routing.compatibility.persona_preset`。PUT 严格匹配，不做别名归一化。 */
 export type PersonaPreset = 'official' | 'official_full' | 'zero' | 'custom'
 
@@ -46,7 +48,7 @@ export type DistillRules = {
     require_single_turn: boolean
   }
   needles: string[]
-  /** Hard regexes. Server reinserts built-in distillation / CoT patterns if omitted. */
+  /** Extra regexes. Built-in distillation / CoT patterns live on the hard rules. */
   patterns: string[]
   fingerprints: string[]
 }
@@ -63,10 +65,90 @@ export type RefusalGuardItem = {
   preview: string | null
 }
 
+export type RefusalDeviceBlock = {
+  device_id: string
+  first_seen_at: string
+  last_seen_at: string
+  hit_count: number
+  source_request_id: string | null
+  fingerprint: string | null
+  reason: string | null
+}
+
 export type RefusalGuardConfig = {
   enabled: boolean
+  similarity_enabled: boolean
+  /** 80、85、90 或 95。 */
+  similarity: number
+  device_block_enabled: boolean
   count: number
   items: RefusalGuardItem[]
+  device_count: number
+  devices: RefusalDeviceBlock[]
+}
+
+export type PolicyQuestion = {
+  id: string
+  label: string
+  summary: string
+  instructions: string
+  enabled: boolean
+  builtin?: boolean
+}
+
+export type PolicyRule = {
+  category: string
+  source: string
+  enabled: boolean
+}
+/** `GET/PUT /api/panel/jev-intercept`。决策模型与硬正则。密钥只回 api_key_set。 */
+export type JevInterceptConfig = {
+  enabled: boolean
+  hard_regex_enabled: boolean
+  /** GPT / Codex 请求是否过拦截关卡，默认 false。 */
+  openai_platform_enabled: boolean
+  provider: 'jev' | 'laya' | 'modernbert'
+  providers?: {
+    id: string
+    label: string
+    default_model: string
+    default_base_url?: string
+  }[]
+  defaults?: {
+    safety_instruction: string
+    question_ids: string[]
+    safety_threshold: number
+    block_if_below: boolean
+    fail_open: boolean
+    dedup_sec: number
+    max_state_chars: number
+    expand_base64: boolean
+    strip_reminders: boolean
+    openai_platform_enabled: boolean
+    timeout_ms: number
+  }
+  base_url: string
+  model: string
+  timeout_ms: number
+  api_key_set: boolean
+  api_key_count: number
+  safety_instruction: string
+  question_ids: string[]
+  question_bank?: PolicyQuestion[]
+  builtin_questions?: PolicyQuestion[]
+  safety_threshold: number
+  block_if_below: boolean
+  fail_open: boolean
+  dedup_sec: number
+  max_state_chars: number
+  expand_base64: boolean
+  strip_reminders: boolean
+  categories: string[]
+  builtin_patterns: string[]
+  builtin_rules?: PolicyRule[]
+  rules?: PolicyRule[]
+  rules_customized?: boolean
+  patterns: string[]
 }
 
 export type NotifyEvents = {
@@ -113,4 +195,23 @@ export type NotifyStatus = {
 
 export type BackupsPayload = {
   items?: BackupItem[]
+}
+
+/** `routing.vm`：槽位默认形态与机器规格。创建时覆盖 memory/vcpus/disk_gb 后固化到槽。 */
+export type VmRoutingSmbios = {
+  manufacturer: string
+  product: string
+  version: string
+  family: string
+}
+
+export type VmRoutingConfig = {
+  default_runtime: RuntimeType
+  memory: string
+  vcpus: number
+  disk_gb: number
+  cpu_model: string
+  smbios: VmRoutingSmbios
+  mac_oui: string
+  allow_tcg: boolean
 }

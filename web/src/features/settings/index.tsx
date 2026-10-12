@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useParams } from '@tanstack/react-router'
 import { VIEW_TITLES } from '@/config/nav'
@@ -29,8 +29,8 @@ import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
 import { CacheBreakpointsPane } from '@/features/settings/cache-breakpoints-pane'
+import { ClaudeCodeOnlyPane } from '@/features/settings/claude-code-only-pane'
 import { ClientAccessPane } from '@/features/settings/client-access-pane'
-import { CredentialWeightPane } from '@/features/settings/credential-weight-pane'
 import { GptPane } from '@/features/settings/gpt-pane'
 import { HealthPane } from '@/features/settings/health-pane'
 import { KernelRoutingPane } from '@/features/settings/kernel-routing-pane'
@@ -59,6 +59,10 @@ import { StickyPane } from '@/features/settings/sticky-pane'
 import { TelemetryPane } from '@/features/settings/telemetry-pane'
 import { WarmupInterceptPane } from '@/features/settings/warmup-intercept-pane'
 
+/**
+ * 展示上游设置和 build 分支的专有策略，并保存路由配置。
+ * @returns 设置页与配置保存入口。
+ */
 export function SettingsPage() {
   const { tab: raw } = useParams({ from: '/_authenticated/settings/$tab' })
   const tab = settingsTabId(raw)
@@ -66,8 +70,25 @@ export function SettingsPage() {
   const qc = useQueryClient()
   const [draft, setDraft] = useState<Record<string, unknown>>({})
   const [discardKey, setDiscardKey] = useState(0)
+  const hydrated = useRef(false)
+  const serverSnapshot = useRef<Record<string, unknown> | null>(null)
+  const acceptNextServer = useRef(false)
   useEffect(() => {
-    if (routing.data) setDraft(routing.data)
+    if (!routing.data) return
+    const next = routing.data
+    const shouldAccept = acceptNextServer.current
+    acceptNextServer.current = false
+    const previousSnapshot = serverSnapshot.current
+    const wasHydrated = hydrated.current
+    setDraft((current) => {
+      const clean =
+        previousSnapshot === null ||
+        JSON.stringify(current) === JSON.stringify(previousSnapshot)
+      if (!wasHydrated || clean || shouldAccept) return next
+      return current
+    })
+    serverSnapshot.current = next
+    hydrated.current = true
   }, [routing.data])
 
   const save = useMutation({
@@ -97,6 +118,7 @@ export function SettingsPage() {
             messages: 'cli-hop',
           },
           detect_proxied_official_cc: detectProxiedOfficialCcFromCompat(compat),
+          claude_code_only: compat.claude_code_only === true,
           persona_rules: rules,
         }
       }
@@ -151,6 +173,7 @@ export function SettingsPage() {
       toast.success(
         settingsSaveToast(tab, compat, inherited, saved?.kernel_persona)
       )
+      acceptNextServer.current = true
       await Promise.all([
         qc.invalidateQueries({ queryKey: routingQueryOptions().queryKey }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
@@ -168,23 +191,23 @@ export function SettingsPage() {
   const logging = (draft.logging as Record<string, unknown> | undefined) || {}
   const inference =
     (draft.inference as Record<string, unknown> | undefined) || {}
-  const hideSave =
-    tab === 'socks5' ||
-    tab === 'telemetry' ||
-    tab === 'backup' ||
-    tab === 'about'
-
-  // dirty = 草稿偏离服务端快照。两边对象来自同一份 JSON，展开更新不改键序，
-  // 串比较足够；首帧 draft 还是 {} 时不算 dirty。
   const serverJson = routing.data ? JSON.stringify(routing.data) : null
   const dirty =
     serverJson !== null &&
     Object.keys(draft).length > 0 &&
     JSON.stringify(draft) !== serverJson
+  const hideSave =
+    tab === 'socks5' ||
+    tab === 'telemetry' ||
+    tab === 'backup' ||
+    tab === 'about'
   const showSaveBar = dirty && !hideSave
 
   const discard = () => {
-    setDraft(routing.data ?? {})
+    const next = routing.data ?? {}
+    setDraft(next)
+    serverSnapshot.current = next
+    hydrated.current = true
     setDiscardKey((k) => k + 1)
   }
 
@@ -217,106 +240,142 @@ export function SettingsPage() {
               {tab === 'sticky' ? (
                 <StickyPane
                   value={sticky}
-                  onChange={(next) => setDraft({ ...draft, sticky: next })}
+                  saving={save.isPending}
+                  pending={dirty}
+                  onChange={(patch) =>
+                    setDraft((current) => ({
+                      ...current,
+                      sticky: {
+                        ...((current.sticky as Record<string, unknown>) || {}),
+                        ...patch,
+                      },
+                    }))
+                  }
                 />
               ) : null}
               {tab === 'pool' ? (
-                <div className='space-y-3'>
+                <div className='space-y-4'>
                   <PoolPane
                     pool={pool}
                     failover={failover}
-                    onPoolChange={(next) => setDraft({ ...draft, pool: next })}
-                    onFailoverChange={(next) =>
-                      setDraft({ ...draft, failover: next })
+                    inference={inference}
+                    saving={save.isPending}
+                    pending={dirty}
+                    onPoolChange={(patch) =>
+                      setDraft((current) => ({
+                        ...current,
+                        pool: {
+                          ...((current.pool as Record<string, unknown>) || {}),
+                          ...patch,
+                        },
+                      }))
+                    }
+                    onFailoverChange={(patch) =>
+                      setDraft((current) => ({
+                        ...current,
+                        failover: {
+                          ...((current.failover as Record<string, unknown>) ||
+                            {}),
+                          ...patch,
+                        },
+                      }))
+                    }
+                    onInferenceChange={(patch) =>
+                      setDraft((current) => ({
+                        ...current,
+                        inference: {
+                          ...((current.inference as Record<string, unknown>) ||
+                            {}),
+                          ...patch,
+                        },
+                      }))
                     }
                   />
-                  <CredentialWeightPane />
                 </div>
               ) : null}
               {tab === 'quota' ? (
-                <div className='space-y-3'>
+                <>
                   <QuotaTierPane
                     tiers={
                       (draft.tiers as
                         Record<string, QuotaTierPolicy> | undefined) || {}
                     }
-                    defaultRpm={
-                      Number(
-                        (
-                          draft.concurrency as
-                            Record<string, unknown> | undefined
-                        )?.default_max_rpm
-                      ) || 0
+                    quota={quota}
+                    codexQuota={
+                      ((draft.codex as Record<string, unknown> | undefined)
+                        ?.quota as Record<string, unknown> | undefined) || {}
                     }
                     onChange={(tier, next) =>
-                      setDraft({
-                        ...draft,
-                        tiers: {
-                          ...((draft.tiers as Record<
-                            string,
-                            QuotaTierPolicy
-                          >) || {}),
-                          [tier]: next,
-                        },
+                      setDraft((current) => {
+                        const currentTiers =
+                          (current.tiers as
+                            Record<string, QuotaTierPolicy> | undefined) || {}
+                        return {
+                          ...current,
+                          tiers: {
+                            ...currentTiers,
+                            [tier]: {
+                              ...(currentTiers[tier] || {}),
+                              ...next,
+                            },
+                          },
+                        }
                       })
                     }
+                    onQuotaChange={(patch) =>
+                      setDraft((current) => {
+                        const currentQuota =
+                          (current.quota as Record<string, unknown>) || {}
+                        const currentWeekly =
+                          (currentQuota.weekly_split as
+                            Record<string, unknown> | undefined) || {}
+                        return {
+                          ...current,
+                          quota: {
+                            ...currentQuota,
+                            ...patch,
+                            ...(patch.weekly_split
+                              ? {
+                                  weekly_split: {
+                                    ...currentWeekly,
+                                    ...(patch.weekly_split as Record<
+                                      string,
+                                      unknown
+                                    >),
+                                  },
+                                }
+                              : {}),
+                          },
+                        }
+                      })
+                    }
+                    onCodexQuotaChange={(next) =>
+                      setDraft((current) => {
+                        const codex =
+                          (current.codex as Record<string, unknown>) || {}
+                        return {
+                          ...current,
+                          codex: {
+                            ...codex,
+                            quota: {
+                              ...((codex.quota as Record<string, unknown>) ||
+                                {}),
+                              ...next,
+                            },
+                          },
+                        }
+                      })
+                    }
+                    saving={save.isPending}
+                    pending={dirty}
                   />
                   <Card>
-                    <CardHeader>
-                      <CardTitle>配额</CardTitle>
+                    <CardHeader className='pb-2'>
+                      <CardTitle className='text-sm'>
+                        Fable 周用量上限
+                      </CardTitle>
                     </CardHeader>
-                    <CardContent className='divide-y'>
-                      <SettingRow
-                        label='5h 打满阻断'
-                        desc='过闸写入受限并切号，不拨调度关'
-                      >
-                        <Switch
-                          checked={quota.block_on_5h !== false}
-                          onCheckedChange={(on) =>
-                            setDraft({
-                              ...draft,
-                              quota: { ...quota, block_on_5h: on },
-                            })
-                          }
-                        />
-                      </SettingRow>
-                      <SettingRow
-                        label='7d 打满阻断'
-                        desc='过闸写入受限并切号，不拨调度关'
-                      >
-                        <Switch
-                          checked={quota.block_on_7d !== false}
-                          onCheckedChange={(on) =>
-                            setDraft({
-                              ...draft,
-                              quota: { ...quota, block_on_7d: on },
-                            })
-                          }
-                        />
-                      </SettingRow>
-                      <SettingRow label='周仓拆分'>
-                        <Switch
-                          checked={
-                            !!(
-                              quota.weekly_split as
-                                Record<string, unknown> | undefined
-                            )?.enabled
-                          }
-                          onCheckedChange={(on) =>
-                            setDraft({
-                              ...draft,
-                              quota: {
-                                ...quota,
-                                weekly_split: {
-                                  ...((quota.weekly_split as object) || {}),
-                                  enabled: on,
-                                  fable_share: 0.5,
-                                },
-                              },
-                            })
-                          }
-                        />
-                      </SettingRow>
+                    <CardContent>
                       <SettingRow
                         label='Fable 周用量上限'
                         desc='仅对 OAuth 账号的 Fable 请求生效。'
@@ -383,7 +442,7 @@ export function SettingsPage() {
                       </SettingRow>
                     </CardContent>
                   </Card>
-                </div>
+                </>
               ) : null}
               {tab === 'logs' ? (
                 <LogsPane
@@ -422,6 +481,15 @@ export function SettingsPage() {
                     onChange={(next) => setDraft({ ...draft, inference: next })}
                   />
                   <CacheBreakpointsPane
+                    compat={
+                      (draft.compatibility as
+                        Record<string, unknown> | undefined) || {}
+                    }
+                    onChange={(next) =>
+                      setDraft({ ...draft, compatibility: next })
+                    }
+                  />
+                  <ClaudeCodeOnlyPane
                     compat={
                       (draft.compatibility as
                         Record<string, unknown> | undefined) || {}

@@ -9,14 +9,7 @@
  */
 
 import { getDb } from '../database.mjs'
-import {
-  collectErrors,
-  enrichLogRow,
-  excludeErrorClassSql,
-  ignoredErrorSqlList,
-  ingressAuthSql,
-  slaOkErrorSqlList,
-} from '../../admin/error-class.mjs'
+import { collectErrors, enrichLogRow, excludeErrorClassSql, ingressAuthSql } from '../../admin/error-class.mjs'
 import {
   calculateCost,
   emptyCostBucket,
@@ -26,14 +19,8 @@ import {
 } from '../../admin/pricing.mjs'
 import { cacheHitStats } from '../../admin/cache-metrics.mjs'
 import { extraWindowSince, WINDOW_5H_MS, WINDOW_7D_MS } from '../../pool/quota-window.mjs'
-
-const IGNORED_CODES_SQL = ignoredErrorSqlList()
-const SLA_OK_CODES_SQL = slaOkErrorSqlList()
-const ERROR_PRED = `(status >= 400 OR (error_code IS NOT NULL AND error_code != '' AND error_code NOT IN (${IGNORED_CODES_SQL})))`
-const SUCCESS_PRED = `(status < 400 AND (error_code IS NULL OR error_code = '' OR error_code IN (${IGNORED_CODES_SQL})))`
-const SLA_OK_PRED = `(status = 429 OR (error_code IS NOT NULL AND error_code != '' AND error_code IN (${SLA_OK_CODES_SQL})))`
-const SLA_SUCCESS_PRED = `(${SUCCESS_PRED} OR ${SLA_OK_PRED})`
-const SLA_ERROR_PRED = `(${ERROR_PRED} AND NOT (${SLA_OK_PRED}))`
+import { ERROR_PRED, SUCCESS_PRED, SLA_ERROR_PRED, SLA_SUCCESS_PRED, ownerPred } from './usage-log-preds.mjs'
+import { collapseBlockKeywords, foldInterceptRows } from '../../protocol/intercept-stats.mjs'
 
 const SUMMARY_COLUMNS = [
   'id',
@@ -86,6 +73,11 @@ const SUMMARY_COLUMNS = [
   'service_tier',
   'speed',
   'long_context',
+  'session_id',
+  'outbound_session_id',
+  'reasoning_effort',
+  'intercept',
+  'vm_owner_user_id',
 ]
 
 function toRow(rec) {
@@ -182,21 +174,16 @@ function bucketEventsSince(rows = [], sinceMs) {
   )
 }
 
-function ownerPred(ownerUserId) {
-  const id = String(ownerUserId || '').trim()
-  if (!id) return { sql: '', params: [] }
-  return {
-    sql: `(user_id = ? OR IFNULL(api_key_id, '') IN (SELECT id FROM api_keys WHERE user_id = ? AND deleted_at IS NULL) OR IFNULL(vm_id, '') IN (SELECT id FROM vms WHERE owner_user_id = ?))`,
-    params: [id, id, id],
-  }
-}
-
-function filterCond({ since = null, until = null, vmId = null, accountId = null } = {}) {
+function filterCond({ since = null, until = null, vmId = null, accountId = null, apiKeyId = null } = {}) {
   const { cond, params } = timeCond(since, until)
   const parts = cond ? [cond.replace(/^WHERE /, '')] : []
   if (vmId) {
     parts.push('vm_id = ?')
     params.push(vmId)
+  }
+  if (apiKeyId) {
+    parts.push('api_key_id = ?')
+    params.push(apiKeyId)
   }
   if (accountId) {
     parts.push('(account_id = ? OR final_account_id = ?)')
@@ -205,7 +192,7 @@ function filterCond({ since = null, until = null, vmId = null, accountId = null 
   return { cond: parts.length ? `WHERE ${parts.join(' AND ')}` : '', params }
 }
 
-/** Same percentile pick as concurrent-test / sub2api ops cards. */
+/** Same percentile pick as sub2api ops cards. */
 export function percentile(sorted, p) {
   if (!sorted.length) return null
   const i = Math.min(sorted.length - 1, Math.max(0, Math.ceil(sorted.length * p) - 1))
@@ -250,6 +237,7 @@ export class UsageLogsRepo {
       INSERT OR IGNORE INTO request_log_debug (request_id, ts, record_json) VALUES (?, ?, ?)
     `)
     this._getDebug = db.prepare('SELECT record_json FROM request_log_debug WHERE request_id = ?')
+    this._vmOwner = db.prepare('SELECT owner_user_id FROM vms WHERE id = ?')
     this._listDebug = db.prepare('SELECT record_json FROM request_log_debug ORDER BY ts DESC LIMIT ?')
     this._getByRequestId = db.prepare('SELECT * FROM usage_logs WHERE request_id = ?')
     this._debugBytes = db.prepare('SELECT COALESCE(SUM(LENGTH(record_json)), 0) AS n FROM request_log_debug')
@@ -282,6 +270,11 @@ export class UsageLogsRepo {
   insertSummary(rec) {
     this._insert.run(...toRow(rec))
     return rec
+  }
+
+  vmOwnerOf(vmId) {
+    if (!vmId) return null
+    return this._vmOwner.get(String(vmId))?.owner_user_id || null
   }
 
   /** INSERT OR IGNORE (legacy import path). @returns true when inserted */
@@ -684,10 +677,32 @@ export class UsageLogsRepo {
    * is the inbound request path (usage_logs keeps no separate upstream endpoint).
    */
   vmUsageStats({ vmId, days = 30 } = {}) {
-    if (!vmId) return { days: 0, since: null, history: [], models: [], endpoints: [] }
+    return this._usageWindow({
+      vmId,
+      days,
+      rankExpr: "COALESCE(NULLIF(path, ''), '—')",
+      rankKey: 'endpoints',
+      rankLimit: 8,
+    })
+  }
+
+  /** Same window as vmUsageStats, isolated to one managed key. Third rank is the VM. */
+  keyUsageStats({ apiKeyId, days = 30 } = {}) {
+    return this._usageWindow({
+      apiKeyId,
+      days,
+      rankExpr: "COALESCE(NULLIF(vm_id, ''), '—')",
+      rankKey: 'vms',
+      rankLimit: 12,
+    })
+  }
+
+  _usageWindow({ vmId = null, apiKeyId = null, days = 30, rankExpr, rankKey, rankLimit = 8 } = {}) {
+    const empty = { days: 0, since: null, history: [], models: [], [rankKey]: [] }
+    if (!vmId && !apiKeyId) return empty
     const span = Math.max(1, Math.min(90, Math.floor(Number(days)) || 30))
     const since = new Date(Date.parse(shanghaiDayStartIso()) - (span - 1) * 86400_000).toISOString()
-    const { cond, params } = filterCond({ since, vmId })
+    const { cond, params } = filterCond({ since, vmId, apiKeyId })
     const history = this.db
       .prepare(`
       SELECT strftime('%Y-%m-%d', created_at, '+8 hours') AS day,
@@ -738,7 +753,72 @@ export class UsageLogsRepo {
       since,
       history,
       models: group("COALESCE(NULLIF(upstream_model, ''), NULLIF(model, ''), NULLIF(requested_model, ''), '—')", 12),
-      endpoints: group("COALESCE(NULLIF(path, ''), '—')", 8),
+      [rankKey]: group(rankExpr, rankLimit),
+    }
+  }
+
+  /**
+   * Shanghai-day protocol gate: blocks, passes, and the words that blocked.
+   * `total` is every inbound inference request (warmup answers included) plus
+   * gate blocks on other paths, so each stage's share uses one denominator.
+   */
+  protocolEntryStats({ since = shanghaiDayStartIso() } = {}) {
+    // COALESCE: a bare `col = x` on NULL yields NULL, and `NOT NULL` drops the row.
+    const block = `(
+      COALESCE(error_code, '') = 'policy_blocked'
+      OR COALESCE(via, '') IN ('hard-regex', 'jev', 'distill-detect', 'refusal-guard')
+      OR COALESCE(final_state, '') IN ('policy_blocked', 'distill_blocked', 'refusal_guard', 'refusal_similar', 'refusal_device')
+    )`
+    const inference = `path IN ('/v1/messages', '/v1/responses', '/v1/chat/completions')`
+    const row = this.db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN ${inference} OR ${block} THEN 1 ELSE 0 END) AS total,
+           SUM(CASE WHEN ${block} THEN 1 ELSE 0 END) AS blocked,
+           SUM(CASE WHEN ${inference}
+                     AND NOT ${block}
+                     AND COALESCE(via, '') != 'warmup-intercept'
+                THEN 1 ELSE 0 END) AS passed
+         FROM usage_logs
+         WHERE created_at >= ?`,
+      )
+      .get(since)
+    const keywords = this.db
+      .prepare(
+        `SELECT error_message AS message, COUNT(*) AS count
+         FROM usage_logs
+         WHERE created_at >= ?
+           AND ${block}
+           AND error_message IS NOT NULL
+           AND error_message != ''
+         GROUP BY error_message
+         ORDER BY count DESC
+         LIMIT 50`,
+      )
+      .all(since)
+    const grouped = this.db
+      .prepare(
+        `SELECT intercept, via, error_message AS message,
+                CASE WHEN ${block} THEN 1 ELSE 0 END AS blocked,
+                COUNT(*) AS count
+         FROM usage_logs
+         WHERE created_at >= ?
+           AND (
+             ${block}
+             OR (${inference} AND COALESCE(via, '') != 'warmup-intercept')
+           )
+         GROUP BY intercept, via, error_message, blocked`,
+      )
+      .all(since)
+    const folded = foldInterceptRows(grouped)
+    return {
+      since,
+      total: Number(row?.total || 0),
+      blocked: Number(row?.blocked || 0),
+      passed: Number(row?.passed || 0),
+      keywords: collapseBlockKeywords(keywords),
+      blocks: folded.blocks,
+      passes: folded.passes,
     }
   }
 
@@ -1044,7 +1124,7 @@ export class UsageLogsRepo {
       cache_creation_tokens: cacheWrite,
       prompt_tokens: cache.prompt_tokens,
       cache_hit_rate: cache.cache_hit_rate,
-      sticky: this._stickyWindow({ since, until }),
+      sticky: this._stickyWindow({ since, until, owner_user_id }),
       total_cost: Number(counts?.total_cost || 0),
       qps: {
         current: lastMinute ? Number(lastMinute.requests || 0) / 60 : 0,
@@ -1066,11 +1146,11 @@ export class UsageLogsRepo {
         avg_first_token_ms: r.avg_first_token_ms ?? null,
         avg_duration_ms: r.avg_duration_ms ?? null,
       })),
-      error_collection: this.errorCollection({ since, until }),
+      error_collection: this.errorCollection({ since, until, owner_user_id }),
     }
   }
 
-  _stickyWindow({ since = null, until = null } = {}) {
+  _stickyWindow({ since = null, until = null, owner_user_id = null } = {}) {
     const empty = { selections: 0, hits: 0, rate: null }
     try {
       const parts = []
@@ -1082,6 +1162,11 @@ export class UsageLogsRepo {
       if (until) {
         parts.push('started_at <= ?')
         params.push(until)
+      }
+      const own = ownerPred(owner_user_id)
+      if (own.sql) {
+        parts.push(`request_id IN (SELECT request_id FROM usage_logs WHERE ${own.sql})`)
+        params.push(...own.params)
       }
       const where = parts.length ? `WHERE ${parts.join(' AND ')}` : ''
       const rows = this.db
@@ -1108,9 +1193,10 @@ export class UsageLogsRepo {
     }
   }
 
-  errorCollection({ since = null, until = null } = {}) {
+  errorCollection({ since = null, until = null, owner_user_id = null } = {}) {
     const { cond, params } = timeCond(since, until)
-    const errCond = cond ? `${cond} AND ${ERROR_PRED}` : `WHERE ${ERROR_PRED}`
+    const own = ownerPred(owner_user_id)
+    const errCond = `${cond ? `${cond} AND ` : 'WHERE '}${ERROR_PRED}${own.sql ? ` AND ${own.sql}` : ''}`
     const rows = this.db
       .prepare(`
       SELECT created_at AS ts, request_id, status, error_code, error_message, model, upstream_model, vm_id, ip_address AS ip, api_key_presented
@@ -1118,17 +1204,18 @@ export class UsageLogsRepo {
       ORDER BY created_at DESC, id DESC
       LIMIT 2000
     `)
-      .all(...params)
+      .all(...params, ...own.params)
     return {
       ...collectErrors(rows),
-      ingress_hits: this.ingressHits({ since, until }),
+      ingress_hits: this.ingressHits({ since, until, owner_user_id }),
     }
   }
 
   /** Invalid-key 401s grouped by presented token + IP (still counted when muted). */
-  ingressHits({ since = null, until = null } = {}) {
+  ingressHits({ since = null, until = null, owner_user_id = null } = {}) {
     const { cond, params } = timeCond(since, until)
-    const authPred = ingressAuthSql()
+    const own = ownerPred(owner_user_id)
+    const authPred = own.sql ? `${ingressAuthSql()} AND ${own.sql}` : ingressAuthSql()
     const where = cond ? `${cond} AND ${authPred}` : `WHERE ${authPred}`
     try {
       return this.db
@@ -1145,7 +1232,7 @@ export class UsageLogsRepo {
         ORDER BY count DESC
         LIMIT 40
       `)
-        .all(...params)
+        .all(...params, ...own.params)
         .map((row) => ({
           api_key_presented: row.api_key_presented || '',
           ip: row.ip || '',

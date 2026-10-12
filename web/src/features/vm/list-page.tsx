@@ -10,6 +10,7 @@ import {
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
+import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -31,6 +32,7 @@ import { CreateVmDialog } from '@/features/vm/create-vm-dialog'
 import { FleetPulse } from '@/features/vm/fleet-pulse'
 import { VmListSkeleton } from '@/features/vm/list-skeleton'
 import { vmsListQueryOptions } from '@/features/vm/queries'
+import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { VmActionsProvider } from '@/features/vm/vm-actions-provider'
 import {
   filterVms,
@@ -53,6 +55,7 @@ const SORT_CHIPS = [
 export function VmListPage() {
   const me = useQuery(meQueryOptions())
   const vmsQ = useQuery(vmsListQueryOptions(5000))
+  usePoolSeatStream()
   const usage = useQuery({
     ...usageQueryOptions(5000),
     enabled: me.data?.role !== 'user',
@@ -95,6 +98,7 @@ export function VmListPage() {
     onError: (error: Error) => toast.error(error.message),
   })
   const vms: Vm[] = vmsQ.data?.items || []
+  const poolQueue = vmsQ.data?.pool_queue
   const accounts = usage.data?.accounts
   const canCreate =
     me.data?.role === 'admin' ||
@@ -107,8 +111,24 @@ export function VmListPage() {
       title={VIEW_TITLES.vm}
       fluid
       extra={
-        canCreate ? (
-          <Button onClick={() => setCreateOpen(true)}>创建</Button>
+        poolQueue || canCreate ? (
+          <div className='flex items-center gap-3'>
+            {poolQueue ? (
+              <span
+                className={cn(
+                  'text-xs text-muted-foreground tabular-nums',
+                  poolQueue.global_queue_depth > 0 &&
+                    'text-[color:var(--status-warn)]'
+                )}
+                title='还没落到任何 VM、在等新席位的 Claude 请求数 / 允许排队数量（上限按全部排队请求计，含各 VM 上的排队，见状态列）'
+              >
+                全局排队 {poolQueue.global_queue_depth}/{poolQueue.queue_max}
+              </span>
+            ) : null}
+            {canCreate ? (
+              <Button onClick={() => setCreateOpen(true)}>创建</Button>
+            ) : null}
+          </div>
         ) : undefined
       }
     >
@@ -285,7 +305,7 @@ export function VmListPage() {
                 </span>
               </p>
               <p className='mt-2 text-destructive'>
-                删除槽位不可恢复：容器、家目录、凭证与代理绑定一并清除。活跃槽位需先切换活跃再删。
+                删除槽位不可恢复：容器、家目录、凭证与代理绑定一并清除。还有其他槽位时，活跃槽位需先切换活跃再删。
               </p>
             </>
           ) : (

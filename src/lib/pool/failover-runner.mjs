@@ -7,17 +7,22 @@ import {
 import { listQuotaFromHeaders } from './quota-window.mjs'
 import {
   CLIENT_POOL_BUSY_MESSAGE,
+  CLIENT_POOL_RATE_LIMITED_MESSAGE,
   clientCancelledResult,
   isClientCancelledResult,
   isCompleteAssistantMessage,
   isIncompleteAssistantMessage,
   incompleteAssistantClientError,
+  KERNEL_FAILURE_STATUS,
 } from '../core/errors.mjs'
 import { hasRefreshPresence, readWorkerCredentialFile } from '../oauth/oauth-credentials.mjs'
 import { ensureWorkerCredential } from '../transport/go-worker-client.mjs'
 import { resolveOfficialCcInference } from '../vm/slot-engine.mjs'
 import { AttemptCoordinator } from './unit-decision.mjs'
 import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
+
+// Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
+const REPAIR_HOP_WAIT_MS = 30_000
 
 const DEFAULTS = {
   max_account_switches: 10,
@@ -69,20 +74,24 @@ function poolError(code, message, details = {}) {
   }
 }
 
-/** Real capacity exhaustion: every eligible seat stayed busy until the wait ran out. */
+/**
+ * Real capacity exhaustion: every eligible seat stayed busy until the wait ran
+ * out, or the pool queue was full. Anthropic's 529 `overloaded_error`, always
+ * with a Retry-After: the planner's earliest seat release, else the soonest
+ * known wake (cooldown / RPM / window reset), floored at 1s.
+ */
 export function poolOverloadedError(details = {}) {
-  const soonest = Number(details.soonest_available_ms)
+  const retryMs = Number(details.retry_after_ms ?? details.soonest_available_ms)
   return {
     ok: false,
-    status: 429,
+    status: 529,
     via: 'pool-failover',
     terminalState: 'exhausted',
-    // Only a known wake time (cooldown / RPM / window reset) is a trustworthy Retry-After.
-    retryAfterSec: Number.isFinite(soonest) && soonest > 0 ? Math.ceil(soonest / 1000) : null,
+    retryAfterSec: Number.isFinite(retryMs) && retryMs > 0 ? Math.max(1, Math.ceil(retryMs / 1000)) : 1,
     body: {
       type: 'error',
       error: {
-        type: 'rate_limit_error',
+        type: 'overloaded_error',
         code: 'pool_overloaded',
         message: CLIENT_POOL_BUSY_MESSAGE,
         details,
@@ -91,7 +100,36 @@ export function poolOverloadedError(details = {}) {
   }
 }
 
-const CAPACITY_SELECTION_REASONS = new Set(['all_accounts_busy', 'pool_wait_queue_full'])
+const CAPACITY_SELECTION_REASONS = new Set([
+  'all_accounts_busy',
+  'pool_wait_queue_full',
+  'pool_queue_timeout',
+  'pool_overload_cooldown',
+])
+
+/**
+ * Every remaining account sits in an upstream 429 rate-limit cooldown. The
+ * caller hit the provider's limit, so this is a 429 with the earliest reset.
+ */
+function poolRateLimitedError(details = {}) {
+  const retryMs = Number(details.retry_after_ms ?? details.soonest_available_ms)
+  return {
+    ok: false,
+    status: 429,
+    via: 'pool-failover',
+    terminalState: 'exhausted',
+    retryAfterSec: Number.isFinite(retryMs) && retryMs > 0 ? Math.max(1, Math.ceil(retryMs / 1000)) : 1,
+    body: {
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        code: 'pool_rate_limited',
+        message: CLIENT_POOL_RATE_LIMITED_MESSAGE,
+        details,
+      },
+    },
+  }
+}
 
 function fableRequiresMaxError(details = {}) {
   return {
@@ -106,6 +144,31 @@ function fableRequiresMaxError(details = {}) {
         code: 'fable_requires_max',
         message: 'Fable requires an available Max account',
         details,
+      },
+    },
+  }
+}
+
+const QUOTA_GUARD_TOO_LARGE_MESSAGE =
+  '临近额度闸线，本请求预估未命中缓存过大，未发往上游。请缩短上下文、等待窗口重置，或稍后再试。'
+
+function quotaGuardTooLargeError(details = {}) {
+  return {
+    ok: false,
+    status: 429,
+    via: 'pool-failover',
+    terminalState: 'exhausted',
+    body: {
+      type: 'error',
+      error: {
+        type: 'rate_limit_error',
+        code: 'quota_guard_request_too_large',
+        message: QUOTA_GUARD_TOO_LARGE_MESSAGE,
+        details: {
+          ...details,
+          message_en:
+            'Near the quota safety line, this request looks like a large uncached prompt and was not sent upstream.',
+        },
       },
     },
   }
@@ -216,9 +279,15 @@ function waitForSessionTurn(previous, signal) {
   })
 }
 
+/** The kernel named why the hop failed: report that, not a generic incomplete. */
+function hasKernelFailureCode(result) {
+  return Object.hasOwn(KERNEL_FAILURE_STATUS, String(result?.body?.error?.code || ''))
+}
+
 function isUnfinishedLastResult(result, policy) {
   if (!result) return false
   if (policy?.reason === 'incomplete_assistant') return true
+  if (hasKernelFailureCode(result)) return false
   if (result.terminalState === 'incomplete') return true
   return isIncompleteAssistantMessage(result)
 }
@@ -276,12 +345,14 @@ function emptyHopReleased(result) {
 
 /** Hidden transport / credential retries inside one hop still spend that unit's budget. */
 function executionsOf(result) {
+  if (result?.upstreamExecutions === 0) return 0
   return 1 + (result?.rust_transport_retried ? 1 : 0) + (result?.credential_retried ? 1 : 0)
 }
 
 function incompleteHopResult(result, policy, extras = {}) {
+  const failed = hasKernelFailureCode(result) ? { ...result, ok: false } : incompleteAssistantClientError(result)
   return {
-    ...incompleteAssistantClientError(result),
+    ...failed,
     via: result?.via || 'pool-failover',
     finalState: 'incomplete',
     policy,
@@ -297,6 +368,7 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
     reason,
     wait_ms: selected?.waitMs ?? selected?.wait_ms ?? 0,
     soonest_available_ms: selected?.soonest_available_ms ?? null,
+    retry_after_ms: selected?.retry_after_ms ?? null,
     wait_reasons: selected?.wait_reasons || [],
     eligible: selected?.eligible ?? 0,
     available: selected?.available ?? 0,
@@ -306,6 +378,8 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
     last_status: lastResult?.status ?? null,
   }
   if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
+  if (reason === 'pool_rate_limited') return poolRateLimitedError(details)
+  if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
   return poolError('account_pool_exhausted', 'No eligible Claude accounts remain', details)
 }
 
@@ -360,6 +434,10 @@ export class FailoverRunner {
     this.sessionTails = new Map()
   }
 
+  reloadConfig(config = {}) {
+    this.config = { ...DEFAULTS, ...(config || {}) }
+  }
+
   noteUnitHealth(selected, policy, result) {
     const circuit = this.scheduler?.unitCircuit
     if (!circuit || !selected?.accountId) return
@@ -371,12 +449,11 @@ export class FailoverRunner {
   /**
    * An empty or cancelled hop leaves the outbound session behind: the next
    * hop on this VM opens a new one. No seat is penalized and no CLI restarts;
-   * Node seat indexes are not kernel native slots.
+   * planner seat indexes are not kernel native slots.
    */
   retireOutboundSession(selected, bindKeys) {
     if (!selected?.vmId) return
     for (const key of bindKeys || []) {
-      this.scheduler.dropSessionSlot?.(selected.vmId, key)
       const bound = this.stickyRouter?.resolve?.(key)
       if (bound?.accountId !== selected.accountId) continue
       this.stickyRouter?.bind?.(
@@ -457,7 +534,7 @@ export class FailoverRunner {
     model,
     stickyKey = null,
     stickyKeys = null,
-    windowKey = undefined,
+    seatKey = null,
     stickyDeviceId = null,
     stream = false,
     deliveryMode = null,
@@ -471,7 +548,9 @@ export class FailoverRunner {
     deviceKey = null,
     skipSessionSeat = false,
     ownerScope = null,
+    keyScope = null,
     countUsage = true,
+    quotaRequest = null,
   } = {}) {
     if (!this.scheduler) throw new Error('FailoverRunner requires a scheduler')
     if (typeof callAttempt !== 'function') throw new Error('FailoverRunner requires callAttempt')
@@ -502,6 +581,8 @@ export class FailoverRunner {
       return !now || now.accountId !== base.accountId || (now.generation || 0) !== (base.generation || 0)
     }
     let freshSlot = false
+    // The seat moved VMs on failover: device affinity follows it.
+    let seatMovedTo = null
     let outboundSessionId = ''
     let outboundSessionAccountId = ''
     let currentDeviceVmId = null
@@ -538,7 +619,11 @@ export class FailoverRunner {
         this.stickyRouter.bind?.(familyKey, { accountId: account.accountId, vmId: account.vmId }, { countHit: false })
         pinBaseline.set(familyKey, this.stickyRouter.resolve?.(familyKey) || null)
       }
-      if (deviceKey && account.vmId && (!currentDeviceVmId || currentDeviceVmId === account.vmId)) {
+      if (
+        deviceKey &&
+        account.vmId &&
+        (!currentDeviceVmId || currentDeviceVmId === account.vmId || seatMovedTo === account.vmId)
+      ) {
         const devicePayload = { accountId: account.accountId, vmId: account.vmId }
         if (this.stickyRouter.bindDeviceAffinity) {
           this.stickyRouter.bindDeviceAffinity(deviceKey, devicePayload, { countHit: false })
@@ -550,6 +635,10 @@ export class FailoverRunner {
     let lastResult = null
     let lastPolicy = null
     let repaired = false
+    // The repaired body is the known fix and has not been sent yet; a slow
+    // rejected hop (a 400 can take minutes on a long transcript) must not
+    // turn it into the client's error. Bounded: repair is one-shot.
+    let repairPending = false
     let requestBody = clone(canonicalBody)
     // A unit that just failed replayably waits behind every other free seat.
     let avoid = null
@@ -559,7 +648,7 @@ export class FailoverRunner {
       if (signal?.aborted || isClientCancelledResult(lastResult)) {
         return { ...clientCancelledResult(lastResult || {}), via: 'pool-failover', ...attribution() }
       }
-      if (Date.now() >= deadline) {
+      if (!repairPending && Date.now() >= deadline) {
         return preferLastResult(
           lastResult,
           lastPolicy,
@@ -579,16 +668,21 @@ export class FailoverRunner {
           model,
           stickyKey,
           stickyKeys: bindKeys,
-          windowKey,
+          seatKey,
           excluded,
           spilled,
           signal,
-          deadline,
+          deadline: repairPending ? Math.max(deadline, Date.now() + REPAIR_HOP_WAIT_MS) : deadline,
           pinVmId,
           familyVmId,
           deviceVmId: currentDeviceVmId,
           skipSessionSlot: skipSessionSeat,
           ownerScope,
+          keyScope,
+          quotaRequest: {
+            body: requestBody,
+            sessionId: outboundSessionId || quotaRequest?.sessionId || stickyKey,
+          },
         }
         if (avoid) {
           const elsewhere = await this.scheduler.selectAndReserve({ ...selectArgs, avoid, allowWait: false })
@@ -605,7 +699,11 @@ export class FailoverRunner {
           return preferLastResult(
             lastResult,
             lastPolicy,
-            poolOverloadedError({ reason: 'pool_wait_queue_full', attempt_count: budget.hops }),
+            poolOverloadedError({
+              reason: 'pool_wait_queue_full',
+              attempt_count: budget.hops,
+              retry_after_ms: error.retryAfterMs ?? null,
+            }),
             attribution(),
           )
         }
@@ -635,9 +733,11 @@ export class FailoverRunner {
         const exhausted = selectionFailure(selected, { excluded, lastPolicy, lastResult, hops: budget.hops })
         return preferLastResult(lastResult, lastPolicy, exhausted, attribution())
       }
+      repairPending = false
       snapshotPins()
       lastSelected = selected
       pinnedSlot = selected.slotIndex ?? null
+      if (selected.seatMoved) seatMovedTo = selected.vmId
       bindAll({ accountId: selected.accountId, vmId: selected.vmId, slotIndex: pinnedSlot }, { countHit: false })
       const attemptStarted = Date.now()
       this.attemptsRepo?.begin?.({
@@ -656,7 +756,8 @@ export class FailoverRunner {
       const noteHop = (value) => {
         if (hopNoted) return
         hopNoted = true
-        budget.noteHop(selected.accountId, selected.vmId, executionsOf(value))
+        const executions = executionsOf(value)
+        if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
       }
       try {
         const prepared =
@@ -758,10 +859,15 @@ export class FailoverRunner {
         if (typeof onAttempt === 'function') {
           await onAttempt({ attemptNo, selected, result, policy })
         }
-        if (policy.reason === 'content_filter_refusal') {
+        if (policy.reason === 'content_filter_refusal' || policy.reason === 'usage_policy_refusal') {
           this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
           bindAll({ accountId: selected.accountId, vmId: selected.vmId })
-          return { ...result, ...attribution(), finalState: 'content_filter', policy }
+          return {
+            ...result,
+            ...attribution(),
+            finalState: policy.reason === 'usage_policy_refusal' ? 'rejected' : 'content_filter',
+            policy,
+          }
         }
         if (verifiedSuccess(result)) {
           this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
@@ -775,6 +881,7 @@ export class FailoverRunner {
         }
         if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
           repaired = true
+          repairPending = true
           requestBody = repairAnthropicRequest(requestBody, policy)
           continue
         }

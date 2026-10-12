@@ -11,20 +11,26 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	kinproxy "github.com/dofastted/kin-gateway/worker/internal/proxy"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 type Config struct {
-	ProxyID     string `json:"proxy_id"`
-	ProxyURL    string `json:"proxy_url"`
-	ListenTCP   string `json:"listen_tcp"`
-	ListenDNS   string `json:"listen_dns"`
-	DNSUpstream string `json:"dns_upstream"`
+	ProxyID       string   `json:"proxy_id"`
+	ProxyURL      string   `json:"proxy_url"`
+	ListenTCP     string   `json:"listen_tcp"`
+	ListenDNS     string   `json:"listen_dns"`
+	DNSUpstream   string   `json:"dns_upstream"`
+	DNSEmptyTypes []uint16 `json:"dns_empty_types,omitempty"`
+	// DomainForward sends a unique helper DNS answer as a SOCKS hostname.
+	// Off by default: the original IP literal is unchanged.
+	DomainForward bool `json:"domain_forward,omitempty"`
 }
 
 // IdleClose is how long a splice may sit with no bytes before both sides
@@ -32,9 +38,10 @@ type Config struct {
 const IdleClose = 7 * time.Minute
 
 const (
-	classIdleClose = "idle_close"
-	classSpliceRST = "splice_rst"
-	classSocksDial = "socks_dial"
+	classIdleClose       = "idle_close"
+	classSpliceRST       = "splice_rst"
+	classSocksDial       = "socks_dial"
+	classAmbiguousDomain = "ambiguous_domain"
 )
 
 type spliceError struct {
@@ -80,6 +87,7 @@ type Server struct {
 	http      *http.Client
 	upstreams []string
 	preferred atomic.Int32
+	domains   domainTable
 }
 
 // parseDNSUpstreams splits a comma-separated dns_upstream value.
@@ -97,6 +105,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.ListenTCP == "" {
 		return nil, fmt.Errorf("listen tcp address is required")
 	}
+	cfg.DNSEmptyTypes = append([]uint16(nil), cfg.DNSEmptyTypes...)
 	upstreams := parseDNSUpstreams(cfg.DNSUpstream)
 	if len(upstreams) == 0 {
 		upstreams = append([]string(nil), DefaultDNSUpstreams...)
@@ -111,6 +120,15 @@ func New(cfg Config) (*Server, error) {
 		upstreams: upstreams,
 		http: &http.Client{
 			Timeout: 10 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if req.URL.Scheme != "https" {
+					return fmt.Errorf("refusing DoH redirect to non-HTTPS URL")
+				}
+				if len(via) >= 10 {
+					return fmt.Errorf("stopped after 10 redirects")
+				}
+				return nil
+			},
 			Transport: &http.Transport{
 				DialContext: dialer.DialContext,
 			},
@@ -185,14 +203,18 @@ func (s *Server) handleTCP(ctx context.Context, conn net.Conn) {
 }
 
 func (s *Server) ForwardTCP(ctx context.Context, client net.Conn, dest string) error {
-	up, err := s.dialer.DialContext(ctx, "tcp", dest)
+	dialDest, err := s.dialDest(dest)
 	if err != nil {
-		return &spliceError{class: classSocksDial, dest: dest, err: err}
+		return err
+	}
+	up, err := s.dialer.DialContext(ctx, "tcp", dialDest)
+	if err != nil {
+		return &spliceError{class: classSocksDial, dest: dialDest, err: err}
 	}
 	defer up.Close()
 	kinproxy.ApplyTCPKeepAlive(client)
 	kinproxy.ApplyTCPKeepAlive(up)
-	return spliceIdle(client, up, dest, IdleClose)
+	return spliceIdle(client, up, dialDest, IdleClose)
 }
 
 func splice(a, b net.Conn) error {
@@ -358,6 +380,35 @@ func (s *Server) handleDNSTCP(ctx context.Context, conn net.Conn) {
 // ResolveDNS tries each upstream in order, starting from the last one that
 // succeeded, and returns the first valid reply.
 func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
+	if len(s.cfg.DNSEmptyTypes) > 0 {
+		var msg dnsmessage.Message
+		if err := msg.Unpack(query); err != nil {
+			return nil, fmt.Errorf("decode DNS query for override: %w", err)
+		}
+		if msg.Response || msg.OpCode != 0 || len(msg.Questions) == 0 {
+			return nil, fmt.Errorf("DNS override requires a standard query with questions")
+		}
+		blocked := 0
+		for _, question := range msg.Questions {
+			if slices.Contains(s.cfg.DNSEmptyTypes, uint16(question.Type)) {
+				blocked++
+			}
+		}
+		if blocked > 0 {
+			reply := dnsmessage.Message{
+				Header: dnsmessage.Header{
+					ID: msg.ID, Response: true, RecursionDesired: msg.RecursionDesired,
+					RecursionAvailable: true, CheckingDisabled: msg.CheckingDisabled,
+				},
+				Questions: msg.Questions,
+			}
+			// Mixed questions cannot be forwarded without leaking an overridden type.
+			if blocked != len(msg.Questions) {
+				reply.RCode = dnsmessage.RCodeFormatError
+			}
+			return reply.Pack()
+		}
+	}
 	n := len(s.upstreams)
 	start := int(s.preferred.Load())
 	var errs []error
@@ -368,6 +419,9 @@ func (s *Server) ResolveDNS(ctx context.Context, query []byte) ([]byte, error) {
 		reply, err := s.resolveOne(attemptCtx, upstream, query)
 		cancel()
 		if err == nil {
+			if s.cfg.DomainForward {
+				s.domains.observe(reply, time.Now())
+			}
 			if idx != start {
 				s.preferred.Store(int32(idx))
 				log.Printf("kin-egress dns upstream switched to %s", upstream)

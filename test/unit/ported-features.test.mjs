@@ -210,6 +210,23 @@ test('Auto Mode Stage1/2 可独立本地处理，默认透传上游', async () =
   assert.equal(response.statusCode, 400)
   assert.equal(response.body.error.code, 'auto_mode_classifier_intercepted')
   assert.equal(stats.errors, 2)
+
+  routing.compatibility = { claude_code_only: true }
+  routing.warmup_intercept = {
+    title_enabled: true,
+    auto_mode_classifier_stage1_mode: 'mock_allow',
+    auto_mode_classifier_stage2_mode: 'mock_allow',
+  }
+  for (const body of [
+    classifierBody(64),
+    classifierBody(4096, 'severity'),
+    { model: 'claude-sonnet-5', max_tokens: 64, messages: [{ role: 'user', content: 'Warmup' }] },
+  ]) {
+    inbound = body
+    await handler.handleProtocol(req, response, 'anthropic.messages', '/v1/messages')
+    assert.equal(response.statusCode, 403)
+    assert.equal(response.body.error.code, 'claude_code_only')
+  }
 })
 
 test('峰值预热接受非 Haiku Claude 模型，拒绝空值和非 Claude 模型', () => {

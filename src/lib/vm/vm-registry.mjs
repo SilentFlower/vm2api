@@ -19,6 +19,7 @@ import { manualScheduleLevelOf, parseScheduleLevelInput } from '../pool/credenti
 import { vmQuotaOverrideOf } from '../pool/vm-quota-override.mjs'
 import { normalizeOwnerId, vmOriginOf } from '../admin/resource-owner.mjs'
 import { normalizeVmKind } from './vm-kind.mjs'
+import { canClaudeResetCredits } from '../oauth/credential-mode.mjs'
 import { validTimezone } from '../core/timezone.mjs'
 import {
   extraFromCodexHeaders,
@@ -29,10 +30,13 @@ import {
 
 import { summarizeCodexSlot } from './codex-slot.mjs'
 import { evaluateCodexQuotaSchedule } from '../pool/codex-slot-pool.mjs'
+import { effectiveOpenAIPolicy, normalizeOpenAIQuotaPolicy } from '../pool/openai-quota-policy.mjs'
+import { runtimeKind } from './runtime-kind.mjs'
+import { hasBoundExit } from './egress.mjs'
 
 export { isCodexVm, normalizeVmKind } from './vm-kind.mjs'
 
-export function listVms(projectRoot) {
+export function listVms(projectRoot, routing = null) {
   const dir = path.join(projectRoot, 'vms')
   if (!fs.existsSync(dir)) return []
   const files = listVmRecordFiles(dir)
@@ -41,7 +45,7 @@ export function listVms(projectRoot) {
       try {
         const raw = JSON.parse(fs.readFileSync(path.join(dir, f), 'utf8'))
         if (!raw?.id) return null
-        return summarizeVm(raw, projectRoot)
+        return summarizeVm(raw, projectRoot, routing)
       } catch {
         return null
       }
@@ -55,15 +59,20 @@ export function getVm(projectRoot, id) {
   return JSON.parse(fs.readFileSync(file, 'utf8'))
 }
 
-export function summarizeVm(vm, projectRoot = null) {
+export function summarizeVm(vm, projectRoot = null, routing = null) {
   const kind = normalizeVmKind(vm)
   const codex = kind.kind === 'codex' ? summarizeCodexSlot(projectRoot, vm) : null
   const quota = codex?.usage?.quota || {}
+  const globalOpenAI = normalizeOpenAIQuotaPolicy(routing?.codex?.quota)
+  const openAIPolicy = kind.kind === 'codex' ? effectiveOpenAIPolicy(vm, globalOpenAI) : null
+  const quotaGate = kind.kind === 'codex' ? evaluateCodexQuotaSchedule(vm, Date.now(), globalOpenAI) : null
   return {
     id: vm.id,
     name: vm.name,
     status: vm.status || 'unknown',
     kernel: vm.kernel || null,
+    runtime_type: runtimeKind(vm),
+    machine: vm.machine || null,
     inference_engine: vm.inference_engine || null,
     persona_preset: vm.persona_preset || null,
     seed_policy: vm.seed_policy || null,
@@ -82,16 +91,33 @@ export function summarizeVm(vm, projectRoot = null) {
       kind.kind === 'codex' ? vm.codex?.usage?.snapshot?.updated_at || null : vm.claude?.refreshed_at || null,
     oauth_source: kind.kind === 'codex' ? 'codex-credentials' : vm.claude?.source || null,
     credential_mode: kind.kind === 'codex' ? 'oauth' : vm.claude?.mode || 'oauth',
+    can_claude_reset: canClaudeResetCredits(vm, {
+      hasToken: kind.kind === 'codex' ? !!codex?.has_token : hasAccessPresence(vm.claude),
+    }),
     auth_scheme: kind.kind === 'codex' ? null : vm.claude?.auth_scheme || null,
     has_refresh: kind.kind === 'codex' ? !!codex?.has_refresh : hasRefreshPresence(vm.claude),
     refresh_error: kind.kind === 'codex' ? null : vm.claude?.refresh_error || null,
     account_tier:
       kind.kind === 'codex' ? 'codex' : vm.claude?.account_tier || (hasAccessPresence(vm.claude) ? 'pro' : null),
     has_session_key: false,
-    max_concurrency: vm.policy?.maxConcurrency ?? 2,
-    max_rpm: vm.policy?.maxRpm ?? 0,
+    max_concurrency: kind.kind === 'codex' ? openAIPolicy.max_concurrency : (vm.policy?.maxConcurrency ?? 2),
+    max_concurrency_override:
+      kind.kind === 'codex' ? openAIPolicy.concurrency_override : vm.policy?.concurrencyOverride === true,
+    max_rpm: kind.kind === 'codex' ? openAIPolicy.max_rpm : (vm.policy?.maxRpm ?? 0),
+    max_rpm_override: kind.kind === 'codex' ? openAIPolicy.rpm_override : vm.policy?.rpmOverride === true,
+    max_sessions: kind.kind === 'codex' ? openAIPolicy.max_sessions : null,
+    max_sessions_override: kind.kind === 'codex' ? openAIPolicy.sessions_override : false,
     session_slots: kind.kind === 'codex' ? null : (vm.policy?.sessionSlots ?? null),
     session_slots_override: kind.kind === 'codex' ? false : vm.policy?.sessionSlotsOverride === true,
+    scheduling_inherited:
+      kind.kind === 'codex'
+        ? {
+            max_concurrency: globalOpenAI.max_concurrency,
+            max_rpm: globalOpenAI.max_rpm,
+            max_sessions: globalOpenAI.max_sessions,
+            session_slots: null,
+          }
+        : null,
     quota_override: kind.kind === 'codex' ? null : vmQuotaOverrideOf(vm),
     allowed_models:
       Array.isArray(vm.policy?.allowed_models) && vm.policy.allowed_models.length
@@ -127,8 +153,18 @@ export function summarizeVm(vm, projectRoot = null) {
     status_5h: quota.status_5h ?? null,
     status_7d: quota.status_7d ?? null,
     codex_usage: codex?.usage || null,
+    quota_policy:
+      kind.kind === 'codex'
+        ? {
+            ...globalOpenAI,
+            ...openAIPolicy,
+            reason: quotaGate?.reason || null,
+            restricted_until: quotaGate?.until || null,
+          }
+        : null,
     reset_credits: codex?.reset_credits || null,
     plan_type: codex?.plan_type || null,
+    claude_reset_credits: kind.kind === 'codex' ? null : vm.claude_reset_credits || null,
   }
 }
 
@@ -161,7 +197,11 @@ export function persistAccountTier(projectRoot, vmId, tier, { source = null } = 
  * Merge live `x-codex-*` headers (and optional park-until) into vm.codex.
  * Cluster 5H/7D meters read this via summarizeCodexSlot -> usage.quota.
  */
-export function persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, now = Date.now() } = {}) {
+export function persistCodexUsage(
+  projectRoot,
+  vmId,
+  { headers, extra, limitedUntil, now = Date.now(), policy = null } = {},
+) {
   if (!projectRoot || !vmId) return null
   const file = path.join(projectRoot, 'vms', `${vmId}.json`)
   if (!fs.existsSync(file)) return null
@@ -180,7 +220,7 @@ export function persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUn
   vm.codex.usage = buildCodexUsageView(extraToCodexSnapshot(merged))
   vm.updated_at = new Date(now).toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
-  syncCodexQuotaSchedule(projectRoot, vm, { now })
+  syncCodexQuotaSchedule(projectRoot, vm, { now, policy })
   return getVm(projectRoot, vmId) || vm
 }
 
@@ -189,13 +229,14 @@ export function persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUn
  * Never flips the operator switch. Leftover quota-off (not schedule_manual)
  * is restored to on + restriction.
  */
-export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now() } = {}) {
+export function syncCodexQuotaSchedule(projectRoot, vm, { now = Date.now(), policy = null } = {}) {
   if (!projectRoot || !vm?.id) return { action: 'keep', reason: null }
-  const ev = evaluateCodexQuotaSchedule(vm, now)
+  const ev = evaluateCodexQuotaSchedule(vm, now, policy)
   const file = path.join(projectRoot, 'vms', `${vm.id}.json`)
   const leftover = isLeftoverQuotaScheduleOff(vm)
   if (ev.action === 'restrict' || ev.action === 'restore') {
-    const until = Number(ev.until) || now + 5 * 60_000
+    const until = ev.until
+    if (until == null && /_local$/.test(ev.reason || '')) clearVmQuotaRestriction(file)
     const next = markVmRestriction(file, { until, reason: ev.reason })
     if (next) {
       vm.claude = next.claude
@@ -265,6 +306,23 @@ export function persistVmSessionSlots(projectRoot, vmId, value, { override = tru
     ...(vm.policy || {}),
     sessionSlots: value,
     sessionSlotsOverride: override,
+  }
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
+export function persistVmMaxSessions(projectRoot, vmId, value, { override = true } = {}) {
+  const file = path.join(projectRoot, 'vms', `${vmId}.json`)
+  if (!fs.existsSync(file)) return null
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > 256) {
+    throw new TypeError('max_sessions must be an integer between 0 and 256')
+  }
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy = {
+    ...(vm.policy || {}),
+    maxSessions: value,
+    sessionsOverride: override,
   }
   vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm, { mode: 0o600 })
@@ -342,6 +400,13 @@ export function setActiveVm(projectRoot, id) {
   atomicWriteJson(file, { active_vm: id, updated_at: new Date().toISOString() })
 }
 
+/** Drop the active pointer. Used when the last slot is deleted. */
+export function clearActiveVm(projectRoot) {
+  try {
+    fs.rmSync(path.join(projectRoot, 'vms', 'active.json'), { force: true })
+  } catch {}
+}
+
 /** Statuses that mean the slot is actually down — not a soft UI pause. */
 const HARD_UNAVAILABLE = new Set(['stopped', 'dead', 'error', 'disabled'])
 
@@ -405,9 +470,70 @@ export function bindVmProxy(projectRoot, id, proxyInfo) {
         password: proxyInfo.password == null ? null : proxyInfo.password,
       }
     : null
-  if (proxyInfo) vm.proxy_cli_enabled = true
+  // Eligibility (`slotHasBoundProxy`) and CLI egress both require this flag.
+  // It is not an operator toggle — it follows whether an exit is bound.
+  vm.proxy_cli_enabled = hasBoundExit(vm.proxy)
+  vm.updated_at = new Date().toISOString()
   atomicWriteJson(file, vm)
   return summarizeVm(vm)
+}
+
+/**
+ * Copy the bound-exit pair onto an in-memory snapshot. Callers that keep a VM
+ * object across `bindVmProxy` (or any other writer) must pull both fields —
+ * `proxy` without `proxy_cli_enabled` is how a bound slot became ineligible.
+ */
+export function adoptVmProxyBinding(target, source) {
+  if (!target) return target
+  target.proxy = source ? (source.proxy ?? null) : null
+  target.proxy_cli_enabled = hasBoundExit(target.proxy)
+  return target
+}
+
+/**
+ * Re-read vm.json, apply a patch of owned fields, write. Use this after another
+ * writer (bind, timezone, start) so a stale snapshot cannot clobber their fields.
+ */
+export function patchVmRecord(projectRoot, id, patch) {
+  const file = path.join(projectRoot, 'vms', `${id}.json`)
+  if (!fs.existsSync(file)) return null
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  if (typeof patch === 'function') {
+    const next = patch(vm)
+    if (next && typeof next === 'object' && next !== vm) Object.assign(vm, next)
+  } else if (patch && typeof patch === 'object') {
+    Object.assign(vm, patch)
+  }
+  vm.updated_at = new Date().toISOString()
+  atomicWriteJson(file, vm, { mode: 0o600 })
+  return vm
+}
+
+/**
+ * Heal slots whose bound exit and `proxy_cli_enabled` drifted (the #332 stale
+ * write). False was never an operator switch — panel/API have no such toggle.
+ */
+export function repairVmProxyCliEnabled(projectRoot) {
+  const repaired = []
+  const dir = path.join(projectRoot, 'vms')
+  if (!fs.existsSync(dir)) return repaired
+  for (const name of listVmRecordFiles(dir)) {
+    const file = path.join(dir, name)
+    let vm
+    try {
+      vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    } catch {
+      continue
+    }
+    if (!vm?.id) continue
+    const enabled = hasBoundExit(vm.proxy)
+    if (vm.proxy_cli_enabled === enabled) continue
+    vm.proxy_cli_enabled = enabled
+    vm.updated_at = new Date().toISOString()
+    atomicWriteJson(file, vm, { mode: 0o600 })
+    repaired.push(vm.id)
+  }
+  return repaired
 }
 
 /**

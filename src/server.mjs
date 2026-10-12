@@ -28,13 +28,16 @@ import {
   normalizeCredentialRefreshConfig,
 } from './lib/oauth/credential-refresh-monitor.mjs'
 import { createKernelWatchdog, normalizeKernelWatchdogConfig } from './lib/transport/kernel-watchdog.mjs'
+import { ensureSlotSubscriptionType } from './lib/oauth/oauth-credentials.mjs'
+import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
+import { ensureTelemetrySidecar } from './lib/vm/slot-process-status.mjs'
 
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
 import { createPeakPrimeMonitor, normalizePeakPrimeConfig } from './lib/admin/peak-prime.mjs'
-import { normalizeNotifyConfig, createNotifyMonitor } from './lib/admin/notify.mjs'
+import { normalizeNotifyConfig, createNotifyMonitor, dispatchNotify } from './lib/admin/notify.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { setManualScheduleWins } from './lib/pool/schedule-policy.mjs'
@@ -76,6 +79,8 @@ import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
 import { createClusterRoutes } from './lib/cluster/cluster-routes.mjs'
 import { bindPlacement } from './lib/cluster/placement.mjs'
+import { startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
+import { createSlotShell } from './lib/vm/slot-shell.mjs'
 
 import {
   classifyCredentialRefresh,
@@ -85,8 +90,8 @@ import {
 import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import { ensureWorkerCredential } from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
-import { createRespond } from './lib/http/respond.mjs'
-import { tryServeWebDist } from './lib/http/web-dist.mjs'
+import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
+import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
 import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
 import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
@@ -100,7 +105,6 @@ const FEATURES = [
   'protocol-convert',
   'go-slot-worker',
   'account-pool-failover',
-  'weighted-round-robin',
   'tools',
   'client-workspace',
   'api-direct-kernel',
@@ -149,6 +153,9 @@ const vmSync = initVmDbSync(cfg.paths.project)
 if (vmSync.upserted || vmSync.rebuilt) {
   console.log(`[db] vm mirror reconciled: upserted=${vmSync.upserted} rebuilt=${vmSync.rebuilt}`)
 }
+if (vmSync.proxy_cli_repaired) {
+  console.log(`[vm] repaired proxy_cli_enabled on ${vmSync.proxy_cli_repaired} slot(s)`)
+}
 
 // --- P3 sticky + quota ---
 
@@ -157,6 +164,7 @@ let healthMonitor = null
 let peakPrimeMonitor = null
 let credentialRefreshMonitor = null
 let kernelWatchdog = null
+let cliNodeGuard = null
 let usageProbeMonitor = null
 let notifyMonitor = null
 
@@ -258,10 +266,14 @@ const {
   applyVmConcurrency,
   applyVmRpm,
   applyVmSessionSlots,
+  applyVmMaxSessions,
+  inheritVmScheduling,
   applyVmQuotaOverride,
+  migrateLegacyOpenAIPolicies,
 } = routingRt
 
 routingConfig = loadRoutingConfig()
+migrateLegacyOpenAIPolicies(routingConfig)
 setManualScheduleWins(routingConfig.pool?.manual_schedule_wins)
 if (routingConfig.official_cc) {
   routingConfig.official_cc = normalizeOfficialCcConfig(routingConfig.official_cc)
@@ -469,7 +481,17 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
 kernelWatchdog = createKernelWatchdog({
   config: routingConfig.kernel_watchdog,
   listTargets: () => listVms(cfg.paths.project),
+  getRouting: () => routingConfig,
   homeDirFor: (vm) => path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
+  ensureTelemetry: (vm) => ensureTelemetrySidecar({ projectRoot: cfg.paths.project, vm }),
+  onFault: (vm, reason) => {
+    const title = `槽内核故障 ${vm.id}`
+    dispatchNotify(routingConfig.notify, {
+      title,
+      text: `【KIN】${title}\n\n${reason}\n已停止调度该槽；内核恢复健康后自动恢复调度。`,
+      subject: `KIN · ${title}`,
+    }).catch((error) => console.warn('[kernel-watchdog] notify failed', error?.message || error))
+  },
 })
 
 usageProbeMonitor = createUsageProbeMonitor({
@@ -481,7 +503,9 @@ usageProbeMonitor = createUsageProbeMonitor({
     const id = account?.account_id || vm?.claude?.account_uuid || vm?.account_uuid || vm?.id
     if (isCodexVm(vm)) {
       try {
-        syncCodexQuotaSchedule(cfg.paths.project, getVm(cfg.paths.project, vm.id) || vm)
+        syncCodexQuotaSchedule(cfg.paths.project, getVm(cfg.paths.project, vm.id) || vm, {
+          policy: routingConfig.codex?.quota,
+        })
       } catch {}
       return
     }
@@ -492,7 +516,7 @@ usageProbeMonitor = createUsageProbeMonitor({
       poolScheduler.syncQuotaSchedule(vm, account)
     } catch {}
   },
-  probeOne: (vm) => panel.buildProbeOne({ cfg, accountQuota, id: vm.id }),
+  probeOne: (vm) => panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig }),
 })
 notifyMonitor = createNotifyMonitor({
   config: routingConfig.notify,
@@ -525,6 +549,7 @@ backupService.onRestored((db) => {
   apiScheduler.reload(apiEndpointStore.listRaw())
 
   routingConfig = loadRoutingConfig()
+  migrateLegacyOpenAIPolicies(routingConfig)
   setManualScheduleWins(routingConfig.pool?.manual_schedule_wins)
   if (routingConfig.official_cc) {
     routingConfig.official_cc = normalizeOfficialCcConfig(routingConfig.official_cc)
@@ -783,7 +808,7 @@ const importCommit = createImportCommit({
 
 const { commitImportedOauth, requireSlotProxy, officialCcStatsHandler } = importCommit
 
-const { handleProtocol } = createHandleProtocol({
+const { handleProtocol, handleSearch } = createHandleProtocol({
   json,
   writeSSEHeaders,
   readBody,
@@ -825,6 +850,7 @@ const clusterManager = new ClusterManager({
   vmsOnNode: (nodeId) => listVms(cfg.paths.project).filter((vm) => vm.node_id === nodeId),
 })
 bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
+await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
 clusterManager.start()
 clusterManager.restoreSlotRelays()
 if (proxyPool.snapshot().config.ipv6_enabled !== true) {
@@ -834,9 +860,23 @@ if (proxyPool.snapshot().config.ipv6_enabled !== true) {
   }
 }
 const clusterRoutes = createClusterRoutes({ manager: clusterManager, json, readBody, ok: panel.ok })
+const slotShell = createSlotShell({ projectRoot: cfg.paths.project })
+for (const vm of listVms(cfg.paths.project)) {
+  if (isCodexVm(vm)) continue
+  try {
+    ensureSlotSubscriptionType(path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'), vm.account_tier)
+  } catch (error) {
+    console.warn('[credential-subscription]', vm.id, error?.message || error)
+  }
+}
+cliNodeGuard = createCliNodeGuard({
+  listTargets: () => listVms(cfg.paths.project),
+  liveTokens: () => slotShell.liveShellTokens?.() || [],
+})
 
 const handlePanel = createPanelHandler({
   json,
+  writeSSEHeaders,
   readBody,
   readRawBody,
   requireAuth,
@@ -889,6 +929,8 @@ const handlePanel = createPanelHandler({
   applyVmConcurrency,
   applyVmRpm,
   applyVmSessionSlots,
+  applyVmMaxSessions,
+  inheritVmScheduling,
   applyVmQuotaOverride,
   initPoolRuntime,
   poolSchedulerConfig,
@@ -898,6 +940,8 @@ const handlePanel = createPanelHandler({
   refreshWorkerCredentialForVm,
   fetchWorkerModels,
   clusterRoutes,
+  clusterManager,
+  slotShell,
 })
 
 const server = http.createServer(async (req, res) => {
@@ -912,7 +956,10 @@ const server = http.createServer(async (req, res) => {
       return res.end()
     }
 
-    const url = new URL(req.url || '/', `http://${req.headers.host}`)
+    const url = parseRequestUrl(req)
+    if (!url) {
+      return json(res, 400, { error: { message: 'Invalid URL', type: 'invalid_request' } })
+    }
     const p = url.pathname
 
     if (isTelemetryPath(p)) {
@@ -941,7 +988,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && tryServeWebDist(res, cfg.paths.project, p)) return
-    if (req.method === 'GET' && (p === '/console' || p === '/console/')) {
+    if (req.method === 'GET' && isConsoleEntry(p)) {
       return json(res, 404, { error: { message: 'console not found; run pnpm -C web build' } })
     }
 
@@ -1055,6 +1102,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (p === '/v1/messages' || p === '/messages')) {
       return await handleProtocol(req, res, 'anthropic.messages', p)
     }
+    if (req.method === 'POST' && (p === '/v1/alpha/search' || p === '/alpha/search')) {
+      return await handleSearch(req, res, p)
+    }
 
     json(res, 404, { error: { message: `not found: ${p}` } })
   } catch (e) {
@@ -1071,7 +1121,8 @@ const server = http.createServer(async (req, res) => {
 })
 
 server.on('upgrade', (req, socket, head) => {
-  if (!clusterRoutes.handleUpgrade(req, socket, head)) socket.destroy()
+  if (clusterRoutes.handleUpgrade(req, socket, head)) return
+  if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
 
 server.on('clientError', (err, socket) => {
@@ -1145,6 +1196,9 @@ function shutdown(signal) {
     kernelWatchdog?.stop?.()
   } catch {}
   try {
+    cliNodeGuard?.stop?.()
+  } catch {}
+  try {
     usageProbeMonitor?.stop?.()
   } catch {}
 
@@ -1192,7 +1246,11 @@ server.listen(cfg.port, cfg.host, () => {
   } catch (e) {
     console.warn('[kernel-watchdog] start failed', e?.message || e)
   }
-
+  try {
+    cliNodeGuard?.start?.({ immediate: true })
+  } catch (e) {
+    console.warn('[cli-node-guard] start failed', e?.message || e)
+  }
   try {
     usageProbeMonitor?.start?.({ immediate: true })
   } catch (e) {
