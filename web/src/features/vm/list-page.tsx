@@ -34,11 +34,14 @@ import { VmListSkeleton } from '@/features/vm/list-skeleton'
 import { vmsListQueryOptions } from '@/features/vm/queries'
 import { usePoolSeatStream } from '@/features/vm/use-pool-seat-stream'
 import { VmActionsProvider } from '@/features/vm/vm-actions-provider'
+import { vmPermsFor } from '@/features/vm/vm-perms'
+import { VmRack } from '@/features/vm/vm-rack'
+import type { RackSize } from '@/features/vm/vm-rack-blade'
+import type { VmZoneFilter } from '@/features/vm/vm-rack-model'
 import {
   filterVms,
   KindFilterChips,
   sortVms,
-  VmCards,
   VmTable,
   type VmKindFilter,
   type VmSortKey,
@@ -47,10 +50,42 @@ import {
 const SORT_CHIPS = [
   ['status', '状态'],
   ['name', '名称'],
-  ['remain', '5h 剩余'],
+  ['remain', '5H 剩余'],
   ['today', '今日花费'],
+  ['cost7', '7D 费用'],
+  ['total', '总计费用'],
   ['cache', '缓存命中'],
 ] as const
+
+const SIZES: [RackSize, string, string][] = [
+  ['s', '小', '小卡：一屏看全队'],
+  ['m', '中', '中卡：日常巡检'],
+  ['l', '大', '大卡：逐台核对'],
+]
+
+const LS_VIEW = 'vm-list-view'
+const LS_SIZE = 'vm-rack-size'
+
+function readPref<T extends string>(
+  key: string,
+  allowed: readonly T[],
+  fallback: T
+): T {
+  try {
+    const v = localStorage.getItem(key)
+    return allowed.includes(v as T) ? (v as T) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function writePref(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value)
+  } catch {
+    // 隐私模式 / 配额满：本次会话内仍按内存状态生效。
+  }
+}
 
 export function VmListPage() {
   const me = useQuery(meQueryOptions())
@@ -62,9 +97,22 @@ export function VmListPage() {
   })
   const qc = useQueryClient()
   const [q, setQ] = useState('')
-  const [filter, setFilter] = useState('all')
+  const [filter, setFilter] = useState<VmZoneFilter>('all')
   const [kind, setKind] = useState<VmKindFilter>('all')
-  const [view, setView] = useState<'grid' | 'list'>('list')
+  const [view, setViewState] = useState(() =>
+    readPref(LS_VIEW, ['grid', 'list'] as const, 'grid')
+  )
+  const [size, setSizeState] = useState(() =>
+    readPref(LS_SIZE, ['s', 'm', 'l'] as const, 'l')
+  )
+  const setView = (next: 'grid' | 'list') => {
+    setViewState(next)
+    writePref(LS_VIEW, next)
+  }
+  const setSize = (next: RackSize) => {
+    setSizeState(next)
+    writePref(LS_SIZE, next)
+  }
   const [sort, setSort] = useState<VmSortKey>('status')
   const [dir, setDir] = useState<'asc' | 'desc'>('asc')
   const [resetTarget, setResetTarget] = useState<Vm | null>(null)
@@ -103,12 +151,14 @@ export function VmListPage() {
   const canCreate =
     me.data?.role === 'admin' ||
     (me.data?.role === 'user' && (me.data.vm_create_quota || 0) > 0)
+  const perms = vmPermsFor(me.data?.role)
   const scoped = filterVms(vms, '', 'all', kind)
   const list = sortVms(filterVms(vms, q, filter, kind), sort, dir, accounts)
 
   return (
     <PageHeader
       title={VIEW_TITLES.vm}
+      description='槽位和账号用量。按服务器分机架、按状态分区；未探测的额度不会冒充可用。'
       fluid
       extra={
         poolQueue || canCreate ? (
@@ -186,6 +236,30 @@ export function VmListPage() {
               {dir === 'asc' ? <ArrowUpNarrowWide /> : <ArrowDownWideNarrow />}
             </Button>
             <Separator orientation='vertical' className='mx-1 h-5' />
+            {view === 'grid' ? (
+              <div
+                role='group'
+                aria-label='卡片大小'
+                className='inline-flex gap-0.5 rounded-lg bg-muted p-0.5'
+              >
+                {SIZES.map(([key, label, title]) => (
+                  <button
+                    key={key}
+                    type='button'
+                    title={title}
+                    aria-pressed={size === key}
+                    onClick={() => setSize(key)}
+                    className={cn(
+                      'h-7 min-w-8 rounded-md px-2 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground',
+                      size === key &&
+                        'bg-card text-foreground shadow-[0_1px_2px_oklch(0_0_0/12%),0_0_0_1px_var(--border)]'
+                    )}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
             <Button
               size='sm'
               variant={view === 'list' ? 'default' : 'outline'}
@@ -210,26 +284,40 @@ export function VmListPage() {
         </div>
         <VmActionsProvider
           accounts={accounts}
-          onReset={(vm) => {
-            setResetInput('')
-            setResetTarget(vm)
-          }}
-          onDelete={(vm) => {
-            setDeleteInput('')
-            setDeleteTarget(vm)
-          }}
+          onReset={
+            perms.admin
+              ? (vm) => {
+                  setResetInput('')
+                  setResetTarget(vm)
+                }
+              : undefined
+          }
+          onDelete={
+            perms.remove
+              ? (vm) => {
+                  setDeleteInput('')
+                  setDeleteTarget(vm)
+                }
+              : undefined
+          }
         >
           {list.length ? (
             view === 'grid' ? (
-              <VmCards vms={list} accounts={accounts} />
+              <VmRack
+                vms={list}
+                accounts={accounts}
+                filter={filter}
+                size={size}
+                onCreate={canCreate ? () => setCreateOpen(true) : undefined}
+              />
             ) : (
               <VmTable vms={list} accounts={accounts} />
             )
           ) : (
             <EmptyState
               reason='没有符合当前筛选的槽位。'
-              actionLabel='创建'
-              onAction={() => setCreateOpen(true)}
+              actionLabel={canCreate ? '创建' : undefined}
+              onAction={canCreate ? () => setCreateOpen(true) : undefined}
             />
           )}
         </VmActionsProvider>
@@ -280,7 +368,11 @@ export function VmListPage() {
           value={resetInput}
           onChange={(e) => setResetInput(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && resetInput.trim() === resetTarget?.id) {
+            if (
+              e.key === 'Enter' &&
+              resetInput.trim() === resetTarget?.id &&
+              !resetVm.isPending
+            ) {
               resetVm.mutate(resetTarget.id)
             }
           }}
@@ -330,7 +422,11 @@ export function VmListPage() {
           value={deleteInput}
           onChange={(e) => setDeleteInput(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && deleteInput.trim() === deleteTarget?.id) {
+            if (
+              e.key === 'Enter' &&
+              deleteInput.trim() === deleteTarget?.id &&
+              !deleteVm.isPending
+            ) {
               deleteVm.mutate(deleteTarget.id)
             }
           }}

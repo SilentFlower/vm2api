@@ -13,7 +13,7 @@ import {
   rustKernelReachable,
   rustKernelBusy,
 } from './rust-kernel-client.mjs'
-import { streamIdleTimeoutMs } from '../core/config.mjs'
+import { maxRequestBytes, streamIdleTimeoutMs } from '../core/config.mjs'
 import { OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { cacheTtlFromRouting, normalizeCacheTtl } from '../protocol/cache-ttl.mjs'
 import { setVmSchedulable, listVms, getVm } from '../vm/vm-registry.mjs'
@@ -23,6 +23,7 @@ import { slotExecArgv } from '../vm/slot-exec.mjs'
 import {
   CONTAINER_CLI_NODE_BIN,
   KERNEL_NATIVE_SLOT_COUNT,
+  normalizeSessionIdleTtlSeconds,
   resolveCliSystemLayout,
   resolveKernelDataplane,
   resolveSlotPersonaPreset,
@@ -689,6 +690,13 @@ export function writeKernelConfig(
   const defaultCacheTtl = routing != null ? cacheTtlFromRouting(routing) : normalizeCacheTtl(previous.default_cache_ttl)
   const previousIdleSeconds = Number(previous.idle_timeout_seconds)
   const idleMs = routing == null && previousIdleSeconds > 0 ? previousIdleSeconds * 1000 : streamIdleTimeoutMs(routing)
+  const previousMax = Number(previous.max_request_bytes)
+  const requestBytes = routing == null && previousMax > 0 ? previousMax : maxRequestBytes(routing)
+  const cchEnabled = routing == null ? previous.cch_enabled !== false : routing?.compatibility?.cch_enabled !== false
+  const sessionIdleTtlSeconds =
+    routing == null
+      ? normalizeSessionIdleTtlSeconds(previous.session_idle_ttl_seconds)
+      : normalizeSessionIdleTtlSeconds(routing?.inference?.session_idle_ttl_seconds)
 
   const kind = runtimeKind(record)
   const config = {
@@ -703,7 +711,8 @@ export function writeKernelConfig(
     request_timeout_seconds: 0,
     first_byte_timeout_seconds: 600,
     idle_timeout_seconds: Math.ceil(idleMs / 1000),
-    max_request_bytes: 32 * 1024 * 1024,
+    session_idle_ttl_seconds: sessionIdleTtlSeconds,
+    max_request_bytes: requestBytes,
     max_response_bytes: 64 * 1024 * 1024,
     max_event_bytes: 32 * 1024 * 1024,
     runtime_kind: kind,
@@ -716,6 +725,7 @@ export function writeKernelConfig(
     system_layout: resolveCliSystemLayout(vm, routing || {}),
     cli_version: OFFICIAL_CLI_VERSION,
     default_cache_ttl: defaultCacheTtl,
+    cch_enabled: cchEnabled,
   }
 
   if (tz) config.timezone = tz

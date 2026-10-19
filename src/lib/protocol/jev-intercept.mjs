@@ -12,7 +12,9 @@
 import { ErrorCode, ErrorType, makeError } from '../core/errors.mjs'
 import { refusalUserDocument } from '../core/refusal-similarity.mjs'
 import { normalizeText } from '../core/distill-detect.mjs'
+import { hasAccessPresence } from '../oauth/oauth-credentials.mjs'
 import { prepareInterceptText } from './jev-prepare.mjs'
+import { inferClaudeTier } from '../pool/claude-tier.mjs'
 
 export const JEV_SETTING = 'jev_intercept'
 export const JEV_CATEGORIES = Object.freeze(['nsfw', 'distill', 'crack', 'jailbreak'])
@@ -31,17 +33,77 @@ export const POLICY_PROVIDERS = Object.freeze([
   { id: 'modernbert', label: 'ModernBERT', default_model: 'english', default_base_url: 'http://127.0.0.1:8000' },
 ])
 
+/**
+ * Which slots the four layers cover. Empty means every account, the old
+ * behaviour. A selection is `platform:plan` (`claude:max`, `gpt:plus`),
+ * matched as a pair, plus optional slot id / email / name. Credential form
+ * is not a filter: operators pick the platform and the plan they already
+ * see on the slot.
+ */
+export const PLAN_TYPE_NONE = 'none'
+export const ACCOUNT_TYPE_NONE = 'none'
+export const JEV_ACCOUNT_TYPES = Object.freeze([
+  { id: 'oauth', label: 'OAuth' },
+  { id: 'setup-token', label: 'Setup Token' },
+  { id: 'official-setup-token', label: '官方 Setup Token' },
+  { id: 'apikey', label: 'Console API Key' },
+  { id: ACCOUNT_TYPE_NONE, label: '无凭证' },
+])
+const GPT_PLAN_BUCKETS = Object.freeze([
+  { id: 'free', label: 'Free', ids: ['free', 'free_workspace', 'guest'] },
+  { id: 'go', label: 'Go', ids: ['go'] },
+  { id: 'plus', label: 'Plus', ids: ['plus'] },
+  { id: 'pro', label: 'Pro', ids: ['pro', 'prolite'] },
+  {
+    id: 'business',
+    label: 'Business',
+    ids: ['team', 'self_serve_business_prolite', 'self_serve_business_usage_based'],
+  },
+  {
+    id: 'enterprise',
+    label: 'Enterprise',
+    ids: ['business', 'ent26', 'enterprise_cbp_automation', 'enterprise_cbp_usage_based', 'enterprise', 'hc'],
+  },
+  { id: 'edu', label: 'Edu', ids: ['edu', 'education'] },
+  { id: 'edu_plus', label: 'Edu Plus', ids: ['edu_plus'] },
+  { id: 'edu_pro', label: 'Edu Pro', ids: ['edu_pro'] },
+])
+const SCOPE_PLAN_RANK = Object.freeze([
+  'max',
+  'pro',
+  'plus',
+  'go',
+  'business',
+  'enterprise',
+  'free',
+  'edu',
+  'edu_plus',
+  'edu_pro',
+  'none',
+])
+export const JEV_PLAN_TYPES = Object.freeze([
+  { id: 'plus', label: 'Plus' },
+  { id: 'pro', label: 'Pro' },
+  { id: 'prolite', label: 'Pro Lite' },
+  { id: 'self_serve_business_prolite', label: 'Business Premium' },
+  { id: 'business', label: 'Business' },
+  { id: 'free', label: 'Free' },
+  { id: PLAN_TYPE_NONE, label: '未标注' },
+])
+
 const TIMEOUT_MIN = 200
 const TIMEOUT_MAX = 8000
 const TIMEOUT_DEFAULT = 2000
 const PATTERN_MAX = 50
 const PATTERN_LEN = 400
 const RULE_MAX = 60
+const SCOPE_LIST_MAX = 200
 
 /**
- * User-text only. Official system prompts mention safety and exploits;
- * scanning them would block Claude Code itself. System-side attacks are
- * the distill detector's job (harvest / CoT) or the decision model, when on.
+ * User-authored text only. Official system prompts and tool results quote
+ * safety rules and exploit writeups; scanning them blocks omp itself.
+ * System-side attacks are the distill detector's job (harvest / CoT) or the
+ * decision model, when on.
  */
 export const HARD_POLICY_RULES = Object.freeze([
   { category: 'jailbreak', source: String.raw`\b(?:jailbreak|dan)\s+mode\b` },
@@ -71,10 +133,6 @@ export const HARD_POLICY_RULES = Object.freeze([
   { category: 'nsfw', source: String.raw`(?:生成|写一段|描述)(?:露骨|色情)(?:内容|小说|场景)` },
   {
     category: 'distill',
-    source: String.raw`\b(?:knowledge|model|teacher|student)\s+distill(?:ation|ing)?\b`,
-  },
-  {
-    category: 'distill',
     source: String.raw`\bdistill(?:ation|ing)?\s+(?:of\s+)?(?:(?:the|your|a|an|reusable|durable|rollout|hidden|internal|full|complete)\s+)?(?:reasoning(?:\s+traces?)?|chain[- ]of[- ]thoughts?|teacher(?:\s+model)?)\b`,
   },
   {
@@ -82,7 +140,7 @@ export const HARD_POLICY_RULES = Object.freeze([
     source: String.raw`\b(?:extract|export|dump|reveal|harvest|exfiltrate)(?:ing|ed|ion|s)?\s+(?:(?:the|your|a|an|full|hidden|internal|complete|raw|durable|entire)\s+){0,4}(?:chain[- ]of[- ]thoughts?|reasoning\s+traces?|hidden\s+reasoning|internal\s+reasoning|internal\s+monologues?)\b`,
   },
   { category: 'distill', source: String.raw`\b(?:chain[- ]of[- ]thought|reasoning\s+trace)\s+extraction\b` },
-  { category: 'distill', source: String.raw`(?:知识蒸馏|模型蒸馏|思维链蒸馏|推理蒸馏|思考链蒸馏)` },
+  { category: 'distill', source: String.raw`(?:思维链蒸馏|推理蒸馏|思考链蒸馏)` },
   {
     category: 'distill',
     source: String.raw`(?:提取|导出|抽取|蒸馏|收割|扒取)\s*(?:出|取)?\s*(?:你的|本人的|完整|全部|隐藏|内部)?\s*(?:的)?\s*(?:思维链|思考链|推理链)`,
@@ -286,6 +344,10 @@ export function defaultJevConfig() {
     enabled: false,
     hard_regex_enabled: true,
     openai_platform_enabled: false,
+    account_types: [],
+    account_plan_types: [],
+    account_platform_plans: [],
+    account_ids: [],
     provider: 'jev',
     base_url: '',
     api_key: '',
@@ -342,10 +404,246 @@ function normalizeRules(raw) {
       enabled: item.enabled !== false,
     })
   }
-  return out
+  // An empty list would swap the shipped rules for nothing while the panel still
+  // reports hard_regex_enabled=true. Fall back to the builtins instead; turn the
+  // layer off with hard_regex_enabled.
+  return out.length ? out : null
 }
 
 const KEY_MAX = 999
+
+/** Trim, lowercase and dedupe one scope list; the panel sends what it shows. */
+function scopeList(raw) {
+  if (!Array.isArray(raw)) return []
+  const out = []
+  const seen = new Set()
+  for (const item of raw) {
+    const text = String(item ?? '')
+      .trim()
+      .toLowerCase()
+      .slice(0, 160)
+    if (!text || seen.has(text)) continue
+    seen.add(text)
+    out.push(text)
+    if (out.length >= SCOPE_LIST_MAX) break
+  }
+  return out
+}
+
+function scopeText(value) {
+  return String(value ?? '')
+    .trim()
+    .toLowerCase()
+}
+
+function isScopePair(value) {
+  return /^(claude|gpt):[a-z0-9_-]{1,64}$/.test(value)
+}
+
+function gptPlanBucket(raw) {
+  const plan = scopeText(raw)
+  if (!plan || plan === PLAN_TYPE_NONE) return PLAN_TYPE_NONE
+  const bucket = GPT_PLAN_BUCKETS.find((item) => item.id === plan || item.ids.includes(plan))
+  if (bucket) return bucket.id
+  return plan.replace(/[^a-z0-9_-]/g, '').slice(0, 64) || PLAN_TYPE_NONE
+}
+
+/** `claude` or `gpt`. A summary's `platform: openai` and a raw Codex file both count as GPT. */
+export function scopePlatformOf(account = {}) {
+  const platform = scopeText(account.platform)
+  const family = scopeText(account.family)
+  const tier = scopeText(account.account_tier)
+  if (
+    account.codex_kernel === true ||
+    tier === 'codex' ||
+    platform === 'openai' ||
+    platform === 'gpt' ||
+    platform === 'codex' ||
+    family === 'codex'
+  ) {
+    return 'gpt'
+  }
+  return 'claude'
+}
+
+export function scopePlanOf(account = {}) {
+  if (scopePlatformOf(account) === 'gpt') return gptPlanBucket(account.plan_type)
+  const hasUsage =
+    account.usage_has_fable != null ||
+    account.utilization_7d_oi != null ||
+    account.reset_7d_oi ||
+    account.status_7d_oi ||
+    account['7d_oi'] ||
+    account.fable
+  if (hasUsage || account.has_token || account.has_access) {
+    const tier = inferClaudeTier(
+      {
+        ...account,
+        has_token: !!(account.has_token || account.has_access || hasUsage),
+      },
+      account,
+    )
+    if (tier.key === 'max' || tier.key === 'pro') return tier.key
+  }
+  const stored = scopeText(account.account_tier || account.tier)
+  if (stored === 'max' || stored === 'pro') return stored
+  return PLAN_TYPE_NONE
+}
+
+export function scopeKeyOf(account = {}) {
+  return `${scopePlatformOf(account)}:${scopePlanOf(account)}`
+}
+
+export function scopeKeyLabel(key) {
+  const text = scopeText(key)
+  const split = text.indexOf(':')
+  const platform = split < 0 ? text : text.slice(0, split)
+  const plan = split < 0 ? '' : text.slice(split + 1)
+  const platformLabel = platform === 'gpt' ? 'GPT' : 'Claude'
+  if (!plan || plan === PLAN_TYPE_NONE) return `${platformLabel} · 未标注`
+  if (platform === 'claude') {
+    if (plan === 'max') return 'Claude · Max'
+    if (plan === 'pro') return 'Claude · Pro'
+    return `Claude · ${plan}`
+  }
+  const bucket = GPT_PLAN_BUCKETS.find((item) => item.id === plan)
+  return `GPT · ${bucket ? bucket.label : plan}`
+}
+
+function compareScopeKeys(left, right) {
+  const [lp, lplan] = left.split(':')
+  const [rp, rplan] = right.split(':')
+  const platform = (lp === 'gpt' ? 1 : 0) - (rp === 'gpt' ? 1 : 0)
+  if (platform) return platform
+  const li = SCOPE_PLAN_RANK.indexOf(lplan)
+  const ri = SCOPE_PLAN_RANK.indexOf(rplan)
+  return (li < 0 ? 99 : li) - (ri < 0 ? 99 : ri) || lplan.localeCompare(rplan)
+}
+
+/**
+ * The same key the panel chip uses. Claude Max/Pro follows `inferClaudeTier`
+ * (usage Fable wins over a stored or defaulted Pro). `quota` is the account
+ * unified record when the caller has it; summaries often lack it.
+ */
+export function scopeAccountFromVm(vm = {}, quota = null) {
+  if (!vm || typeof vm !== 'object') return null
+  const platform = scopePlatformOf(vm)
+  const attached = vm.quota && typeof vm.quota === 'object' ? vm.quota.unified || vm.quota : {}
+  const passed = quota && typeof quota === 'object' ? quota.unified || quota : {}
+  const q = { ...attached, ...passed }
+  const storedTier = scopeText(vm.claude?.account_tier || q.account_tier || vm.account_tier)
+  const view = {
+    has_token: !!(vm.has_token || vm.has_access || hasAccessPresence(vm.claude || {})),
+    has_access: !!(vm.has_access || vm.claude?.has_access || vm.has_token || hasAccessPresence(vm.claude || {})),
+    account_tier: storedTier === 'codex' ? null : storedTier || null,
+    usage_has_fable: q.usage_has_fable ?? vm.usage_has_fable ?? null,
+    utilization_7d_oi: q.utilization_7d_oi ?? vm.utilization_7d_oi ?? null,
+    reset_7d_oi: q.reset_7d_oi || vm.reset_7d_oi || null,
+    status_7d_oi: q.status_7d_oi || vm.status_7d_oi || null,
+    '7d_oi': q['7d_oi'] || vm['7d_oi'] || null,
+    fable: q.fable || vm.fable || null,
+  }
+  const tier = platform === 'claude' ? scopePlanOf({ ...view, platform: 'claude' }) : null
+  return {
+    id: vm.id || null,
+    email: vm.email || vm.codex?.email || vm.claude?.email || null,
+    name: vm.name || null,
+    platform,
+    plan_type: platform === 'gpt' ? vm.plan_type || vm.codex?.plan_type || null : null,
+    account_tier: tier === 'max' || tier === 'pro' ? tier : null,
+    has_token: view.has_token,
+    usage_has_fable: view.usage_has_fable,
+    utilization_7d_oi: view.utilization_7d_oi,
+    reset_7d_oi: view.reset_7d_oi,
+    status_7d_oi: view.status_7d_oi,
+    '7d_oi': view['7d_oi'],
+    fable: view.fable,
+  }
+}
+
+export function buildScopeInventory(vms = [], selectedKeys = []) {
+  const counts = new Map()
+  const accounts = []
+  for (const vm of vms || []) {
+    const account = scopeAccountFromVm(vm)
+    if (!account?.id) continue
+    const scopeKey = scopeKeyOf(account)
+    counts.set(scopeKey, (counts.get(scopeKey) || 0) + 1)
+    accounts.push({
+      id: String(account.id),
+      email: account.email,
+      name: account.name,
+      platform: account.platform,
+      plan_type: account.plan_type,
+      account_tier: account.account_tier,
+      scope_key: scopeKey,
+      schedulable: vm?.schedulable !== false,
+    })
+  }
+  const ids = new Set(counts.keys())
+  for (const key of selectedKeys || []) {
+    const text = scopeText(key)
+    if (isScopePair(text)) ids.add(text)
+  }
+  const account_platform_plan_options = [...ids]
+    .sort(compareScopeKeys)
+    .map((id) => ({ id, label: scopeKeyLabel(id), count: counts.get(id) || 0 }))
+  return { account_platform_plan_options, accounts_total: accounts.length, accounts }
+}
+
+function scopePairs(raw) {
+  return scopeList(raw).filter(isScopePair)
+}
+
+/** Old plan-only saves had no platform. Keep them as pairs until the panel rewrites the key. */
+function pairsFromLegacyPlans(planTypes) {
+  const out = []
+  for (const plan of planTypes || []) {
+    if (plan === 'max') out.push('claude:max')
+    else if (plan === PLAN_TYPE_NONE) out.push('claude:none', 'gpt:none')
+    else out.push(`gpt:${gptPlanBucket(plan)}`)
+  }
+  return scopePairs(out)
+}
+
+/** Any pair or named account means the operator narrowed the gate. Credential form does not. */
+export function jevScopeConfigured(jev) {
+  if (!jev) return false
+  return (
+    (Array.isArray(jev.account_platform_plans) && jev.account_platform_plans.length > 0) ||
+    (Array.isArray(jev.account_ids) && jev.account_ids.length > 0)
+  )
+}
+
+/**
+ * True when this platform cannot be decided until the slot is known:
+ * a pair for it is selected, or a named account might belong to it.
+ */
+export function jevScopeWaits(jev, platform) {
+  if (!jevScopeConfigured(jev)) return false
+  if ((jev.account_ids || []).length > 0) return true
+  const prefix = platform === 'gpt' || platform === 'openai' ? 'gpt:' : 'claude:'
+  return (jev.account_platform_plans || []).some((key) => String(key).startsWith(prefix))
+}
+
+/**
+ * A selected pair matches platform and plan together. Named accounts are a
+ * union with those pairs. An empty scope takes every account; no account
+ * context matches nothing.
+ */
+export function jevAccountInScope(jev, account) {
+  if (!jevScopeConfigured(jev)) return true
+  if (!account) return false
+  const id = scopeText(account.id)
+  const email = scopeText(account.email)
+  const name = scopeText(account.name)
+  for (const want of jev.account_ids || []) {
+    if (want && (want === id || want === email || want === name)) return true
+  }
+  const pairs = jev.account_platform_plans || []
+  if (!pairs.length) return false
+  return pairs.includes(scopeKeyOf(account))
+}
 
 function normalizeKeys(raw) {
   const list = []
@@ -368,8 +666,18 @@ function normalizeKeys(raw) {
 
 export function normalizeJevConfig(raw) {
   const base = defaultJevConfig()
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return base
+  // Run the defaults through the same normalisation: `publicJevConfig(null)`
+  // used to read `questions` off the raw default and throw.
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return normalizeJevConfig(base)
   const timeout = Number(raw.timeout_ms)
+  const accountTypes = scopeList(raw.account_types)
+  const accountPlanTypes = scopeList(raw.account_plan_types)
+  const accountIds = scopeList(raw.account_ids)
+  // Absent key: a plan-only save from 1.3.158 still narrows. An explicit
+  // empty list is the operator clearing the filter, so it does not migrate.
+  const accountPlatformPlans = Object.hasOwn(raw, 'account_platform_plans')
+    ? scopePairs(raw.account_platform_plans)
+    : pairsFromLegacyPlans(accountPlanTypes)
   const patterns = []
   const seen = new Set(HARD_POLICY_RULES.map((rule) => rule.source))
   for (const item of Array.isArray(raw.patterns) ? raw.patterns : []) {
@@ -386,6 +694,10 @@ export function normalizeJevConfig(raw) {
     enabled: raw.enabled === true,
     hard_regex_enabled: raw.hard_regex_enabled !== false,
     openai_platform_enabled: raw.openai_platform_enabled === true,
+    account_types: accountTypes,
+    account_plan_types: accountPlanTypes,
+    account_platform_plans: accountPlatformPlans,
+    account_ids: accountIds,
     provider: providerOf(raw.provider).id,
     base_url: String(raw.base_url || '')
       .trim()
@@ -420,6 +732,10 @@ export function publicJevConfig(cfg) {
     enabled: c.enabled,
     hard_regex_enabled: c.hard_regex_enabled,
     openai_platform_enabled: c.openai_platform_enabled,
+    account_types: [...c.account_types],
+    account_plan_types: [...c.account_plan_types],
+    account_platform_plans: [...c.account_platform_plans],
+    account_ids: [...c.account_ids],
     provider: c.provider,
     providers: POLICY_PROVIDERS.map((item) => ({ ...item })),
     base_url: c.base_url,
@@ -456,8 +772,14 @@ export function publicJevConfig(cfg) {
       expand_base64: true,
       strip_reminders: true,
       openai_platform_enabled: false,
+      account_types: [],
+      account_plan_types: [],
+      account_platform_plans: [],
+      account_ids: [],
       timeout_ms: TIMEOUT_DEFAULT,
     },
+    account_type_options: JEV_ACCOUNT_TYPES.map((item) => ({ ...item })),
+    account_plan_type_options: JEV_PLAN_TYPES.map((item) => ({ ...item })),
     categories: [...JEV_CATEGORIES, 'custom'],
     builtin_patterns: HARD_POLICY_RULES.map((rule) => rule.source),
     builtin_rules: builtinHardRules(),
@@ -546,6 +868,15 @@ export function validateJevPatch(body = {}) {
   }
   for (const key of ['block_if_below', 'fail_open', 'expand_base64', 'strip_reminders', 'openai_platform_enabled']) {
     if (Object.hasOwn(body, key) && typeof body[key] !== 'boolean') problems.push(`${key} 必须是布尔`)
+  }
+  for (const key of ['account_types', 'account_plan_types', 'account_platform_plans', 'account_ids']) {
+    if (!Object.hasOwn(body, key)) continue
+    const list = body[key]
+    if (!Array.isArray(list)) problems.push(`${key} 必须是字符串数组`)
+    else if (list.length > SCOPE_LIST_MAX) problems.push(`${key} 最多 ${SCOPE_LIST_MAX} 项`)
+    else if (list.some((item) => typeof item !== 'string' || !item.trim())) {
+      problems.push(`${key} 只能是非空字符串`)
+    }
   }
   if (Object.hasOwn(body, 'safety_instruction') && typeof body.safety_instruction !== 'string') {
     problems.push('safety_instruction 必须是字符串')
@@ -657,9 +988,9 @@ export function matchHardPolicy(text, extra = [], rules = null) {
   return null
 }
 
-/** Hard regex sees user turns only. Quoted or official system text is not scanned. */
+/** Hard regex sees user-authored turns only. Tool results and official system text are not scanned. */
 export function jevDocument(inbound, body = inbound) {
-  return refusalUserDocument(inbound, body)
+  return refusalUserDocument(inbound, body, { includeToolResults: false })
 }
 
 /** Jev also sees the client system. Roleplay tasks put the sexual text there and leave the user turn as a character card. */

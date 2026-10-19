@@ -4,11 +4,13 @@ import type { Vm } from '@/types/panel-vm'
 import { toast } from 'sonner'
 import { api } from '@/lib/api'
 import { fmtUsd } from '@/lib/format'
+import { formatWindowSpend } from '@/lib/vm-usage'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/confirm-dialog'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { Meter, ResetAt } from '@/features/vm/detail-section-primitives'
 import { vmQueryOptions } from '@/features/vm/queries'
+import { useVmPerms } from '@/features/vm/vm-perms'
 
 type QuotaPayload = {
   reset_credits?: {
@@ -36,6 +38,7 @@ export function OpenaiQuotaPanel({
 }) {
   const qc = useQueryClient()
   const [confirm, setConfirm] = useState(false)
+  const canUse = useVmPerms().credential
   const credits = vm.reset_credits
   const available = Math.max(0, Number(credits?.available_count) || 0)
   const expiry = credits?.credits?.[0]?.expires_at
@@ -91,7 +94,7 @@ export function OpenaiQuotaPanel({
       <Meter
         label='5 小时已用'
         value={u5}
-        hint={quotaHint(vm.status_5h, cost5)}
+        hint={quotaHint(vm.status_5h, cost5, vm.estimate_5h)}
       />
       <div className='text-[11px] text-muted-foreground'>
         5h 重置 <ResetAt value={vm.reset_5h} now={now} />
@@ -99,31 +102,33 @@ export function OpenaiQuotaPanel({
       <Meter
         label='7 天已用'
         value={u7}
-        hint={quotaHint(vm.status_7d, cost7)}
+        hint={quotaHint(vm.status_7d, cost7, vm.estimate_7d)}
       />
       <div className='text-[11px] text-muted-foreground'>
         7d 重置 <ResetAt value={vm.reset_7d} now={now} />
       </div>
-      <div className='flex flex-wrap items-center gap-2'>
-        <Button
-          size='sm'
-          variant='outline'
-          disabled={busy}
-          onClick={() => queryQuota.mutate()}
-        >
-          {queryQuota.isPending
-            ? '查询中…'
-            : `查询重置券${credits ? ` ${available}` : ''}`}
-        </Button>
-        <Button
-          size='sm'
-          variant='destructive'
-          disabled={busy || available < 1}
-          onClick={() => setConfirm(true)}
-        >
-          {resetQuota.isPending ? '使用中…' : '使用重置券'}
-        </Button>
-      </div>
+      {canUse ? (
+        <div className='flex flex-wrap items-center gap-2'>
+          <Button
+            size='sm'
+            variant='outline'
+            disabled={busy}
+            onClick={() => queryQuota.mutate()}
+          >
+            {queryQuota.isPending
+              ? '查询中…'
+              : `查询重置券${credits ? ` ${available}` : ''}`}
+          </Button>
+          <Button
+            size='sm'
+            variant='destructive'
+            disabled={busy || available < 1}
+            onClick={() => setConfirm(true)}
+          >
+            {resetQuota.isPending ? '使用中…' : '使用重置券'}
+          </Button>
+        </div>
+      ) : null}
       {expiry ? (
         <p className='m-0 text-[11px] text-muted-foreground'>
           最近一张到期 <ResetAt value={expiry} now={now} />
@@ -143,10 +148,17 @@ export function OpenaiQuotaPanel({
   )
 }
 
-function quotaHint(status: unknown, cost: number): string {
+function quotaHint(
+  status: unknown,
+  cost: number,
+  est: Vm['estimate_5h']
+): string {
   const bits: string[] = []
   const text = String(status || '').trim()
   if (text) bits.push(text)
-  bits.push(`合计 ${fmtUsd(cost, 2)}`)
+  const spend = formatWindowSpend(cost, est)
+  if (spend.costText) bits.push(spend.costText)
+  if (spend.remainText) bits.push(spend.remainText)
+  if (!spend.costText) bits.push(`合计 ${fmtUsd(cost, 2)}`)
   return bits.join(' · ')
 }

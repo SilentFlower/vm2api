@@ -16,7 +16,7 @@
  */
 
 export const PERSONA_PRESETS = Object.freeze(['official', 'official_full', 'zero', 'custom'])
-export const DEFAULT_PERSONA_PRESET = 'official'
+export const DEFAULT_PERSONA_PRESET = 'official_full'
 export const OVERLAY_PRESETS = Object.freeze(['off', 'official', 'minimal', 'custom'])
 export const DEFAULT_OVERLAY_PRESET = 'off'
 
@@ -85,23 +85,23 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
       text: '{{identity}}',
     }),
     Object.freeze({
-      id: 'caller_agent',
-      note: '常驻约束 + 调用方 agent prompt，都空则整块丢弃。2.1.263 起 1h global',
+      id: 'agent',
+      note: '常驻约束 + 调用方官方提示词。空则丢弃。1h 断点在本块，排在会变的第5段之前。',
       drop_if_empty: true,
       type: 'text',
       text: '{{agent_standing}}{{caller_agent}}',
-      cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h', scope: 'global' }),
+      cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h' }),
     }),
     Object.freeze({
       id: 'env',
-      note: '槽位 Environment（时区），按档开关，排在 agent 之后不破 global 缓存',
+      note: '槽位 Environment（时区），按档开关，排在 agent 之后不破 1h 前缀缓存',
       drop_if_empty: true,
       type: 'text',
       text: '{{env}}',
     }),
     Object.freeze({
       id: 'caller_system',
-      note: '调用方 --append-system-prompt 剩余 system，原文追加不清洗',
+      note: '第5段可选。只放顶层 system。role=system 留在消息列表。空则丢弃',
       drop_if_empty: true,
       type: 'text',
       text: '{{caller_system}}',
@@ -122,10 +122,10 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
     }),
     Object.freeze({
       id: 'agent_official',
-      note: '常驻约束为第一段 + 官方 Claude Code 基础提示词全文。2.1.263 起 1h global 缓存',
+      note: '常驻约束为第一段 + 官方 Claude Code 基础提示词全文。2.1.263 起 1h 缓存',
       type: 'text',
       text: '{{agent_standing}}{{agent_official}}',
-      cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h', scope: 'global' }),
+      cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h' }),
     }),
     Object.freeze({
       id: 'env_official',
@@ -159,7 +159,7 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
       id: 'agent_slot',
       hide: true,
       type: 'text',
-      text: '{{agent_standing}}{{caller_agent}}',
+      text: '{{agent_standing}}',
       cache_control: Object.freeze({ type: 'ephemeral', ttl: '1h' }),
     }),
     Object.freeze({
@@ -171,6 +171,7 @@ export const DEFAULT_PERSONA_TEMPLATES = Object.freeze({
     }),
     Object.freeze({
       id: 'caller_system',
+      note: '第5段可选。调用方 system 都写这里，空则丢弃',
       drop_if_empty: true,
       type: 'text',
       text: '{{caller_system}}',
@@ -390,7 +391,12 @@ export function renderPersonaTemplate(blocks, vars = {}) {
     if (!block || typeof block !== 'object') continue
     const text = renderText(block.text, vars)
     const blank = !text.trim()
-    if (block.drop_if_empty && blank) continue
+    const emptyEnvironment =
+      blank &&
+      extractTemplateVars(block.text).some((name) =>
+        ['env', 'env_official', 'env_timezone_only', 'timezone'].includes(name),
+      )
+    if (blank && (block.drop_if_empty || emptyEnvironment)) continue
     const next = { type: 'text', text: blank ? EMPTY_BLOCK_TEXT : text }
     if (block.cache_control && typeof block.cache_control === 'object') {
       next.cache_control = { ...block.cache_control }

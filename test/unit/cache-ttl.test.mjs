@@ -6,6 +6,8 @@ import {
   clearConversationCacheTtls,
   DEFAULT_CACHE_TTL,
   enforceCacheTtlOrder,
+  fillMissingCacheTtl,
+  validateCacheBreakpoints,
   normalizeCacheTtl,
   pinConversationCacheTtl,
   resolveCacheTtl,
@@ -41,6 +43,41 @@ test('ttl-less markers (official Claude Code) take the settings menu value', () 
   const out = applyCacheTtlToBody(body, '1h')
   assert.deepEqual(out.system[0].cache_control, { type: 'ephemeral', ttl: '1h' })
   assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '1h' })
+})
+
+test('owned TTL completion preserves explicit mixed TTLs and scope without mutating input', () => {
+  const input = {
+    system: [
+      { type: 'text', text: 'hour', cache_control: { type: 'ephemeral', ttl: '1h', scope: 'global' } },
+      { type: 'text', text: 'missing', cache_control: { type: 'ephemeral', scope: 'org' } },
+    ],
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'short', cache_control: { type: 'ephemeral', ttl: '5m' } }] },
+    ],
+  }
+  const before = structuredClone(input)
+  const output = fillMissingCacheTtl(input, '5m')
+  assert.deepEqual(
+    output.system.map((block) => block.cache_control),
+    [
+      { type: 'ephemeral', ttl: '1h', scope: 'global' },
+      { type: 'ephemeral', ttl: '5m', scope: 'org' },
+    ],
+  )
+  assert.deepEqual(output.messages, input.messages)
+  assert.deepEqual(input, before)
+})
+
+test('native validation counts automatic caching against the explicit marker budget', () => {
+  const input = {
+    system: Array.from({ length: 4 }, (_, index) => ({
+      type: 'text',
+      text: String(index),
+      cache_control: { type: 'ephemeral', ttl: '1h' },
+    })),
+    cache_control: { type: 'ephemeral' },
+  }
+  assert.throws(() => validateCacheBreakpoints(input), /four breakpoints/)
 })
 
 test('a conversation keeps its first TTL until that cache would have expired', () => {
@@ -201,11 +238,11 @@ test('stripIllegalCacheControlFields drops ephemeral.scope', () => {
   assert.deepEqual(out.messages[0].content[0].cache_control, { type: 'ephemeral', ttl: '5m' })
 })
 
-test('unclassified cache_creation without ttl bills the default 1h rate', () => {
+test('unclassified cache_creation without ttl bills the 5m rate', () => {
   const asDefault = calculateCost({ cache_creation_tokens: 1_000_000 }, 'claude-sonnet-5')
   const as5m = calculateCost({ cache_creation_tokens: 1_000_000, cache_ttl: '5m' }, 'claude-sonnet-5')
   const as1h = calculateCost({ cache_creation_tokens: 1_000_000, cache_ttl: '1h' }, 'claude-sonnet-5')
-  assert.equal(asDefault.cache_creation_cost, 4)
+  assert.equal(asDefault.cache_creation_cost, 2.5)
   assert.equal(as5m.cache_creation_cost, 2.5)
   assert.equal(as1h.cache_creation_cost, 4)
   assert.equal(as1h.total_cost - as5m.total_cost, 1.5)

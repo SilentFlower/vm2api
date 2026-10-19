@@ -28,7 +28,7 @@ import {
   isCompleteAssistantMessage,
   isWrapConnectionError,
 } from '../core/errors.mjs'
-import { extraHeadersFromLimitError, isPlanLimitMessage } from '../pool/quota-window.mjs'
+import { extraHeadersFromLimitError } from '../pool/quota-window.mjs'
 
 const MAX_BODY = 64 * 1024 * 1024
 const credentialRefreshTail = new Map()
@@ -268,6 +268,54 @@ export function isDownstreamCommitEvent(event) {
   return t.startsWith('response.output_')
 }
 
+/**
+ * Timing starts at generated content, independently of downstream commitment.
+ * A generated tool name is first output: name-only tools often never send a
+ * parameter delta. Omitted thinking reports generated tokens without text.
+ * Connection metadata, empty blocks, and trailers are not TTFT.
+ * Shared Claude/Codex kernel stream path only; API transport still stamps the
+ * first `data:` line in api-protocol.mjs.
+ */
+function hasGeneratedContent(block) {
+  if (!block || typeof block !== 'object') return false
+  const nonempty = (value) => typeof value === 'string' && value.length > 0
+  if ([block.text, block.thinking, block.refusal].some(nonempty)) return true
+  if (block.type === 'redacted_thinking') return nonempty(block.data)
+  return (
+    (block.type === 'function_call' ||
+      block.type === 'custom_tool_call' ||
+      String(block.type || '').endsWith('tool_use')) &&
+    (nonempty(block.name) || nonempty(block.arguments) || nonempty(block.input))
+  )
+}
+
+function isFirstTokenEvent(event) {
+  if (!event || typeof event !== 'object') return false
+  const type = String(event.type || '')
+  if (type === 'content_block_delta') {
+    const delta = event.delta || {}
+    return (
+      [delta.text, delta.thinking, delta.partial_json, delta.refusal].some(
+        (value) => typeof value === 'string' && value.length > 0,
+      ) ||
+      (delta.type === 'thinking_delta' && Number.isFinite(delta.estimated_tokens) && delta.estimated_tokens > 0)
+    )
+  }
+  if (type === 'content_block_start') return hasGeneratedContent(event.content_block)
+  if (type.startsWith('response.') && type.endsWith('.delta')) {
+    return typeof event.delta === 'string' && event.delta.length > 0
+  }
+  if (type === 'response.content_part.added' || type === 'response.content_part.done')
+    return hasGeneratedContent(event.part)
+  if (type === 'response.output_item.added' || type === 'response.output_item.done') {
+    return (
+      hasGeneratedContent(event.item) ||
+      (Array.isArray(event.item?.content) && event.item.content.some(hasGeneratedContent))
+    )
+  }
+  return false
+}
+
 /** Anthropic SSE: message_start.message.usage + message_delta.usage. OpenAI Responses: response.usage. */
 export function usageFromSseEvent(event) {
   if (!event || typeof event !== 'object') return null
@@ -277,32 +325,9 @@ export function usageFromSseEvent(event) {
   return null
 }
 
-const AUTH_ERROR_TEXT =
-  /authentication_error|token has been revoked|oauth_revoked|invalid_grant|invalid (?:bearer|x-api-key)|OAuth token has expired/i
-// cli-hop can flatten an organization permission denial into generic api_error.
-// Preserve the denial instead of replacing it with an empty-hop error.
-const PERMISSION_ERROR_TEXT = /organization does not have access to claude/i
+import { semanticStatusForStreamError } from '../protocol/stream-error-status.mjs'
 
-/**
- * The kernel cli-hop answers 200 and then streams `event: error` (sub2api
- * sseStreamErrorEventError). Before any downstream byte, restore the HTTP
- * status the upstream meant so the pool classifies it like a real response.
- */
-export function semanticStatusForStreamError(errorBody) {
-  const type = String(errorBody?.error?.type || errorBody?.type || '')
-  const message = String(errorBody?.error?.message || errorBody?.message || '')
-  if (isPlanLimitMessage(message)) return 429
-  // The kernel names the status the job failed with; older kernels did not.
-  // Codex Responses Lite error events put it on the outer object (`{type,status,error}`).
-  const explicit = Number(errorBody?.error?.status ?? errorBody?.status)
-  if (explicit >= 400 && explicit < 600) return explicit
-  if (type === 'rate_limit_error') return 429
-  if (type === 'overloaded_error') return 529
-  if (type === 'authentication_error' || AUTH_ERROR_TEXT.test(message)) return 401
-  if (type === 'permission_error' || PERMISSION_ERROR_TEXT.test(message)) return 403
-  if (type === 'invalid_request_error') return 400
-  return 502
-}
+export { semanticStatusForStreamError } from '../protocol/stream-error-status.mjs'
 
 /**
  * Kernel `map_kernel` folds every provider failure into 502 `provider_error`.
@@ -404,7 +429,7 @@ function dumpSessionEnvelope(envelope) {
  * body on the VM's HTTP betas would lift every role=system turn into system[],
  * so system grows each turn and no cached prefix is ever read.
  */
-export function finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m = false, cliHop = false }) {
+export function finalizeWorkerPayload({ body, reqHeaders, exec, identity, routing, want1m = false, cliHop = false }) {
   const model = body?.model || ''
   const credMode = credentialModeFromOauth(exec?.vm?.claude || {})
   const headers = prepareOutboundHeaders(reqHeaders, exec?.homeDir, identity, model, {
@@ -416,7 +441,10 @@ export function finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m
   // Envelope headers are discarded; the existing MessageRequest.betas channel
   // carries request gates to the native CLI, which builds the actual HTTP wire.
   const gated = cliHop ? { ...body, betas } : sanitizeAnthropicBodyForBetaTokens(body, headers['anthropic-beta'])
-  return { headers, body: sealClaudeCodeCch(gated) }
+  return {
+    headers,
+    body: sealClaudeCodeCch(gated, { enabled: routing?.compatibility?.cch_enabled !== false, seal: !cliHop }),
+  }
 }
 
 function workerEnvelope({
@@ -425,6 +453,7 @@ function workerEnvelope({
   reqHeaders,
   exec,
   identity,
+  routing,
   stream,
   deliveryMode,
   want1m = false,
@@ -432,7 +461,7 @@ function workerEnvelope({
   preserveCacheBreakpoints = null,
   cliHop = false,
 } = {}) {
-  const finalized = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m, cliHop })
+  const finalized = finalizeWorkerPayload({ body, reqHeaders, exec, identity, routing, want1m, cliHop })
   const envelope = {
     ...(requestContext ? { request_context: requestContext } : {}),
     body: finalized.body,
@@ -462,6 +491,7 @@ export async function callGoWorker({
   reqHeaders = {},
   timeoutMs,
   identity = null,
+  routing,
   signal,
   want1m = false,
   cacheTtl = null,
@@ -471,7 +501,15 @@ export async function callGoWorker({
   cliHop = false,
 } = {}) {
   if (isCrsMock()) {
-    const { body: outboundBody, headers } = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m, cliHop })
+    const { body: outboundBody, headers } = finalizeWorkerPayload({
+      body,
+      reqHeaders,
+      exec,
+      identity,
+      routing,
+      want1m,
+      cliHop,
+    })
     writeCrsTrace({ body: outboundBody, headers, stream: false })
     const mock = mockCrsPayload({ scenario: mockScenario(exec) })
     return {
@@ -496,6 +534,7 @@ export async function callGoWorker({
             reqHeaders,
             exec,
             identity,
+            routing,
             stream: false,
             want1m,
             cacheTtl,
@@ -553,6 +592,7 @@ export async function streamGoWorker({
   timeoutMs,
   idleTimeoutMs = 0,
   identity = null,
+  routing,
   signal,
   deliveryMode = 'realtime',
   onEvent,
@@ -565,7 +605,15 @@ export async function streamGoWorker({
   cliHop = false,
 } = {}) {
   if (isCrsMock()) {
-    const { body: outboundBody, headers } = finalizeWorkerPayload({ body, reqHeaders, exec, identity, want1m, cliHop })
+    const { body: outboundBody, headers } = finalizeWorkerPayload({
+      body,
+      reqHeaders,
+      exec,
+      identity,
+      routing,
+      want1m,
+      cliHop,
+    })
     writeCrsTrace({ body: outboundBody, headers, stream: true })
     const scenario = mockScenario(exec)
     const mockStartedAt = Date.now()
@@ -615,7 +663,10 @@ export async function streamGoWorker({
     let mockTtftMs = null
     await emitMockSse(async (line) => {
       if (line.startsWith('data:')) {
-        if (mockTtftMs == null) mockTtftMs = Date.now() - mockStartedAt
+        try {
+          if (mockTtftMs == null && isFirstTokenEvent(JSON.parse(line.slice(5))))
+            mockTtftMs = Date.now() - mockStartedAt
+        } catch {}
         if (typeof onCommit === 'function') onCommit()
       }
       if (onEvent) await onEvent(line)
@@ -629,9 +680,11 @@ export async function streamGoWorker({
       model: payload.body?.model || null,
       stopReason: payload.body?.stop_reason || null,
       ttftMs: mockTtftMs,
+      firstTokenAt: mockTtftMs == null ? null : mockStartedAt + mockTtftMs,
     }
   }
   let committed = false
+  // Hop-relative TTFT. firstTokenAt is epoch ms so request logs subtract ingress t0.
   const startedAt = Date.now()
   let ttftMs = null
   const requestId = randomUUID()
@@ -647,6 +700,7 @@ export async function streamGoWorker({
             reqHeaders,
             exec,
             identity,
+            routing,
             stream: true,
             deliveryMode,
             want1m,
@@ -712,6 +766,7 @@ export async function streamGoWorker({
     }
     const observeSseEvent = (event) => {
       if (!event) return event
+      if (ttftMs == null && isFirstTokenEvent(event)) ttftMs = Date.now() - startedAt
       if (event.type === 'response_headers' && event.headers && typeof event.headers === 'object') {
         sseRateHeaders = { ...sseRateHeaders, ...event.headers }
       }
@@ -762,7 +817,6 @@ export async function streamGoWorker({
               const event = observeSseEvent(takeSseEvent())
               if (isDownstreamCommitEvent(event)) await flushCommit()
             }
-            if (ttftMs == null) ttftMs = Date.now() - startedAt
           } else if (line === '') {
             if (dataBuf) {
               const event = takeSseEvent()
@@ -808,6 +862,7 @@ export async function streamGoWorker({
         stopReason,
         sawMessageStop,
         ttftMs,
+        firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
         committed,
         terminalState,
         transportError: false,
@@ -820,6 +875,7 @@ export async function streamGoWorker({
       return clientCancelledResult({
         via: 'go-worker-stream',
         ttftMs,
+        firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
         committed,
       })
     }
@@ -837,6 +893,7 @@ export async function streamGoWorker({
       },
       headers: {},
       ttftMs,
+      firstTokenAt: ttftMs == null ? null : startedAt + ttftMs,
       committed,
       terminalState: committed ? 'incomplete' : 'transport_error',
       transportError: true,

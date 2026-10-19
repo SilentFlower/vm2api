@@ -11,9 +11,8 @@ import {
   CRS_OFFICIAL_SYSTEM,
   CRS_AGENT_EXPANSION,
   AGENT_EXPANSION_CACHE_CONTROL,
-  DEFAULT_CLI_VERSION,
 } from '../../src/lib/identity/crs-persona.mjs'
-import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../../src/lib/identity/vm-identity.mjs'
+import { loadVmIdentity, OFFICIAL_CLI_VERSION, OFFICIAL_CLAUDE_CLI_UA } from '../../src/lib/identity/vm-identity.mjs'
 import { prepareOutboundEnvelope } from '../../src/lib/protocol/outbound-attempt.mjs'
 
 test('unofficial outbound envelope matches official 2.1.281 capture keys', () => {
@@ -92,12 +91,12 @@ test('unofficial outbound envelope matches official 2.1.281 capture keys', () =>
   assert.equal(body.output_config.effort, 'high')
   assert.equal(body.context_management.edits[0].type, 'clear_thinking_20251015')
   assert.equal(body.system.length, 4)
-  assert.match(body.system[0].text, /cc_entrypoint=sdk-cli;/)
-  assert.match(body.system[0].text, /cch=/)
-  assert.match(body.system[0].text, /cc_prompt_id=/)
-  assert.equal(body.system[1].text, CRS_OFFICIAL_SYSTEM)
-  assert.equal(body.system[2].text, CRS_AGENT_EXPANSION)
-  assert.deepEqual(body.system[2].cache_control, AGENT_EXPANSION_CACHE_CONTROL)
+  assert.equal(body.system[0].text, CRS_OFFICIAL_SYSTEM)
+  assert.equal(body.system[1].text, CRS_AGENT_EXPANSION)
+  assert.deepEqual(body.system[1].cache_control, AGENT_EXPANSION_CACHE_CONTROL)
+  assert.match(body.system[2].text, /cc_entrypoint=sdk-cli;/)
+  assert.match(body.system[2].text, /cch=/)
+  assert.match(body.system[2].text, /cc_prompt_id=/)
   assert.match(body.system[3].text, /# Environment/)
   assert.ok(!body.system[3].text.includes('Linux 7.0.0-14-generic'))
   assert.match(body.system[3].text, /Timezone: America\/Los_Angeles/)
@@ -146,9 +145,7 @@ const CAPTURE_281_FIRST_USER = (() => {
   return buf.toString('utf8')
 })()
 
-test('outbound headers align with Claude Code 2.1.293 and keep the 2.1.281 fingerprint vector', () => {
-  assert.equal(OFFICIAL_CLI_VERSION, '2.1.293')
-  assert.equal(DEFAULT_CLI_VERSION, '2.1.293')
+test('outbound headers use the official CLI pin and keep the 2.1.281 fingerprint vector', () => {
   assert.equal(computeClaudeCodeFingerprint(CAPTURE_281_FIRST_USER, '2.1.281'), '6f0')
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-281-'))
   const identity = loadVmIdentity({
@@ -181,7 +178,7 @@ test('outbound headers align with Claude Code 2.1.293 and keep the 2.1.281 finge
     firstUserText: CAPTURE_281_FIRST_USER,
   })
   const { headers, body } = envelope
-  assert.equal(headers['user-agent'], 'claude-cli/2.1.293 (external, sdk-cli)')
+  assert.equal(headers['user-agent'], OFFICIAL_CLAUDE_CLI_UA)
   assert.equal(headers['anthropic-version'], '2023-06-01')
   assert.equal(headers['x-app'], 'cli')
   assert.equal(headers['anthropic-dangerous-direct-browser-access'], 'true')
@@ -193,10 +190,12 @@ test('outbound headers align with Claude Code 2.1.293 and keep the 2.1.281 finge
   assert.equal(headers['x-stainless-retry-count'], '0')
   assert.equal(headers['x-stainless-timeout'], '600')
   assert.match(
-    body.system[0].text,
-    new RegExp(`cc_version=2\\.1\\.293\\.${computeClaudeCodeFingerprint(CAPTURE_281_FIRST_USER, '2.1.293')}`),
+    body.system[2].text,
+    new RegExp(
+      `cc_version=${OFFICIAL_CLI_VERSION.replaceAll('.', '\\.')}\\.${computeClaudeCodeFingerprint(CAPTURE_281_FIRST_USER, OFFICIAL_CLI_VERSION)}`,
+    ),
   )
-  assert.match(body.system[0].text, /cc_prompt_index=0; cc_turn_index=1;/)
+  assert.match(body.system[2].text, /cc_prompt_index=0; cc_turn_index=1;/)
   const uid = JSON.parse(body.metadata.user_id)
   assert.equal(headers['x-claude-code-session-id'], uid.session_id)
   fs.rmSync(dir, { recursive: true, force: true })

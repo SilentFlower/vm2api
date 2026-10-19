@@ -22,8 +22,9 @@ import {
   reloadSlotWorker,
 } from './vm-runtime.mjs'
 import { inspectWrapCliDir, materializeWrapCli, wrapCliHomeDir } from './wrap-cli-runtime.mjs'
-import { boundProxyUrl, isLocalEgressProxy } from './egress.mjs'
-import { slotHost } from './slot-host.mjs'
+import { isLocalEgressProxy } from './egress.mjs'
+import { vmNodeId } from '../cluster/placement.mjs'
+import { hostProxyUrlForVm, slotHost } from './slot-host.mjs'
 
 export { runtimeKind }
 
@@ -35,16 +36,28 @@ export function startSlot(vm, projectRoot, opts = {}) {
   return slotHost(vm).start(vm, projectRoot, opts)
 }
 
+/**
+ * A node slot's sockets are relay paths that the local vms/<id>/run fallback cannot
+ * rebuild, so the record must carry them. Callers that only patch status after
+ * start (create, import, recreate) would otherwise leave runtime as {type}.
+ */
+function persistNodeRuntime(vm, projectRoot, boot) {
+  if (vmNodeId(vm) && boot?.runtime) persistVmRuntime(projectRoot, vm.id, boot.runtime)
+}
+
 export async function startSlotReady(vm, projectRoot, opts = {}) {
   if (isCodexVm(vm)) {
     if (!slotHost(vm).supports('codex')) return unsupportedOnHost('codex')
-    const boot = await startSlot(vm, projectRoot, opts)
+    const boot = await (opts.ops?.startSlot || startSlot)(vm, projectRoot, opts)
+    if (!boot?.ok) return boot
+    persistNodeRuntime(vm, projectRoot, boot)
     const kernel = await ensureSlotInferenceRuntime(vm, projectRoot, opts)
     if (!kernel.ok) return kernel
     return { ok: true, engine: 'codex', docker: boot, kernel }
   }
   const boot = await startSlot(vm, projectRoot, opts)
   if (!boot?.ok) return boot
+  persistNodeRuntime(vm, projectRoot, boot)
   return attachInferenceRuntime(boot, vm, projectRoot, opts)
 }
 
@@ -99,9 +112,14 @@ export async function ensureSlotInferenceRuntime(vm, projectRoot, opts = {}) {
     const write = opts.ops?.writeCodexKernelConfig || writeCodexKernelConfig
     const start = opts.ops?.ensureCodexKernel || ensureCodexKernel
     const localExit = isLocalEgressProxy(vm?.proxy)
+    // Local egress on this host is the deployment proxy (empty URL). A node
+    // slot's local egress is the node's own route, reached through the
+    // control-plane forwarder; an empty URL would leave from here instead.
+    const proxyUrl = localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm)
     write(projectRoot, vm, {
-      proxyUrl: localExit ? '' : boundProxyUrl(vm?.proxy),
-      proxyRequired: !localExit,
+      proxyUrl,
+      proxyRequired: !localExit || !!proxyUrl,
+      routing,
     })
     const kernel = await start(slotExec(projectRoot, vm), { timeoutMs: opts.timeoutMs })
     if (!kernel?.ok) {
@@ -248,7 +266,9 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   const name = containerName(vm.id)
   const existing = inspect(name)
   const needsKernelMount = engine === 'rust' && !!existing && !hasKernelMount(name) && !wrapUsesSlotKernel(wrap)
-  const boot = needsKernelMount ? start(vm, projectRoot, { recreate: true }) : reload(vm, projectRoot)
+  const boot = needsKernelMount
+    ? await start(vm, projectRoot, { recreate: true, routing: ops.routing })
+    : await reload(vm, projectRoot, { routing: ops.routing })
   if (!boot?.ok) {
     return {
       ok: false,
@@ -265,7 +285,7 @@ export async function switchSlotInferenceEngine(vm, projectRoot, engine, { timeo
   const rust = await startRust(exec, { timeoutMs })
   if (!rust?.ok) {
     const code = rust?.reason === 'health_timeout' ? 'kernel_health_timeout' : 'kernel_start_failed'
-    const rollback = reload(vm, projectRoot)
+    const rollback = await reload(vm, projectRoot, { routing: ops.routing })
     return {
       ok: false,
       code,

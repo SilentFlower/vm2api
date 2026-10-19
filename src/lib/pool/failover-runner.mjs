@@ -5,6 +5,7 @@ import {
   shouldContinue,
 } from './upstream-error-policy.mjs'
 import { listQuotaFromHeaders } from './quota-window.mjs'
+import { flattenSearchResultHistory, searchHistoryFingerprint } from '../protocol/request-rectifier.mjs'
 import {
   CLIENT_POOL_BUSY_MESSAGE,
   CLIENT_POOL_RATE_LIMITED_MESSAGE,
@@ -23,11 +24,17 @@ import { SOFT_COOLDOWN_REASONS } from './pool-scheduler.mjs'
 
 // Seat wait for the one-shot repair hop when the rejected hop already spent the deadline.
 const REPAIR_HOP_WAIT_MS = 30_000
+const SEARCH_REPAIR_IDLE_MS = 60 * 60 * 1000
+const SEARCH_REPAIR_LIMIT = 512
 
 const DEFAULTS = {
   max_account_switches: 10,
   max_total_attempts: 12,
   total_retry_deadline_ms: 120000,
+  // Same-session serialization waits out the previous turn. Cap a wedged tail
+  // so the queue cannot sit forever. 0 disables the cap. Long enough that a
+  // normal generation still runs serially; keepalive covers the Cloudflare wait.
+  session_queue_timeout_ms: 900_000,
   delivery_mode: 'realtime',
   max_same_account_retries: 1,
   same_account_retry_delay_ms: 500,
@@ -37,6 +44,11 @@ const DEFAULTS = {
 
 function clone(value) {
   return structuredClone(value)
+}
+
+function searchRepairKey(stickyKey, model, selected) {
+  if (!stickyKey || !selected?.accountId || !selected?.vmId) return null
+  return JSON.stringify([stickyKey, selected.accountId, selected.vmId, model, credentialStamp(selected)])
 }
 
 function usageOf(result) {
@@ -194,9 +206,8 @@ function priorAuth401Stamp(selected) {
   return selected?.vm?.claude?.oauth_401_generation ?? selected?.state?.worker_status?.oauth_401_generation ?? null
 }
 
-function signatureRepairEnabled(config, selected) {
-  if (config.signature_repair === true) return true
-  return resolveOfficialCcInference(selected?.vm) === 'cli-hop'
+function signatureRepairEnabled(config) {
+  return config.signature_repair === true
 }
 
 function selectedUsage(selected, accountQuota = null) {
@@ -259,23 +270,36 @@ function sleepWithSignal(ms, signal) {
   })
 }
 
-function waitForSessionTurn(previous, signal) {
-  if (!signal) return previous.catch(() => {})
-  if (signal.aborted)
+function waitForSessionTurn(previous, signal, timeoutMs) {
+  const timeout = Number(timeoutMs)
+  const bounded = Number.isFinite(timeout) && timeout > 0
+  if (signal?.aborted) {
     return Promise.reject(Object.assign(new Error('Request was cancelled'), { code: 'request_cancelled' }))
+  }
+  if (!signal && !bounded) return previous.catch(() => {})
   return new Promise((resolve, reject) => {
-    const onAbort = () => {
-      cleanup()
-      reject(Object.assign(new Error('Request was cancelled'), { code: 'request_cancelled' }))
+    let settled = false
+    let timer = null
+    const finish = (fn, value) => {
+      if (settled) return
+      settled = true
+      signal?.removeEventListener?.('abort', onAbort)
+      if (timer) clearTimeout(timer)
+      fn(value)
     }
-    const cleanup = () => signal.removeEventListener?.('abort', onAbort)
-    signal.addEventListener?.('abort', onAbort, { once: true })
-    previous
-      .catch(() => {})
-      .then(() => {
-        cleanup()
-        resolve()
-      })
+    const onAbort = () => {
+      finish(reject, Object.assign(new Error('Request was cancelled'), { code: 'request_cancelled' }))
+    }
+    const onTimeout = () => {
+      finish(reject, Object.assign(new Error('Session queue timed out'), { code: 'session_queue_timeout' }))
+    }
+    if (signal) signal.addEventListener('abort', onAbort, { once: true })
+    if (bounded) {
+      // Keep the timer referenced. An unref'd wait looks idle to the process,
+      // and the queued request is still in flight until it times out or runs.
+      timer = setTimeout(onTimeout, timeout)
+    }
+    previous.catch(() => {}).then(() => finish(resolve))
   })
 }
 
@@ -380,7 +404,11 @@ function selectionFailure(selected, { excluded, lastPolicy, lastResult, hops }) 
   if (CAPACITY_SELECTION_REASONS.has(reason)) return poolOverloadedError(details)
   if (reason === 'pool_rate_limited') return poolRateLimitedError(details)
   if (reason === 'quota_guard_request_too_large') return quotaGuardTooLargeError(details)
-  return poolError('account_pool_exhausted', 'No eligible Claude accounts remain', details)
+  const failed = poolError('account_pool_exhausted', 'No eligible Claude accounts remain', details)
+  // An all-rest pool knows when the first working window opens.
+  const retryMs = Number(details.retry_after_ms)
+  if (retryMs > 0) failed.retryAfterSec = Math.max(1, Math.ceil(retryMs / 1000))
+  return failed
 }
 
 function applyCooldown(scheduler, selected, policy, model, { diagnosticPin = false } = {}) {
@@ -432,6 +460,7 @@ export class FailoverRunner {
     this.onFablePlanDenied = onFablePlanDenied
     this.onFableSuccess = onFableSuccess
     this.sessionTails = new Map()
+    this.searchRepairs = new Map()
   }
 
   reloadConfig(config = {}) {
@@ -447,9 +476,9 @@ export class FailoverRunner {
   }
 
   /**
-   * An empty or cancelled hop leaves the outbound session behind: the next
-   * hop on this VM opens a new one. No seat is penalized and no CLI restarts;
-   * planner seat indexes are not kernel native slots.
+   * An empty hop leaves the outbound session behind for a fresh-session retry.
+   * Client cancellation only ends its job; kernel cancel_ack fences slot reuse.
+   * Planner seat indexes are not kernel native slots.
    */
   retireOutboundSession(selected, bindKeys) {
     if (!selected?.vmId) return
@@ -517,14 +546,27 @@ export class FailoverRunner {
     const tail = previous.catch(() => {}).then(() => turn)
     this.sessionTails.set(sessionKey, tail)
     try {
-      await waitForSessionTurn(previous, args.signal)
+      await waitForSessionTurn(previous, args.signal, this.config.session_queue_timeout_ms)
       return await this.runOnce(args)
     } catch (error) {
       if (error?.code === 'request_cancelled') return clientCancelledResult()
+      if (error?.code === 'session_queue_timeout') {
+        const retryMs = Number(this.config.session_queue_timeout_ms)
+        return poolOverloadedError({
+          reason: 'session_queue_timeout',
+          retry_after_ms: Number.isFinite(retryMs) && retryMs > 0 ? retryMs : 1000,
+        })
+      }
       throw error
     } finally {
       releaseTurn()
-      if (this.sessionTails.get(sessionKey) === tail) this.sessionTails.delete(sessionKey)
+      // Drop the chain only after this tail settles. A timeout or cancel
+      // releases our turn early, while the holder is still running; deleting
+      // immediately would let the next request overlap that holder.
+      const drop = () => {
+        if (this.sessionTails.get(sessionKey) === tail) this.sessionTails.delete(sessionKey)
+      }
+      tail.then(drop, drop)
     }
   }
 
@@ -640,6 +682,12 @@ export class FailoverRunner {
     // turn it into the client's error. Bounded: repair is one-shot.
     let repairPending = false
     let requestBody = clone(canonicalBody)
+    let searchRepair = null
+    let searchFingerprint
+    const fingerprint = () => {
+      if (searchFingerprint === undefined) searchFingerprint = searchHistoryFingerprint(canonicalBody)
+      return searchFingerprint
+    }
     // A unit that just failed replayably waits behind every other free seat.
     let avoid = null
 
@@ -735,6 +783,7 @@ export class FailoverRunner {
       }
       repairPending = false
       snapshotPins()
+      const attemptStickyBound = pinBaseline.get(stickyKey) || null
       lastSelected = selected
       pinnedSlot = selected.slotIndex ?? null
       if (selected.seatMoved) seatMovedTo = selected.vmId
@@ -760,15 +809,21 @@ export class FailoverRunner {
         if (executions > 0) budget.noteHop(selected.accountId, selected.vmId, executions)
       }
       try {
+        const repairKey = searchRepairKey(stickyKey, model, selected)
+        const hint = this.searchRepairs.get(repairKey)
+        if (hint && hint.expiresAt <= Date.now()) this.searchRepairs.delete(repairKey)
+        const knownSearchRepair = hint && hint.expiresAt > Date.now() && hint.fingerprint === fingerprint()
+        const attemptBody = knownSearchRepair ? flattenSearchResultHistory(requestBody) : requestBody
         const prepared =
           typeof applyAttempt === 'function'
-            ? await applyAttempt(clone(requestBody), selected, {
+            ? await applyAttempt(clone(attemptBody), selected, {
                 attemptNo,
                 repaired,
                 attemptStartedAt: attemptStarted,
                 freshSlot,
+                stickyBound: attemptStickyBound,
               })
-            : clone(requestBody)
+            : clone(attemptBody)
         const wrappedAttempt =
           prepared &&
           typeof prepared === 'object' &&
@@ -781,7 +836,11 @@ export class FailoverRunner {
           outboundSessionAccountId = selected.accountId
           bindAll(
             { accountId: selected.accountId, vmId: selected.vmId, sessionId: outboundSessionId },
-            { countHit: false },
+            {
+              countHit: false,
+              // Prebinding moved the VM already; replace the previous VM's session.
+              replaceSession: !!attemptStickyBound?.vmId && attemptStickyBound.vmId !== selected.vmId,
+            },
           )
         }
         result = await callAttempt({
@@ -807,7 +866,6 @@ export class FailoverRunner {
             terminalState: 'cancelled',
             latencyMs: Date.now() - attemptStarted,
           })
-          this.retireOutboundSession(selected, bindKeys)
           return { ...clientCancelledResult(result), via: result?.via || 'pool-failover', ...attribution() }
         }
         policy = classifyAttempt(
@@ -817,10 +875,15 @@ export class FailoverRunner {
             model,
             repaired,
             oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config, selected),
+            signatureRepair: signatureRepairEnabled(this.config),
           },
           this.scheduler?.accountQuota,
         )
+        if (knownSearchRepair && policy.reason === 'search_repairable') {
+          // Repeating the identical flatten cannot fix a second rejection.
+          this.searchRepairs.delete(repairKey)
+          policy = { ...policy, action: 'stop' }
+        }
         // One writer for rate_limit_reset_at / overload_until (sub2api HandleUpstreamError).
         const hardBlock =
           !result?.committed && !pinVmId
@@ -870,6 +933,16 @@ export class FailoverRunner {
           }
         }
         if (verifiedSuccess(result)) {
+          if (repairKey && (knownSearchRepair || searchRepair?.key === repairKey)) {
+            this.searchRepairs.delete(repairKey)
+            while (this.searchRepairs.size >= SEARCH_REPAIR_LIMIT) {
+              this.searchRepairs.delete(this.searchRepairs.keys().next().value)
+            }
+            this.searchRepairs.set(repairKey, {
+              fingerprint: fingerprint(),
+              expiresAt: Date.now() + SEARCH_REPAIR_IDLE_MS,
+            })
+          }
           this.scheduler.markSuccess(selected, { workerStatus: result.workerStatus || null, countUsage })
           if (isFableModel(model) && typeof this.onFableSuccess === 'function') {
             try {
@@ -882,6 +955,9 @@ export class FailoverRunner {
         if (policy.action === 'repair-and-retry' && !repaired && !result?.committed) {
           repaired = true
           repairPending = true
+          if (policy.reason === 'search_repairable' && repairKey && fingerprint()) {
+            searchRepair = { key: repairKey }
+          }
           requestBody = repairAnthropicRequest(requestBody, policy)
           continue
         }
@@ -909,7 +985,46 @@ export class FailoverRunner {
         }
         budget.noteSwitch(selected.accountId, selected.vmId, { spill: policy.reason === 'slot_busy' })
       } catch (error) {
-        noteHop(null)
+        const invalidCache = error?.status === 400 && error.body?.error?.code === 'invalid_cache_control'
+        noteHop(invalidCache ? { upstreamExecutions: 0 } : null)
+        if (error?.code === 'response_sent') {
+          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: 403,
+            errorScope: 'request',
+            action: 'stop',
+            downstreamCommitted: true,
+            terminalState: 'policy_block',
+            latencyMs: Date.now() - attemptStarted,
+          })
+          return {
+            ok: false,
+            responseSent: true,
+            status: 403,
+            via: 'account-scope',
+            vmId: selected.vmId,
+            accountId: selected.accountId,
+            attemptCount: attemptNo,
+            finalState: 'policy_block',
+          }
+        }
+        if (invalidCache) {
+          this.attemptsRepo?.complete?.(requestId, attemptNo, {
+            upstreamStatus: 0,
+            errorScope: 'request',
+            action: 'stop',
+            downstreamCommitted: false,
+            terminalState: 'invalid_request',
+            latencyMs: Date.now() - attemptStarted,
+          })
+          return {
+            ok: false,
+            status: 400,
+            body: error.body,
+            terminalState: 'invalid_request',
+            finalState: 'invalid_request',
+            ...attribution(),
+          }
+        }
         if (signal?.aborted || error?.code === 'selection_cancelled' || error?.code === 'request_cancelled') {
           this.attemptsRepo?.complete?.(requestId, attemptNo, {
             upstreamStatus: 0,
@@ -919,7 +1034,6 @@ export class FailoverRunner {
             terminalState: 'cancelled',
             latencyMs: Date.now() - attemptStarted,
           })
-          this.retireOutboundSession(selected, bindKeys)
           return { ...clientCancelledResult({ committed }), via: 'pool-failover', ...attribution() }
         }
         result = {
@@ -944,7 +1058,7 @@ export class FailoverRunner {
             model,
             repaired,
             oauth401CooldownMs: this.config.oauth_401_cooldown_ms,
-            signatureRepair: signatureRepairEnabled(this.config, selected),
+            signatureRepair: signatureRepairEnabled(this.config),
           },
           this.scheduler?.accountQuota,
         )

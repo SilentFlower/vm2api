@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { startGateway, api } from '../harness.mjs'
 
 async function login(gw, username, password) {
@@ -27,6 +30,77 @@ async function panel(gw, method, path, { cookie, body } = {}) {
     json = JSON.parse(text)
   } catch {}
   return { status: res.status, json, text }
+}
+
+for (const prefix of ['VM2API', 'KIN']) {
+  test(`${prefix} default admin is listed and can rotate its password across restarts`, async () => {
+    const env = {
+      VM2API_ADMIN_USER: '',
+      VM2API_ADMIN_PASSWORD: '',
+      [`${prefix}_ADMIN_USER`]: 'admin',
+      [`${prefix}_ADMIN_PASSWORD`]: '123456',
+    }
+    let gw = await startGateway({ env })
+    try {
+      const list = await api(gw, 'GET', '/api/panel/users')
+      assert.equal(list.status, 200, list.text)
+      const self = list.json.data.items.find((user) => user.username === 'admin')
+      assert.ok(self, JSON.stringify(list.json))
+      assert.equal(self.role, 'admin')
+      assert.equal(self.password_hash, undefined)
+      assert.doesNotMatch(gw.stderr(), /bootstrap failed/)
+
+      const admin = await login(gw, 'admin', '123456')
+      const otherSession = await login(gw, 'admin', '123456')
+      assert.equal(admin.status, 200)
+      assert.equal(otherSession.status, 200)
+      const before = await panel(gw, 'GET', '/api/panel/onboarding', { cookie: admin.cookie })
+      assert.equal(before.status, 200)
+      assert.equal(before.json.data.steps.find((step) => step.id === 'admin_password').done, false)
+
+      const shortCreate = await panel(gw, 'POST', '/api/panel/users', {
+        cookie: admin.cookie,
+        body: { username: 'reader', password: '123456', role: 'user' },
+      })
+      assert.equal(shortCreate.status, 400)
+      assert.equal(shortCreate.json.error.code, 'invalid_password')
+      const shortChange = await panel(gw, 'PATCH', `/api/panel/users/${self.id}`, {
+        cookie: admin.cookie,
+        body: { password: '123456' },
+      })
+      assert.equal(shortChange.status, 400)
+      assert.equal(shortChange.json.error.code, 'invalid_password')
+
+      const changed = await panel(gw, 'PATCH', `/api/panel/users/${self.id}`, {
+        cookie: admin.cookie,
+        body: { password: 'changed-admin-pass' },
+      })
+      assert.equal(changed.status, 200, JSON.stringify(changed.json))
+      assert.equal((await panel(gw, 'GET', '/api/panel/me', { cookie: admin.cookie })).status, 200)
+      assert.equal((await panel(gw, 'GET', '/api/panel/me', { cookie: otherSession.cookie })).status, 401)
+      assert.equal((await login(gw, 'admin', '123456')).status, 401)
+      assert.equal((await login(gw, 'admin', 'changed-admin-pass')).status, 200)
+      const after = await panel(gw, 'GET', '/api/panel/onboarding', { cookie: admin.cookie })
+      assert.equal(after.status, 200)
+      assert.equal(after.json.data.steps.find((step) => step.id === 'admin_password').done, true)
+
+      const project = gw.project
+      await gw.stop()
+      gw = await startGateway({ project, env })
+      assert.equal((await login(gw, 'admin', '123456')).status, 401)
+      const relogin = await login(gw, 'admin', 'changed-admin-pass')
+      assert.equal(relogin.status, 200)
+      const restarted = await panel(gw, 'GET', '/api/panel/onboarding', { cookie: relogin.cookie })
+      assert.equal(restarted.status, 200)
+      assert.equal(restarted.json.data.steps.find((step) => step.id === 'admin_password').done, true)
+      const users = await panel(gw, 'GET', '/api/panel/users', { cookie: relogin.cookie })
+      assert.equal(users.status, 200)
+      assert.equal(users.json.data.items.length, 1)
+      assert.equal(users.json.data.items[0].id, self.id)
+    } finally {
+      await gw.stop()
+    }
+  })
 }
 
 test('admin can create users and change passwords', async () => {
@@ -71,6 +145,40 @@ test('admin can create users and change passwords', async () => {
     assert.equal(short.json.error?.code, 'invalid_password')
   } finally {
     await gw.stop()
+  }
+})
+
+test('deleting a tenant reclaims its assigned VM in the runtime file and SQLite mirror', async () => {
+  const gw = await startGateway()
+  try {
+    const created = await api(gw, 'POST', '/api/panel/users', {
+      body: { username: 'tenant', password: 'tenant-pass', role: 'user' },
+    })
+    assert.equal(created.status, 201, created.text)
+    const userId = created.json.data.item.id
+    const session = await login(gw, 'tenant', 'tenant-pass')
+    assert.equal(session.status, 200)
+    const assigned = await api(gw, 'PATCH', '/api/panel/vms/vm-sim-01/owner', { body: { user_id: userId } })
+    assert.equal(assigned.status, 200, assigned.text)
+
+    const deleted = await api(gw, 'DELETE', `/api/panel/users/${userId}`)
+    assert.equal(deleted.status, 200, deleted.text)
+    const vm = JSON.parse(fs.readFileSync(path.join(gw.project, 'vms', 'vm-sim-01.json'), 'utf8'))
+    assert.equal(vm.owner_user_id, null)
+    assert.equal(vm.origin, 'platform')
+    assert.equal(vm.schedulable, true)
+    const db = new DatabaseSync(path.join(gw.project, 'data', 'kin.db'), { readOnly: true })
+    try {
+      const row = db.prepare('SELECT owner_user_id, origin FROM vms WHERE id = ?').get(vm.id)
+      assert.equal(row.owner_user_id, null)
+      assert.equal(row.origin, 'platform')
+    } finally {
+      db.close()
+    }
+    assert.equal((await panel(gw, 'GET', '/api/panel/me', { cookie: session.cookie })).status, 401)
+  } finally {
+    await gw.stop()
+    fs.rmSync(gw.project, { recursive: true, force: true })
   }
 })
 

@@ -3,20 +3,28 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import { EventEmitter } from 'node:events'
 import fs from 'node:fs'
+import http from 'node:http'
 import net from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import ssh2 from 'ssh2'
 import { ClusterManager } from '../../src/lib/cluster/cluster-manager.mjs'
-import { remoteSlotOwner } from '../../src/lib/cluster/placement.mjs'
-import { remoteIptablesScript, slotEgressNames } from '../../src/lib/cluster/remote-slot.mjs'
+import {
+  awaitSlotImageBuild,
+  bindPlacement,
+  nodeImageBuildRunning,
+  remoteSlotOwner,
+  startSlotImageBuild,
+  unbindPlacement,
+} from '../../src/lib/cluster/placement.mjs'
+import { remoteIptablesScript, slotContainerBody, slotEgressNames } from '../../src/lib/cluster/remote-slot.mjs'
 import {
   pullSlotCredentials,
   pushSlotCredentials,
   reconcileSlotCredentials,
   remoteSlotPath,
 } from '../../src/lib/cluster/remote-slot-files.mjs'
-import { slotImageSpec } from '../../src/lib/cluster/slot-image.mjs'
+import { slotImageAction, slotImageSpec } from '../../src/lib/cluster/slot-image.mjs'
 import { tarStream } from '../../src/lib/cluster/tar.mjs'
 import { SocketRelay } from '../../src/lib/cluster/socket-relay.mjs'
 import { connectSsh } from '../../src/lib/cluster/ssh-link.mjs'
@@ -276,6 +284,14 @@ test('slot image tag follows payload bytes only; a VERSION bump keeps the image'
   fs.chmodSync(process.env.KIN_CODEX_KERNEL_BIN, 0o755)
 
   const a = slotImageSpec(root, 'ubuntu-24.04')
+  const container = slotContainerBody(
+    { id: 'vm-03', platform: 'anthropic', node_id: 'node-a', kernel: 'ubuntu-24.04' },
+    { image: a.ref, network: 'test-net', remoteDir: '/home/node/vms/vm-03', user: '1000:1000', routing: {} },
+  )
+  const entry = a.files.find((file) => `/${file.name}` === container.Cmd[0])
+  assert.ok(entry, 'the remote Claude command must name a file baked into its slot image')
+  assert.equal(entry.mode, 0o755)
+  assert.match(entry.body.toString(), /^#!\/bin\/sh/)
   assert.match(a.ref, /^vm2api\/kin-slot-ubuntu-24\.04:[0-9a-f]{12}$/)
   const kvm = slotImageSpec(root, 'ubuntu-24.04', { runtime: 'kvm' })
   assert.match(kvm.ref, /^vm2api\/kin-slot-kvm-ubuntu-24\.04:[0-9a-f]{12}$/)
@@ -448,4 +464,75 @@ test('a node with placed VMs cannot be removed', async () => {
     vmsOnNode: () => [{ id: 'vm-02' }],
   })
   await assert.rejects(manager.remove('n1'), { code: 'node_has_vms' })
+})
+
+test('a node pulls a missing cloud OS and does not upload an image it already has', () => {
+  assert.equal(slotImageAction({ slotPresent: true, basePresent: true }), 'skip')
+  assert.equal(slotImageAction({ slotPresent: true, basePresent: false }), 'skip')
+  assert.equal(slotImageAction({ slotPresent: false, basePresent: false }), 'pull-base')
+  assert.equal(slotImageAction({ slotPresent: false, basePresent: true }), 'build-payload')
+})
+
+test('startSlotImageBuild returns a job awaitSlotImageBuild can finish', async (t) => {
+  const root = tmpDir('kin-slot-job-')
+  for (const file of [
+    'share/wrap-cli/cli-node',
+    'share/wrap-cli/cc-node',
+    'bin/kin-kernel',
+    'bin/kin-worker',
+    'bin/kin-egress',
+    'bin/kin-codex-kernel',
+  ]) {
+    fakeElf(path.join(root, file), 1)
+  }
+  const envKeys = ['KIN_CODEX_KERNEL_BIN', 'KIN_CLUSTER_WORKER_BIN', 'KIN_CLUSTER_EGRESS_BIN']
+  const saved = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]))
+  const hits = []
+  const server = http.createServer((req, res) => {
+    hits.push(req.url || '')
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end('{}')
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const { port } = server.address()
+  t.after(() => {
+    unbindPlacement()
+    server.close()
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    fs.rmSync(root, { recursive: true, force: true })
+  })
+  process.env.KIN_CODEX_KERNEL_BIN = path.join(root, 'bin/kin-codex-kernel')
+  process.env.KIN_CLUSTER_WORKER_BIN = path.join(root, 'bin/kin-worker')
+  process.env.KIN_CLUSTER_EGRESS_BIN = path.join(root, 'bin/kin-egress')
+  bindPlacement({
+    manager: {
+      client() {
+        throw new Error('ssh should not run when connect is injected')
+      },
+    },
+    projectRoot: root,
+  })
+  const connect = () =>
+    new Promise((resolve, reject) => {
+      const sock = net.connect(port, '127.0.0.1')
+      sock.once('connect', () => resolve(sock))
+      sock.once('error', reject)
+    })
+  const job = startSlotImageBuild('n1', 'ubuntu-24.04', { connect })
+  assert.equal(job.status, 'running')
+  assert.equal(nodeImageBuildRunning('n1'), true)
+  assert.equal(nodeImageBuildRunning('n10'), false)
+  assert.match(job.ref, /^vm2api\/kin-slot-ubuntu-24\.04:/)
+  const done = await awaitSlotImageBuild(job)
+  assert.equal(done, job)
+  assert.equal(done.status, 'done')
+  assert.equal(nodeImageBuildRunning('n1'), false)
+  assert.match(done.log, /跳过传输/)
+  assert.equal(
+    hits.some((url) => url.includes('/build')),
+    false,
+  )
 })

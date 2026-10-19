@@ -1,4 +1,5 @@
 import { useRef } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 import type { UsageAccountRow } from '@/types/panel-usage'
 import type { Vm } from '@/types/panel-vm'
@@ -9,6 +10,8 @@ import {
   Play,
   RefreshCw,
   RotateCcw,
+  Undo2,
+  UserRoundPlus,
 } from 'lucide-react'
 import { credTypeLabel, credTypeOf } from '@/lib/cred-type'
 import { fmtExpiresAt, fmtNum, fmtUsd } from '@/lib/format'
@@ -23,12 +26,7 @@ import {
   seatTitle,
   vmRunning,
 } from '@/lib/vm-status'
-import {
-  fmtHitPct,
-  vmTodayStats,
-  vmTotalCost,
-  vmWeekOutcome,
-} from '@/lib/vm-usage'
+import { fmtHitPct, vmTodayStats, vmWeekOutcome } from '@/lib/vm-usage'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -43,7 +41,9 @@ import {
   SlotIdentity,
 } from '@/components/platform-chip'
 import { StatusMark } from '@/components/status-mark'
+import { meQueryOptions } from '@/features/auth/queries'
 import { ProxyChip } from '@/features/proxies/proxy-chip'
+import { usersQueryOptions } from '@/features/users/queries'
 import { restrictionTitle } from '@/features/vm/clear-restriction'
 import { Field } from '@/features/vm/detail-section-primitives'
 import { NodeChip } from '@/features/vm/node-chip'
@@ -53,9 +53,16 @@ import {
   SchedulableSwitch,
   vmSchedulableProps,
 } from '@/features/vm/schedulable-switch'
-import { VmUsageWindows } from '@/features/vm/usage-windows'
+import { VmUsagePanel } from '@/features/vm/usage-windows'
 import { refreshBlockedReason } from '@/features/vm/vm-action-menu'
 import { useVmActions } from '@/features/vm/vm-actions-context'
+import { VmMemoryBlock } from '@/features/vm/vm-memory-block'
+import {
+  canReclaimVm,
+  resolveOwnerUsername,
+  vmOriginLabel,
+} from '@/features/vm/vm-owner'
+import { useVmPerms } from '@/features/vm/vm-perms'
 import { VmSchedulingBlock } from '@/features/vm/vm-scheduling'
 
 function Section({
@@ -77,6 +84,14 @@ function Section({
 
 function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
   const actions = useVmActions()
+  const me = useQuery(meQueryOptions())
+  const admin = me.data?.role === 'admin'
+  const perms = useVmPerms()
+  const users = useQuery({
+    ...usersQueryOptions(),
+    enabled: admin,
+    staleTime: 60_000,
+  })
   const today = vmTodayStats(vm, accounts)
   const week = vmWeekOutcome(vm, accounts)
   const codex = isCodexVm(vm)
@@ -118,11 +133,12 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
       </div>
       <p className='text-xs text-muted-foreground'>{restrictionCopy(vm)}</p>
 
-      <Section title='用量窗口'>
-        <VmUsageWindows vm={vm} accounts={accounts} quotaActions />
-      </Section>
+      <section className='min-w-0 rounded-lg border px-3 py-2.5'>
+        <VmUsagePanel vm={vm} accounts={accounts} />
+      </section>
 
       <VmSchedulingBlock vm={vm} />
+      <VmMemoryBlock vm={vm} />
 
       <div className='grid gap-2 sm:grid-cols-2'>
         <Section title='今日'>
@@ -140,10 +156,10 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             {fmtHitPct(today.hit)}
           </div>
         </Section>
-        <Section title='累计 / 7d 结果'>
+        <Section title='7D 请求'>
           <div className='flex items-baseline justify-between'>
             <span className='text-lg leading-tight font-semibold tabular-nums'>
-              {fmtUsd(vmTotalCost(vm, accounts), 2)}
+              {fmtNum(week.known ? week.success + week.fail : week.req)}
             </span>
             <span className='font-mono text-xs tabular-nums'>
               <span className='text-[color:var(--status-ok)]'>
@@ -156,7 +172,7 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             </span>
           </div>
           <div className='mt-1 text-[11px] text-muted-foreground'>
-            7d 成功 / 失败 · 官方价累计
+            7D 窗口 · 成功 / 失败
           </div>
         </Section>
       </div>
@@ -207,18 +223,31 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
             <Field label='代理' compact>
               <ProxyChip vm={vm} compact />
             </Field>
+            {admin ? (
+              <Field label='租户属主' compact>
+                <span className='text-xs'>
+                  {resolveOwnerUsername(vm.owner_user_id, users.data?.items)}
+                  <span className='text-muted-foreground'>
+                    {' '}
+                    · {vmOriginLabel(vm.origin)}
+                  </span>
+                </span>
+              </Field>
+            ) : null}
           </div>
         </Section>
       </div>
 
       <div className='flex flex-wrap gap-1.5 border-t pt-3'>
-        <Button
-          size='sm'
-          variant='outline'
-          onClick={() => actions.openTest(vm)}
-        >
-          <Play /> 测试链接
-        </Button>
+        {perms.test ? (
+          <Button
+            size='sm'
+            variant='outline'
+            onClick={() => actions.openTest(vm)}
+          >
+            <Play /> 测试链接
+          </Button>
+        ) : null}
         <Button
           size='sm'
           variant='outline'
@@ -226,22 +255,26 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
         >
           <BarChart3 /> 查看统计
         </Button>
-        <Button
-          size='sm'
-          variant='outline'
-          onClick={() => actions.openReauth(vm)}
-        >
-          <Link2 /> 重新授权
-        </Button>
-        <Button
-          size='sm'
-          variant='outline'
-          disabled={Boolean(blocked) || actions.refreshingId === vm.id}
-          title={blocked || undefined}
-          onClick={() => actions.refreshToken(vm)}
-        >
-          <RefreshCw /> 刷新令牌
-        </Button>
+        {perms.credential ? (
+          <>
+            <Button
+              size='sm'
+              variant='outline'
+              onClick={() => actions.openReauth(vm)}
+            >
+              <Link2 /> 重新授权
+            </Button>
+            <Button
+              size='sm'
+              variant='outline'
+              disabled={Boolean(blocked) || actions.refreshingId === vm.id}
+              title={blocked || undefined}
+              onClick={() => actions.refreshToken(vm)}
+            >
+              <RefreshCw /> 刷新令牌
+            </Button>
+          </>
+        ) : null}
         <Button
           size='sm'
           variant='outline'
@@ -251,6 +284,26 @@ function CardBody({ vm, accounts }: { vm: Vm; accounts?: UsageAccountRow[] }) {
         >
           <RotateCcw /> 恢复状态
         </Button>
+        {admin && actions.openAssignOwner ? (
+          <Button
+            size='sm'
+            variant='outline'
+            disabled={actions.ownerBusyId === vm.id}
+            onClick={() => actions.openAssignOwner?.(vm)}
+          >
+            <UserRoundPlus /> 分配给租户
+          </Button>
+        ) : null}
+        {admin && actions.reclaimOwner && canReclaimVm(vm) ? (
+          <Button
+            size='sm'
+            variant='outline'
+            disabled={actions.ownerBusyId === vm.id}
+            onClick={() => actions.reclaimOwner?.(vm)}
+          >
+            <Undo2 /> 收回
+          </Button>
+        ) : null}
         <Button size='sm' variant='ghost' className='ms-auto' asChild>
           <Link to='/vm/$id' params={{ id: vm.id }}>
             <ExternalLink /> 完整页面

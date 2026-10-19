@@ -1,6 +1,11 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
+import { resolveOutboundSessionId } from '../../src/lib/identity/identity-rewrite.mjs'
 
 class Scheduler {
   constructor(candidates) {
@@ -99,6 +104,30 @@ test('unsupported classifier runtime stops without counting execution or cooling
   assert.equal(result.body.error.code, 'classifier_runtime_unsupported')
   assert.deepEqual(scheduler.cooldowns, [])
   assert.equal(scheduler.selectCalls, 1)
+})
+
+test('invalid panel cache layout stops before execution without rotating or cooling accounts', async () => {
+  const scheduler = new Scheduler([candidate(1), candidate(2)])
+  const attempts = new Attempts()
+  const runner = new FailoverRunner({ scheduler, attemptsRepo: attempts })
+  const result = await runner.run({
+    requestId: 'invalid-cache-layout',
+    model: 'claude-opus-5-5',
+    canonicalBody: { model: 'claude-opus-5-5' },
+    applyAttempt: () => {
+      const error = new Error('Cache TTL must place 1h before 5m.')
+      error.status = 400
+      error.body = { error: { type: 'invalid_request_error', code: 'invalid_cache_control', message: error.message } }
+      throw error
+    },
+    callAttempt: () => assert.fail('invalid cache layout must not execute'),
+  })
+  assert.equal(result.status, 400)
+  assert.equal(result.body.error.code, 'invalid_cache_control')
+  assert.equal(result.attemptCount, 0)
+  assert.equal(scheduler.selectCalls, 1)
+  assert.deepEqual(scheduler.cooldowns, [])
+  assert.equal(attempts.items[0].errorScope, 'request')
 })
 
 test('account1 quota exhausted rotates to account2 and commits final sticky', async () => {
@@ -516,6 +545,170 @@ test('search history repair still runs when the rejected hop outlived the deadli
   assert.equal(JSON.stringify(bodies[1]).includes('encrypted_content'), false)
 })
 
+function searchHistoryBody() {
+  return {
+    model: 'claude-opus-test',
+    messages: [
+      { role: 'user', content: 'find it' },
+      {
+        role: 'assistant',
+        content: [
+          { type: 'server_tool_use', id: 'srvtoolu_1', name: 'web_search', input: { query: 'release notes' } },
+          {
+            type: 'web_search_tool_result',
+            tool_use_id: 'srvtoolu_1',
+            content: [
+              { type: 'web_search_result', title: 'Release', url: 'https://a.example', encrypted_content: 'old' },
+            ],
+          },
+        ],
+      },
+      { role: 'user', content: 'summarize' },
+    ],
+  }
+}
+
+function rejectedSearch() {
+  return {
+    ok: false,
+    status: 400,
+    terminalState: 'rejected',
+    body: { error: { message: 'Invalid `encrypted_content` in `search_result` block' } },
+  }
+}
+
+test('confirmed search repair is reused for unchanged history on the next turn', async () => {
+  const runner = new FailoverRunner({ scheduler: new Scheduler([candidate(1)]) })
+  const history = searchHistoryBody()
+  let executions = 0
+  const execute = ({ body }) => {
+    executions++
+    if (JSON.stringify(body).includes('encrypted_content')) {
+      return rejectedSearch()
+    }
+    return success('release summary')
+  }
+  const args = { model: history.model, stickyKey: 'search-conversation', callAttempt: execute }
+  const first = await runner.run({ ...args, requestId: 'search-first', canonicalBody: history })
+  assert.equal(first.status, 200)
+  assert.equal(first.attemptCount, 2)
+  const beforeSecond = executions
+  const second = await runner.run({
+    ...args,
+    requestId: 'search-next',
+    canonicalBody: {
+      ...history,
+      messages: [
+        ...history.messages,
+        { role: 'assistant', content: 'release summary' },
+        { role: 'user', content: 'explain the changes' },
+      ],
+    },
+  })
+  assert.equal(second.status, 200)
+  assert.equal(executions - beforeSecond, 1, 'known rejected history must not make another failing upstream call')
+  assert.equal(second.attemptCount, 1)
+  assert.equal(history.messages[1].content[1].content[0].encrypted_content, 'old')
+})
+
+for (const changed of ['session', 'account', 'vm', 'model', 'credential', 'history', 'tools', 'new search']) {
+  test(`confirmed search repair does not rewrite a different ${changed}`, async () => {
+    const scheduler = new Scheduler([{ ...candidate(1), vm: { claude: { _token_version: 1 } } }])
+    const runner = new FailoverRunner({ scheduler })
+    const history = searchHistoryBody()
+    const args = { model: history.model, stickyKey: 'search-conversation', canonicalBody: history }
+    const first = await runner.run({
+      ...args,
+      requestId: 'learn-search',
+      callAttempt: ({ body }) => (JSON.stringify(body).includes('encrypted_content') ? rejectedSearch() : success()),
+    })
+    assert.equal(first.status, 200)
+    assert.equal(first.attemptCount, 2)
+    switch (changed) {
+      case 'session':
+        args.stickyKey = 'other-conversation'
+        break
+      case 'account':
+        scheduler.candidates[0].accountId = 'other-account'
+        break
+      case 'vm':
+        scheduler.candidates[0].vmId = 'other-vm'
+        break
+      case 'model':
+        args.model = history.model = 'claude-sonnet-test'
+        break
+      case 'credential':
+        scheduler.candidates[0].vm.claude._token_version = 2
+        break
+      case 'history':
+        history.messages[1].content[1].content[0].encrypted_content = 'new-ciphertext'
+        break
+      case 'tools':
+        history.tools = [{ name: 'extra', input_schema: { type: 'object' } }]
+        break
+      case 'new search':
+        history.messages.push(
+          { ...structuredClone(history.messages[1]), content: [{ type: 'search_result', encrypted_content: 'new' }] },
+          { role: 'user', content: 'continue' },
+        )
+        break
+    }
+    const result = await runner.run({
+      ...args,
+      requestId: 'fresh-search-contract',
+      callAttempt: ({ body }) => {
+        assert.deepEqual(body, history, 'a new execution context or search history must get its original opaque data')
+        return success('original history accepted')
+      },
+    })
+    assert.equal(result.status, 200)
+    assert.equal(result.attemptCount, 1)
+  })
+}
+
+test('failed search repair is not learned for the next turn', async () => {
+  const runner = new FailoverRunner({ scheduler: new Scheduler([candidate(1)]) })
+  const history = searchHistoryBody()
+  const args = { model: history.model, stickyKey: 'failed-search', canonicalBody: history }
+  const rejected = await runner.run({ ...args, requestId: 'failed-repair', callAttempt: rejectedSearch })
+  assert.equal(rejected.status, 400)
+  assert.equal(rejected.attemptCount, 2)
+  const accepted = await runner.run({
+    ...args,
+    requestId: 'next-after-failed-repair',
+    callAttempt: ({ body }) => {
+      assert.deepEqual(body, history)
+      return success('original accepted')
+    },
+  })
+  assert.equal(accepted.status, 200)
+  assert.equal(accepted.attemptCount, 1)
+})
+
+test('a confirmed search repair does not hide a later rejection or retry the same transformed body', async () => {
+  const runner = new FailoverRunner({ scheduler: new Scheduler([candidate(1)]) })
+  const history = searchHistoryBody()
+  const args = { model: history.model, stickyKey: 'changed-upstream', canonicalBody: history }
+  const learned = await runner.run({
+    ...args,
+    requestId: 'learned-search',
+    callAttempt: ({ body }) => (JSON.stringify(body).includes('encrypted_content') ? rejectedSearch() : success()),
+  })
+  assert.equal(learned.attemptCount, 2)
+  const rejected = await runner.run({ ...args, requestId: 'search-rejected-again', callAttempt: rejectedSearch })
+  assert.equal(rejected.status, 400)
+  assert.equal(rejected.attemptCount, 1)
+  const next = await runner.run({
+    ...args,
+    requestId: 'after-stale-search-repair',
+    callAttempt: ({ body }) => {
+      assert.deepEqual(body, history, 'a failed learned repair must be discarded')
+      return success('original accepted')
+    },
+  })
+  assert.equal(next.status, 200)
+})
+
 test('signature 400 is not repaired when signature_repair is off', async () => {
   const scheduler = new Scheduler([{ ...candidate(1), vm: { family: 'codex', platform: 'openai' } }])
   const runner = new FailoverRunner({ scheduler })
@@ -551,7 +744,7 @@ test('signature 400 is not repaired when signature_repair is off', async () => {
   assert.equal(calls, 1)
 })
 
-test('cli-hop rust slot repairs signature 400 even when signature_repair is off', async () => {
+test('cli-hop signature 400 is not repaired when signature_repair is off', async () => {
   const scheduler = new Scheduler([
     {
       ...candidate(1),
@@ -576,27 +769,19 @@ test('cli-hop rust slot repairs signature 400 even when signature_repair is off'
       ],
     },
     model: 'claude-opus-test',
-    callAttempt: ({ body }) => {
+    callAttempt: () => {
       calls++
-      if (calls === 1) {
-        return {
-          ok: false,
-          status: 400,
-          terminalState: 'rejected',
-          body: { error: { message: 'Invalid `signature` in `thinking` block' } },
-        }
+      return {
+        ok: false,
+        status: 400,
+        terminalState: 'rejected',
+        body: { error: { message: 'Invalid `signature` in `thinking` block' } },
       }
-      assert.equal(body.thinking, undefined)
-      assert.deepEqual(body.messages[0].content, [
-        { type: 'text', text: 'x' },
-        { type: 'text', text: 'keep' },
-      ])
-      return success('repaired')
     },
   })
-  assert.equal(result.ok, true)
-  assert.equal(result.attemptCount, 2)
-  assert.equal(calls, 2)
+  assert.equal(result.ok, false)
+  assert.equal(result.status, 400)
+  assert.equal(calls, 1)
 })
 
 test('thinking-only hop moves to the next slot and returns the later text', async () => {
@@ -721,34 +906,59 @@ test('aborted signal stops before another account is tried', async () => {
   assert.equal(scheduler.cooldowns.length, 0)
 })
 
-test('client cancellation preserves sticky session and skips account cleanup', async () => {
-  const scheduler = new Scheduler([candidate(1)])
-  const controller = new AbortController()
-  const result = await new FailoverRunner({
-    scheduler,
-    stickyRouter: {},
-    config: { same_account_retry_delay_ms: 0 },
-  }).run({
-    requestId: 'req-cancel-preserve-session',
-    canonicalBody: { model: 'claude-opus-test' },
-    model: 'claude-opus-test',
-    stickyKey: 'parent-session',
-    signal: controller.signal,
-    callAttempt: () => {
-      controller.abort()
-      return {
-        ok: false,
-        status: 499,
-        clientCancelled: true,
-        terminalState: 'cancelled',
-        body: { type: 'error', error: { code: 'client_cancelled', message: 'Client closed the connection' } },
-      }
-    },
+for (const cancellation of ['result', 'throw']) {
+  test(`client cancellation via ${cancellation} preserves outbound session beyond fifty turns`, async (t) => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-cancel-session-'))
+    const sticky = new StickyRouter({ dataDir, config: { sticky: { enabled: true } } })
+    t.after(() => {
+      sticky.db.close()
+      fs.rmSync(dataDir, { recursive: true, force: true })
+    })
+    const scheduler = new Scheduler([{ ...candidate(1), slotIndex: 3 }])
+    const runner = new FailoverRunner({ scheduler, stickyRouter: sticky })
+    const callerSession = 'cancelled-caller'
+    const stickyKey = sticky.canonicalSessionKey(callerSession)
+    let originalSession
+    for (let turn = 0; turn < 53; turn++) {
+      const controller = new AbortController()
+      const result = await runner.run({
+        requestId: `req-cancel-${cancellation}-${turn}`,
+        canonicalBody: { model: 'claude-opus-test' },
+        model: 'claude-opus-test',
+        stickyKey,
+        signal: controller.signal,
+        applyAttempt: (body, selected, extra) => {
+          const bound = extra.stickyBound
+          const sessionId = resolveOutboundSessionId(callerSession, {
+            boundSessionId: bound?.sessionId,
+            boundVmId: bound?.vmId,
+            vmId: selected.vmId,
+            epoch: `turn:${turn}`,
+          })
+          originalSession ??= sessionId
+          assert.equal(sessionId, originalSession, `outbound session changed at turn ${turn}`)
+          return { body, meta: { sessionId } }
+        },
+        callAttempt: () => {
+          if (turn !== 50) return success()
+          if (cancellation === 'throw') {
+            controller.abort()
+            throw Object.assign(new Error('Client closed the connection'), { code: 'request_cancelled' })
+          }
+          return { ok: false, status: 499, clientCancelled: true, terminalState: 'cancelled' }
+        },
+      })
+      assert.equal(result.status, turn === 50 ? 499 : 200)
+      if (turn === 50) assert.equal(result.body.error.code, 'client_cancelled')
+      const bound = sticky.resolve(stickyKey)
+      assert.equal(bound.sessionId, originalSession, `persisted session changed at turn ${turn}`)
+      assert.equal(bound.slotIndex, 3, `cancellation dropped the seat at turn ${turn}`)
+    }
+    assert.notEqual(originalSession, callerSession)
+    assert.deepEqual(scheduler.releasedAccounts, [])
+    assert.deepEqual(scheduler.cooldowns, [])
   })
-  assert.equal(result.status, 499)
-  assert.equal(result.body.error.code, 'client_cancelled')
-  assert.deepEqual(scheduler.releasedAccounts, [])
-})
+}
 
 test('streamed plan limit writes the hard block and rotates to another account', async () => {
   const scheduler = new Scheduler([candidate(1), candidate(2)])
@@ -1287,6 +1497,120 @@ test('the fifth candidate is reached after four VMs fail', async () => {
   assert.deepEqual(seen, ['vm-01', 'vm-02', 'vm-03', 'vm-04', 'vm-05'])
 })
 
+test('session queue timeout defaults to 15 minutes and reloads over the default', () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler })
+  assert.equal(runner.config.session_queue_timeout_ms, 900_000)
+  runner.reloadConfig({ total_retry_deadline_ms: 50 })
+  assert.equal(runner.config.session_queue_timeout_ms, 900_000)
+  runner.reloadConfig({ session_queue_timeout_ms: 0 })
+  assert.equal(runner.config.session_queue_timeout_ms, 0)
+})
+
+test('a same-session waiter times out without starting or overlapping the holder', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { session_queue_timeout_ms: 40 } })
+  let release
+  let entered
+  const holderEntered = new Promise((resolve) => {
+    entered = resolve
+  })
+  let holderCalls = 0
+  let waiterCalls = 0
+  let followerCalls = 0
+  const holder = runner.run({
+    requestId: 'req-hold',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'shared-session',
+    callAttempt: () => {
+      holderCalls += 1
+      entered()
+      return new Promise((resolve) => {
+        release = () => resolve(success())
+      })
+    },
+  })
+  await holderEntered
+  const waiter = await runner.run({
+    requestId: 'req-wait',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'shared-session',
+    callAttempt: () => {
+      waiterCalls += 1
+      return success()
+    },
+  })
+  assert.equal(waiter.ok, false)
+  assert.equal(waiter.status, 529)
+  assert.equal(waiter.body.error.type, 'overloaded_error')
+  assert.equal(waiter.body.error.code, 'pool_overloaded')
+  assert.equal(waiter.body.error.details.reason, 'session_queue_timeout')
+  assert.equal(waiterCalls, 0)
+  assert.equal(holderCalls, 1)
+  let followerEntered = false
+  const follower = runner.run({
+    requestId: 'req-follow',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'shared-session',
+    callAttempt: () => {
+      followerEntered = true
+      followerCalls += 1
+      return success()
+    },
+  })
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(followerEntered, false)
+  release()
+  const held = await holder
+  const followed = await follower
+  assert.equal(held.ok, true)
+  assert.equal(followed.ok, true)
+  assert.equal(followerCalls, 1)
+  assert.equal(waiterCalls, 0)
+  assert.equal(scheduler.selectCalls, 2)
+})
+
+test('session queue wait still aborts with the caller', async () => {
+  const scheduler = new Scheduler([candidate(1)])
+  const runner = new FailoverRunner({ scheduler, config: { session_queue_timeout_ms: 5_000 } })
+  let release
+  let entered
+  const holderEntered = new Promise((resolve) => {
+    entered = resolve
+  })
+  const holder = runner.run({
+    requestId: 'req-hold-abort',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'abort-session',
+    callAttempt: () => {
+      entered()
+      return new Promise((resolve) => {
+        release = () => resolve(success())
+      })
+    },
+  })
+  await holderEntered
+  const controller = new AbortController()
+  const pending = runner.run({
+    requestId: 'req-abort-wait',
+    canonicalBody: { model: 'claude-opus-test' },
+    model: 'claude-opus-test',
+    stickyKey: 'abort-session',
+    signal: controller.signal,
+    callAttempt: () => success(),
+  })
+  controller.abort()
+  const aborted = await pending
+  assert.equal(aborted.terminalState, 'cancelled')
+  assert.equal(aborted.status, 499)
+  release()
+  assert.equal((await holder).ok, true)
+})
+
 test('same sticky session requests execute serially', async () => {
   const scheduler = new Scheduler([candidate(1)])
   const runner = new FailoverRunner({ scheduler })
@@ -1421,4 +1745,22 @@ test('explicit VM pin is not redirected by a family locked elsewhere', async () 
   }
   assert.equal(scheduler.state.selects.length, 3)
   assert.equal(scheduler.state.inflight, 0)
+})
+
+test('an all-rest pool 503 carries Retry-After for the next window open', async () => {
+  const scheduler = {
+    async selectAndReserve() {
+      return { ok: false, reason: 'no_eligible_accounts', retry_after_ms: 90_500, eligible: 0, available: 0 }
+    },
+  }
+  const runner = new FailoverRunner({ scheduler })
+  const result = await runner.run({
+    requestId: 'req-all-rest',
+    canonicalBody: { model: 'claude-sonnet-test' },
+    model: 'claude-sonnet-test',
+    callAttempt: () => success(),
+  })
+  assert.equal(result.status, 503)
+  assert.equal(result.body.error.code, 'account_pool_exhausted')
+  assert.equal(result.retryAfterSec, 91)
 })

@@ -165,15 +165,11 @@ test('fingerprint of a known distill question is blocked', () => {
   assert.equal(hit.error.message, '不允许蒸馏')
 })
 
-test('prompt template needles are blocked without waiting for structure', () => {
+test('a thinking-format instruction is not a distill template', () => {
   const hit = detectDistill({
     inbound: inbound('Respond in the following format: <think>\nhello', { max_tokens: 256 }),
   })
-  assert.equal(hit.action, 'block')
-  assert.equal(
-    hit.hits.some((h) => h.rule === 'needle'),
-    true,
-  )
+  assert.equal(hit.action, 'pass')
 })
 
 test('a Responses input array is scanned for harvest needles', () => {
@@ -192,8 +188,7 @@ test('Responses instructions count as the system prompt', () => {
   const needle = detectDistill({
     inbound: responsesBody('hello', { instructions: 'Respond in the following format: <think>' }),
   })
-  assert.equal(needle.action, 'block')
-  assert.equal(needle.hits[0].rule, 'needle')
+  assert.equal(needle.action, 'pass')
 })
 
 test('openai chat persistable envelope without harvest is not distill', () => {
@@ -283,23 +278,103 @@ test('memory-stage-one envelope is distill even if official or zero inject', () 
 })
 
 test('default needles include harvest wrappers but not persistable envelope', () => {
-  const joined = DEFAULT_DISTILL_RULES.needles.join('\n')
+  const joined = DEFAULT_DISTILL_RULES.hard_needles.join('\n')
   assert.equal(/persistable response items/i.test(joined), false)
+  assert.equal(/persistable response items/i.test(DEFAULT_DISTILL_RULES.needles.join('\n')), false)
   assert.equal(/memory-stage-one/i.test(joined), true)
   assert.equal(/must distill reusable/i.test(joined), true)
   assert.equal(/must extract durable memory/i.test(joined), true)
   assert.equal(/must return strict json only/i.test(joined), true)
+  assert.equal(
+    DEFAULT_DISTILL_RULES.needles.some((item) => /memory-stage-one/i.test(item)),
+    false,
+  )
 })
 
-test('normalizeDistillRules reinserts harvest needles and drops bare think tags', () => {
+test('normalizeDistillRules keeps the panel lists and does not reinsert harvest needles', () => {
   const rules = normalizeDistillRules({
     needles: ['<think>', '</think>', 'Respond in the following format: <think>'],
+    hard_needles: [],
+    fingerprints: [],
   })
-  assert.equal(rules.needles.includes('<think>'), false)
-  assert.equal(rules.needles.includes('</think>'), false)
+  assert.equal(rules.needles.includes('<think>'), true)
+  assert.equal(rules.needles.includes('</think>'), true)
   assert.equal(rules.needles.includes('Respond in the following format: <think>'), true)
-  assert.equal(rules.needles.includes('Memory-stage-one extractor'), true)
-  assert.equal(rules.needles.includes('You MUST extract durable memory now'), true)
+  assert.equal(rules.hard_needles.includes('Memory-stage-one extractor'), false)
+  assert.equal(rules.hard_needles.includes('You MUST extract durable memory now'), false)
+})
+
+test('a harvest phrase removed on the panel does not block', () => {
+  const hit = detectDistill(
+    { inbound: inbound('Memory-stage-one extractor.\nMUST extract durable memory now.') },
+    { hard_needles: [], needles: [], fingerprints: [], patterns: [] },
+  )
+  assert.equal(hit.action, 'pass')
+})
+
+test('a panel harvest phrase blocks official clients', () => {
+  const hit = detectDistill(
+    {
+      inbound: inbound('please run CUSTOM-HARVEST-TOKEN now'),
+      official: true,
+    },
+    { hard_needles: ['CUSTOM-HARVEST-TOKEN'], needles: [], fingerprints: [], patterns: [] },
+  )
+  assert.equal(hit.action, 'block')
+  assert.equal(hit.hits[0].rule, 'harvest_needle')
+  assert.equal(hit.hits[0].evidence, 'CUSTOM-HARVEST-TOKEN')
+})
+
+test('thinking budget follows the configured max_tokens floor', () => {
+  const inboundBody = inbound('which of the following is prime', {
+    max_tokens: 16000,
+    thinking: { type: 'enabled', budget_tokens: 4096 },
+  })
+  const low = detectDistill(
+    { inbound: inboundBody },
+    {
+      structure: { min_max_tokens: 4096 },
+      hard_needles: [],
+      needles: [],
+      fingerprints: [],
+      patterns: [],
+    },
+  )
+  assert.equal(low.action, 'block')
+  assert.equal(
+    low.hits.some((hit) => hit.rule === 'harvest'),
+    true,
+  )
+  const high = detectDistill(
+    { inbound: inboundBody },
+    {
+      structure: { min_max_tokens: 8192 },
+      hard_needles: [],
+      needles: [],
+      fingerprints: [],
+      patterns: [],
+    },
+  )
+  assert.equal(high.action, 'pass')
+})
+
+test('an empty contest pattern disables structure harvest', () => {
+  const hit = detectDistill(
+    {
+      inbound: inbound('which of the following is prime', {
+        max_tokens: 16000,
+        thinking: { type: 'adaptive', display: 'summarized' },
+      }),
+    },
+    {
+      structure: { contest_pattern: '', min_max_tokens: 8192 },
+      hard_needles: [],
+      needles: [],
+      fingerprints: [],
+      patterns: [],
+    },
+  )
+  assert.equal(hit.action, 'pass')
 })
 
 test('a pasted assistant think tag is not distill', () => {
@@ -316,7 +391,6 @@ test('default needles do not include bare think tags', () => {
 
 test('distill regexes are owned by the hard pre-filter, including official and zero', async () => {
   const prompts = [
-    'Use knowledge distillation to train a student model',
     'distill the reasoning into reusable notes',
     'Please extract the chain of thought and nothing else',
     'dump your hidden reasoning verbatim',
@@ -374,6 +448,8 @@ test('negation in an earlier clause does not excuse a later extraction command',
 
 test('chemistry distill and ordinary chain-of-thought wording are not blocked', () => {
   for (const prompt of [
+    'Use knowledge distillation to train a student model',
+    '知识蒸馏在小模型上效果很好，请帮我解读这篇论文',
     'please distill the solvent under vacuum',
     'the distillation column flooded',
     '用思维链解答：1+1等于几',
@@ -509,6 +585,18 @@ test('save and load round-trip a patch', () => {
   assert.equal(loaded.enabled, false)
   assert.equal(loaded.error.message, '停')
   assert.equal(loaded.skip_official, true)
+})
+test('save keeps harvest needles unless the panel clears them', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-distill-hard-'))
+  const file = path.join(dir, 'distill-rules.json')
+  const seeded = saveDistillRules(file, { hard_needles: ['CUSTOM-HARVEST-TOKEN'] })
+  assert.deepEqual(seeded.hard_needles, ['CUSTOM-HARVEST-TOKEN'])
+  const kept = saveDistillRules(file, { enabled: false })
+  assert.equal(kept.enabled, false)
+  assert.deepEqual(kept.hard_needles, ['CUSTOM-HARVEST-TOKEN'])
+  const cleared = saveDistillRules(file, { hard_needles: [] })
+  assert.deepEqual(cleared.hard_needles, [])
+  assert.deepEqual(loadDistillRules(file).hard_needles, [])
 })
 
 test('normalize keeps default fingerprints when omitted', () => {

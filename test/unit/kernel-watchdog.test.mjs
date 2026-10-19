@@ -24,6 +24,7 @@ test('watchdog restarts only a dead kernel or one that gave up on its CLI', asyn
   const ensured = []
   let now = 0
   const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
     now: () => now,
     listTargets: () => [
       { id: 'vm-up', inference_engine: 'rust' },
@@ -63,6 +64,7 @@ test('container restarts are bounded, spaced out, then the VM is faulted until h
   const ensured = []
   const faults = []
   const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
     config: { restart_backoff_sec: [60, 300], restart_window_sec: 3600 },
     listTargets: () => [{ id: 'vm-loop', inference_engine: 'rust' }],
     homeDirFor: () => '/tmp/vm-loop',
@@ -120,6 +122,7 @@ test('watchdog does not restart a live crag slot', async () => {
   fs.writeFileSync(path.join(run, 'kernel.json'), JSON.stringify({ dataplane: 'crag' }))
   const ensured = []
   const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
     listTargets: () => [{ id: 'vm-crag', inference_engine: 'rust' }],
     homeDirFor: () => home,
     health: async () => ({ ok: true, engine: 'rust', ready_slots: 0, cli_pid: 0 }),
@@ -137,6 +140,7 @@ test('telemetry sidecar is checked once per window on every running slot', async
   let now = 0
   const checked = []
   const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
     now: () => now,
     telemetryEveryMs: 600_000,
     listTargets: () => [
@@ -168,6 +172,7 @@ test('inherited rust slot reaches the restart ladder after CLI budget is spent',
   const faults = []
   let now = 0
   const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
     now: () => now,
     getRouting: () => ({ inference: { engine: 'rust' } }),
     listTargets: () => [{ id: 'vm-inherit' }],
@@ -211,6 +216,7 @@ test('watchdog rereads routing each tick; Codex stays out of the restart path', 
   let routingCalls = 0
   let routing = { inference: { engine: 'rust' } }
   const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
     getRouting: () => {
       routingCalls += 1
       return routing
@@ -231,4 +237,143 @@ test('watchdog rereads routing each tick; Codex stays out of the restart path', 
   await wd.tick()
   assert.deepEqual(probed, ['vm-inherit'])
   assert.equal(routingCalls, 2)
+})
+
+test('a missing container is booted, not just kernel-restarted, inside the same budget', async () => {
+  let now = 0
+  const revived = []
+  const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'missing' }),
+    listTargets: () => [
+      { id: 'vm-gone', status: 'running', inference_engine: 'rust' },
+      { id: 'vm-planned', status: 'planned', inference_engine: 'rust' },
+    ],
+    health: async () => null,
+    ensure: async () => ({ ok: false, reason: 'container_unavailable', error: 'No such container' }),
+    revive: async (vm) => {
+      revived.push(vm.id)
+      return { ok: true }
+    },
+    now: () => now,
+  })
+  await wd.tick()
+  assert.deepEqual(revived, [], 'the first boot waits for the first backoff like any restart')
+  now = 60_000
+  await wd.tick()
+  assert.deepEqual(revived, ['vm-gone'], 'only a running-intent slot is booted')
+  assert.equal(wd.restartsInWindow('vm-gone'), 1)
+})
+
+test('a held slot is left alone; reset gives a faulted slot a fresh budget', async () => {
+  let now = 0
+  const probed = []
+  const bridged = []
+  const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
+    config: { restart_backoff_sec: [60] },
+    listTargets: () => [
+      { id: 'vm-held', inference_engine: 'rust' },
+      { id: 'vm-loop', inference_engine: 'rust' },
+    ],
+    health: async (exec) => {
+      probed.push(exec.vmId)
+      return null
+    },
+    ensure: async () => ({ ok: true }),
+    healBridges: async (vms) => bridged.push(vms.map((vm) => vm.id)),
+    now: () => now,
+  })
+  try {
+    wd.hold('vm-held')
+    for (const at of [0, 60_000, 120_000]) {
+      now = at
+      await wd.tick()
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    assert.equal(probed.includes('vm-held'), false)
+    assert.deepEqual(bridged[0], ['vm-loop'], 'bridge heal skips a held slot too')
+    assert.ok(kernelFaults.has('vm-loop'), 'one restart spent: faulted')
+    assert.deepEqual(wd.reset('vm-loop'), { faulted: true })
+    assert.equal(kernelFaults.has('vm-loop'), false)
+    assert.equal(wd.restartsInWindow('vm-loop'), 0)
+    wd.release('vm-held')
+    probed.length = 0
+    await wd.tick()
+    assert.deepEqual(probed, ['vm-held', 'vm-loop'])
+  } finally {
+    kernelFaults.delete('vm-loop')
+  }
+})
+
+function deferred() {
+  let resolve
+  const promise = new Promise((r) => {
+    resolve = r
+  })
+  return { promise, resolve }
+}
+
+test('a hold taken while the health probe is pending stops the restart and the boot', async () => {
+  const probe = deferred()
+  const actions = []
+  const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
+    config: { restart_backoff_sec: [10] },
+    listTargets: () => [{ id: 'vm-race', status: 'running', inference_engine: 'rust' }],
+    health: () => probe.promise,
+    ensure: async () => {
+      actions.push('ensure')
+      return { ok: false, reason: 'container_unavailable' }
+    },
+    revive: async () => {
+      actions.push('revive')
+      return { ok: true }
+    },
+    now: () => 60_000,
+  })
+  const ticking = wd.tick()
+  await new Promise((resolve) => setImmediate(resolve))
+  const drained = wd.hold('vm-race')
+  probe.resolve(null)
+  await ticking
+  await drained
+  assert.deepEqual(actions, [], 'the operator cycle owns the slot once held')
+})
+
+test('hold waits for a restart already in flight, and the boot after it is skipped', async () => {
+  const restart = deferred()
+  const actions = []
+  let at = 0
+  const wd = createKernelWatchdog({
+    observeRuntime: async () => ({ state: 'running' }),
+    config: { restart_backoff_sec: [10] },
+    listTargets: () => [{ id: 'vm-busy', status: 'running', inference_engine: 'rust' }],
+    health: async () => null,
+    ensure: async () => {
+      actions.push('ensure:start')
+      await restart.promise
+      actions.push('ensure:end')
+      return { ok: false, reason: 'container_unavailable' }
+    },
+    revive: async () => {
+      actions.push('revive')
+      return { ok: true }
+    },
+    now: () => at,
+  })
+  await wd.tick()
+  at = 10_000
+  const ticking = wd.tick()
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.deepEqual(actions, ['ensure:start'])
+  let settled = false
+  const drained = wd.hold('vm-busy').then(() => {
+    settled = true
+  })
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(settled, false, 'hold does not return while a restart is still running')
+  restart.resolve()
+  await drained
+  await ticking
+  assert.deepEqual(actions, ['ensure:start', 'ensure:end'], 'no boot once the slot is held')
 })

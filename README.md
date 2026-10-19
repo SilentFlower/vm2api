@@ -24,6 +24,12 @@
 
 <img src="docs/images/brand-hero.png" alt="vm2api Hero Banner" width="100%" style="border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.4);" />
 
+<br/>
+
+<a href="https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme"><img src="docs/images/sponsor-proxylane.png" alt="ProxyLane（赞助商）" width="100%" /></a>
+
+**赞助商**：[ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme) AI 账号专用的原生静态住宅 IP，Scamalytics 低欺诈评分，每个 IP 独享，不限流量，$3.90 起。一个槽位绑一个 IP：把 SOCKS5 `host:port:user:pass` 粘贴到「代理池」→「添加代理」即可。首次购买使用优惠码 `VM2API30` 享 7 折。
+
 </div>
 
 <br/>
@@ -121,7 +127,7 @@
 |:---|:---|:---|:---|
 | 1 | 蒸馏 | 收割模板、题目指纹、套取思维链的结构。OpenAI 平台模型不扫。默认再跳过官方 Claude Code 和 0 注入。 | 403，封 device |
 | 2 | 硬正则 | 色情、破解、破限和自定义正则。蒸馏类正则跟蒸馏总开关：关掉硬正则仍拦这些短语，关掉蒸馏才放行；官方客户端和 0 注入仍扫，OpenAI 不扫。 | 403 |
-| 3 | 拒答缓存 | 上游已经拒过的精确正文、近似正文，以及被封的 device。硬正则和决策模型自己的拦截不写入这张缓存。 | 503 |
+| 3 | 拒答缓存 | 上游已经拒过的精确正文、近似正文，以及被封的 device。硬正则和决策模型自己的拦截不写入这张缓存。 | 400，不可重试，不是登录失效 |
 | 4 | 决策模型 | 安全模型逐题打分，低于阈值才拦。打分失败默认放行，并在「放行出站」里标出来。 | 403 |
 | 5 | 放行出站 | 前面都没拦。上游自己的拒答单独列出，用来看漏拦。 | 进入槽位 |
 
@@ -238,13 +244,15 @@ vm2api 内置全栈自适应网关，原生支持以下所有主流生态：
 | `/v1/messages` | Anthropic Messages API | Claude 官方 SDK、Cursor、Continue、LibreChat、Roo Code |
 | `/v1/chat/completions` | OpenAI Chat API | NextChat、Open WebUI、Lobechat、LangChain、AutoGPT |
 | `/v1/responses` | OpenAI Responses API | 新一代结构化智能体与高级编码工具生态 |
-| `/v1/models` | 标准模型列表 API | 自动同步当前槽位支持的所有模型矩阵 |
+| `/v1/models` | 标准模型列表 API | 按密钥 `group_type` 列出可调度模型：`openai` 仅 GPT，`anthropic` 仅 Claude，`all` 与 master 两者都列 |
 
 ---
 
 <br/>
 
 # 🇬🇧 English
+
+> **Sponsor**: [ProxyLane](https://proxylane.dev/zh-cn/isp-proxies?utm_source=vm2api&utm_medium=affiliate&utm_campaign=vm2api_sponsor_202610&utm_content=github_readme_en) native static residential ISP IPs built for AI accounts: low Scamalytics fraud scores, a dedicated IP with unlimited traffic, from $3.90. Bind one IP per slot: paste the SOCKS5 line `host:port:user:pass` into 代理池 → 添加代理 (Proxy pool → Add proxy). Code `VM2API30` gives 30% off your first purchase.
 
 ## Table of Contents
 - [💡 Overview](#-overview)
@@ -323,7 +331,7 @@ Details: [CHANGELOG.md](CHANGELOG.md). Guide: [vm2api.fkcodex.com/zh](https://vm
 |:---|:---|:---|:---|
 | 1 | Distill | Harvest templates, problem fingerprints, and chain-of-thought extraction shapes. OpenAI platform models are skipped. Official Claude Code and zero-injection are skipped by default. | 403, and the device is banned |
 | 2 | Hard regex | NSFW, cracking, jailbreak, and custom patterns. Distill-category patterns follow the distill switch, not the hard-regex switch, and still scan official clients and zero-injection. OpenAI platform models skip that category. | 403 |
-| 3 | Refusal cache | Exact text, similar text, and devices the upstream has already refused. Hard-regex and decision-model blocks are not stored here. | 503 |
+| 3 | Refusal cache | Exact text, similar text, and devices the upstream has already refused. Hard-regex and decision-model blocks are not stored here. | 400, non-retryable, not a login failure |
 | 4 | Decision model | A safety model scores the text and blocks only below the threshold. If scoring fails, the request is allowed by default and marked on the pass column. | 403 |
 | 5 | Passed egress | Everything the gates allowed. The upstream's own refusals are listed separately, so a miss is visible. | Enters a slot |
 

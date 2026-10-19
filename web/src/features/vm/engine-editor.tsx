@@ -20,6 +20,7 @@ import {
 } from '@/features/vm/engine-contract'
 import { isRemoteVm, REMOTE_UNSUPPORTED_TEXT } from '@/features/vm/placement'
 import { vmQueryOptions } from '@/features/vm/queries'
+import { useVmPerms } from '@/features/vm/vm-perms'
 
 export function VmEngineEditor({
   id,
@@ -44,6 +45,7 @@ export function VmEngineEditor({
     resolved
   )
   const inherits = configured === 'auto'
+  const canEdit = useVmPerms().admin
   const remote = isRemoteVm(vm)
   const status = useMemo(
     () => ({
@@ -57,7 +59,7 @@ export function VmEngineEditor({
     mutationFn: () =>
       patchVm(id, { inference_engine: inferenceEnginePatchValue('auto') }),
     onSuccess: async () => {
-      toast.success('推理内核已改为跟随设置 → 协议')
+      toast.success('推理内核已改为跟随全局')
       await Promise.all([
         qc.invalidateQueries({ queryKey: vmQueryOptions(id).queryKey }),
         qc.invalidateQueries({ queryKey: dashboardQueryOptions().queryKey }),
@@ -85,17 +87,9 @@ export function VmEngineEditor({
         <Link to='/wrap' className='underline underline-offset-4'>
           内核页
         </Link>{' '}
-        或{' '}
-        <Link
-          to='/settings/$tab'
-          params={{ tab: 'protocol' }}
-          className='underline underline-offset-4'
-        >
-          设置 → 协议
-        </Link>
         切换。Go HTTP 转发不再启用。
       </p>
-      {inherits ? null : (
+      {inherits || !canEdit ? null : (
         <Button
           className='mt-3'
           variant='outline'
@@ -105,7 +99,7 @@ export function VmEngineEditor({
           {inherit.isPending ? '恢复中…' : '恢复跟随全局'}
         </Button>
       )}
-      {remote ? (
+      {remote && canEdit ? (
         <p className='mt-2 text-xs text-muted-foreground'>
           切换推理内核：{REMOTE_UNSUPPORTED_TEXT}
         </p>

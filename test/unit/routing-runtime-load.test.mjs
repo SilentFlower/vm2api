@@ -237,6 +237,40 @@ test('persistRoutingPatch writes a changed stream idle timeout into Claude kerne
   }
 })
 
+test('persistRoutingPatch writes a changed request body limit into Claude kernel configs', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-body-'))
+  const vms = path.join(root, 'vms')
+  const routingFile = path.join(root, 'routing.json')
+  const kernelFile = path.join(vms, 'vm-claude', 'run', 'kernel.json')
+  fs.mkdirSync(vms, { recursive: true })
+  fs.writeFileSync(path.join(vms, 'vm-claude.json'), JSON.stringify({ id: 'vm-claude', status: 'stopped', claude: {} }))
+  const routingConfig = { failover: { stream_idle_timeout_ms: 180000 }, concurrency: {}, tiers: {} }
+  fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
+  try {
+    const runtime = createRoutingRuntime({
+      cfg: { paths: { project: root } },
+      routingConfigPath: routingFile,
+      routingConfig,
+      stickyRouter: { reloadConfig() {} },
+      accountQuota: {
+        reloadConfig() {},
+        applyTierConcurrency() {},
+        applyTierRpm() {},
+        repo: { get: () => null },
+      },
+      requestLog: { setConfig() {} },
+    })
+    const same = runtime.persistRoutingPatch({ failover: { stream_idle_timeout_ms: 180000 } })
+    assert.equal(same.kernel_persona, null)
+    assert.equal(fs.existsSync(kernelFile), false)
+    const changed = runtime.persistRoutingPatch({ failover: { max_request_mib: 64 } })
+    assert.equal(changed.kernel_reload, 0)
+    assert.equal(JSON.parse(fs.readFileSync(kernelFile, 'utf8')).max_request_bytes, 64 * 1024 * 1024)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
 test('persistRoutingPatch writes persona_preset into Claude kernel system_layout', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-persona-kernel-'))
   const vms = path.join(root, 'vms')
@@ -481,4 +515,38 @@ test('PUT /api/panel/routing rejects an invalid vm patch before persist', async 
   assert.equal(response.status, 400)
   assert.equal(response.body?.error?.code, 'invalid_vm_config')
   assert.match(response.body?.error?.message, /memory/)
+})
+
+test('persistRoutingPatch round-trips websocket gates and analytics', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-routing-ws-persist-'))
+  const routingFile = path.join(root, 'routing.json')
+  const routingConfig = { concurrency: {}, tiers: {}, codex: { enabled: true } }
+  fs.mkdirSync(root, { recursive: true })
+  fs.writeFileSync(routingFile, JSON.stringify(routingConfig))
+  try {
+    const runtime = persistHarness(root, routingFile, routingConfig)
+    runtime.persistRoutingPatch({
+      websocket: { enabled: false },
+      codex: {
+        websocket: { enabled: false },
+        upstream_transport: 'http',
+        user_agent: 'codex_cli_rs/9.9.9 (linux x86_64)',
+        client_features: { enabled: true },
+        analytics: { enabled: true },
+      },
+    })
+    const saved = JSON.parse(fs.readFileSync(routingFile, 'utf8'))
+    assert.equal(saved.websocket.enabled, false)
+    assert.equal(saved.codex.websocket.enabled, false)
+    assert.equal(saved.codex.upstream_transport, 'http')
+    assert.equal(saved.codex.user_agent, 'codex_cli_rs/9.9.9 (linux x86_64)')
+    assert.equal(saved.codex.client_features.enabled, true)
+    assert.equal(saved.codex.analytics.enabled, true)
+    const loaded = runtimeFor(routingFile).loadRoutingConfig()
+    assert.equal(loaded.websocket.enabled, false)
+    assert.equal(loaded.codex.analytics.enabled, true)
+    assert.equal(loaded.codex.upstream_transport, 'http')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
 })

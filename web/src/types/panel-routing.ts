@@ -7,6 +7,14 @@ export type PersonaPreset = 'official' | 'official_full' | 'zero' | 'custom'
 export type OverlayPreset = 'off' | 'official' | 'minimal' | 'custom'
 
 /**
+ * `routing.inference.session_idle_ttl_seconds`。
+ * kernel 原生 sticky 槽空闲秒数，不是流空闲，也不是池账号绑定 TTL。
+ */
+export const SESSION_IDLE_TTL_SECONDS_MIN = 1
+export const SESSION_IDLE_TTL_SECONDS_MAX = 86400
+export const SESSION_IDLE_TTL_SECONDS_DEFAULT = 600
+
+/**
  * persona / overlay 模板的一个 system 块。
  * `id` / `note` / `drop_if_empty` / `hide` 是 meta，渲染时被剥离；
  * 只有 `type` / `text` / `cache_control` 会到达 Anthropic。
@@ -46,7 +54,11 @@ export type DistillRules = {
     min_max_tokens: number
     require_no_tools: boolean
     require_single_turn: boolean
+    /** 结构收割用的赛题正则。空字符串表示不做这项。 */
+    contest_pattern: string
   }
+  /** 官方客户端和 0 注入也拦。面板删掉即停，不会被代码补回。 */
+  hard_needles: string[]
   needles: string[]
   /** Extra regexes. Built-in distillation / CoT patterns live on the hard rules. */
   patterns: string[]
@@ -101,12 +113,48 @@ export type PolicyRule = {
   source: string
   enabled: boolean
 }
+
+/** 账号范围里的一个可选项：`3` 是当前槽位数，`none` 表示「没有该字段」。 */
+export type JevScopeOption = {
+  id: string
+  label: string
+  count: number
+}
+
+/** 面板用来算「当前范围命中几个槽位」的槽位清单（`GET /api/panel/jev-intercept`）。 */
+export type JevScopeAccount = {
+  id: string
+  email: string | null
+  name: string | null
+  platform: string | null
+  plan_type: string | null
+  account_tier?: string | null
+  /** `claude:max` / `gpt:plus`. The chip id. */
+  scope_key?: string
+  type?: string
+  schedulable: boolean
+}
+
+export type JevScopeInventory = {
+  account_platform_plan_options?: JevScopeOption[]
+  account_type_options?: JevScopeOption[]
+  account_plan_type_options?: JevScopeOption[]
+  accounts_total: number
+  accounts: JevScopeAccount[]
+}
+
 /** `GET/PUT /api/panel/jev-intercept`。决策模型与硬正则。密钥只回 api_key_set。 */
 export type JevInterceptConfig = {
   enabled: boolean
   hard_regex_enabled: boolean
   /** GPT / Codex 请求是否过拦截关卡，默认 false。 */
   openai_platform_enabled: boolean
+  /** 账号范围。空 = 所有账号都进关卡。平台+套餐与指定账号取并集。 */
+  account_platform_plans: string[]
+  account_types: string[]
+  account_plan_types: string[]
+  account_ids: string[]
+  account_scope?: JevScopeInventory
   provider: 'jev' | 'laya' | 'modernbert'
   providers?: {
     id: string
@@ -170,6 +218,14 @@ export type NotifyTelegramConfig = {
   chat_id: string
 }
 
+export type NotifyWecomConfig = {
+  enabled: boolean
+  /** 企业微信群机器人 webhook 地址或 key；GET 永远为空，仅以 webhook_set 表示已配置。 */
+  webhook: string
+  webhook_set?: boolean
+  mention_all: boolean
+}
+
 /** `GET /routing -> notify` 与 `GET /notify -> config` 的脱敏通知配置。 */
 export type NotifyConfig = {
   enabled: boolean
@@ -181,6 +237,7 @@ export type NotifyConfig = {
   console_url: string
   events: NotifyEvents
   telegram: NotifyTelegramConfig
+  wecom: NotifyWecomConfig
   email?: Record<string, unknown>
 }
 
@@ -190,7 +247,12 @@ export type NotifyStatus = {
   last_events?: { type?: string; title?: string }[]
   last_error?: string | null
   last_run_at?: string | null
-  channels?: { email?: boolean; telegram?: boolean; any?: boolean }
+  channels?: {
+    email?: boolean
+    telegram?: boolean
+    wecom?: boolean
+    any?: boolean
+  }
 }
 
 export type BackupsPayload = {
@@ -214,4 +276,22 @@ export type VmRoutingConfig = {
   smbios: VmRoutingSmbios
   mac_oui: string
   allow_tcg: boolean
+}
+
+/** `routing.websocket`：全局推理 WebSocket 总闸，不影响终端/集群 WS。 */
+export type RoutingWebsocketConfig = {
+  enabled: boolean
+}
+
+/** `routing.codex.upstream_transport`。任一 WS 闸关闭时实际强制 HTTP。 */
+export type CodexUpstreamTransport = 'prefer_websocket' | 'http'
+
+/** `routing.codex.client_features`：安装 UUID / client_metadata，默认关。 */
+export type CodexClientFeatures = {
+  enabled: boolean
+}
+
+/** `routing.codex.analytics`：官方 analytics-events，默认关。 */
+export type CodexAnalyticsConfig = {
+  enabled: boolean
 }

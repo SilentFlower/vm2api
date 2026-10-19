@@ -15,17 +15,43 @@ import { assertProxyAllowed, proxyBlockedReason } from './proxy-policy.mjs'
 
 export const EGRESS_BIN = process.env.KIN_EGRESS_BIN || '/opt/kin-gateway/bin/kin-egress'
 export const LOCAL_EGRESS_ID = 'px-local'
+const LOCAL_EGRESS_NODE_PREFIX = `${LOCAL_EGRESS_ID}-`
+
+/**
+ * Local egress is one pool row per VPS: `px-local` for the control plane,
+ * `px-local-<nodeId>` for each cluster node. Bind capacity, probe and geo are
+ * then per machine, while every local row on a host shares the same docker
+ * bridge (see egressArtifactId).
+ */
+export function localEgressIdForNode(nodeId) {
+  const key = String(nodeId || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '')
+  return key ? `${LOCAL_EGRESS_NODE_PREFIX}${key}` : LOCAL_EGRESS_ID
+}
+
+export function isLocalEgressId(proxyId) {
+  const id = String(proxyId || '').trim()
+  return id === LOCAL_EGRESS_ID || id.startsWith(LOCAL_EGRESS_NODE_PREFIX)
+}
+
+/** Node a local row belongs to; null for the control plane (or a non-local id). */
+export function localEgressNodeId(proxyId) {
+  const id = String(proxyId || '').trim()
+  return id.startsWith(LOCAL_EGRESS_NODE_PREFIX) ? id.slice(LOCAL_EGRESS_NODE_PREFIX.length) || null : null
+}
 
 export function isLocalEgressProxy(proxy) {
   if (!proxy || typeof proxy !== 'object') return false
   const id = String(proxy.id || '').trim()
+  if (isLocalEgressId(id)) return true
   const scheme = String(proxy.scheme || proxy.kind || '')
     .trim()
     .toLowerCase()
   const host = String(proxy.host || '')
     .trim()
     .toLowerCase()
-  return id === LOCAL_EGRESS_ID || scheme === 'local' || host === 'local'
+  return scheme === 'local' || host === 'local'
 }
 
 /** Remote SOCKS (url or host:port) or local egress. Empty URL is not "unbound". */
@@ -64,14 +90,19 @@ export function proxyKey(proxyId) {
     .replace(/[^a-zA-Z0-9_-]/g, '')
 }
 
+// Each host has a single local masquerade bridge, whichever per-node local row a slot holds.
+function egressArtifactId(proxyId) {
+  return isLocalEgressId(proxyId) ? LOCAL_EGRESS_ID : proxyId
+}
+
 export function networkName(proxyId) {
-  const id = proxyKey(proxyId)
+  const id = proxyKey(egressArtifactId(proxyId))
   return id ? `kin-eg-${id}` : ''
 }
 
 /** Linux iface max 15 chars. */
 export function bridgeName(proxyId) {
-  const hex = proxyKey(proxyId)
+  const hex = proxyKey(egressArtifactId(proxyId))
     .replace(/^px-/, '')
     .replace(/[^a-zA-Z0-9]/g, '')
     .slice(0, 12)
@@ -79,7 +110,7 @@ export function bridgeName(proxyId) {
 }
 
 export function chainName(proxyId) {
-  const hex = proxyKey(proxyId)
+  const hex = proxyKey(egressArtifactId(proxyId))
     .replace(/^px-/, '')
     .replace(/[^a-zA-Z0-9]/g, '')
     .slice(0, 12)
@@ -87,7 +118,7 @@ export function chainName(proxyId) {
 }
 
 export function portsForProxy(proxyId) {
-  const s = proxyKey(proxyId)
+  const s = proxyKey(egressArtifactId(proxyId))
   let h = 2166136261
   for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 16777619)
   const n = (h >>> 0) % 8000
@@ -180,15 +211,28 @@ export function egressRunDir(projectRoot, proxyId) {
   return path.join(projectRoot, 'data', 'run', 'egress', proxyKey(proxyId))
 }
 
+/** True when pid exists and is not a zombie (Linux). Used by tests and stop/reload paths. */
+export function egressPidActive(pid) {
+  return pidAlive(pid)
+}
+
 function pidAlive(pid) {
   const n = Number(pid)
   if (!Number.isInteger(n) || n <= 0) return false
   try {
     process.kill(n, 0)
-    return true
   } catch {
     return false
   }
+  if (process.platform === 'linux') {
+    try {
+      const state = fs.readFileSync(`/proc/${n}/stat`, 'utf8').split(' ')[2]
+      if (state === 'Z') return false
+    } catch {
+      return false
+    }
+  }
+  return true
 }
 
 function readPid(file) {
@@ -345,7 +389,17 @@ export function configuredDnsEmptyTypes() {
   return new SettingsRepo(getDb()).get('proxy_pool_config')?.dns_disable_svcb_https === true ? [64, 65] : []
 }
 
-export function startEgressProcess({
+const EGRESS_POLL_MS = 50
+const egressWaitLock = new Int32Array(new SharedArrayBuffer(4))
+
+function sleepMsSync(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return
+  Atomics.wait(egressWaitLock, 0, 0, Math.min(Math.floor(ms), 2_147_483_647))
+}
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+export async function startEgressProcess({
   projectRoot,
   proxyId,
   proxyUrl,
@@ -384,6 +438,16 @@ export function startEgressProcess({
     try {
       process.kill(existing, 'SIGTERM')
     } catch {}
+    const stopped = await waitEgressExit(existing)
+    if (!stopped.ok) return { ok: false, error: stopped.error, pid: existing }
+    if (tcpPort > 0) {
+      const portFree = await waitPortReleased(listenHost, tcpPort)
+      if (!portFree.ok) return { ok: false, error: portFree.error, pid: existing }
+    }
+    if (dnsPort > 0) {
+      const dnsFree = await waitPortReleased(listenHost, dnsPort)
+      if (!dnsFree.ok) return { ok: false, error: dnsFree.error, pid: existing }
+    }
   }
   if (!fs.existsSync(bin)) {
     return { ok: false, error: `kin-egress binary not found: ${bin}` }
@@ -398,13 +462,10 @@ export function startEgressProcess({
   if (dnsEmptyTypes.length) cfg.dns_empty_types = dnsEmptyTypes
   if (domainForward) cfg.domain_forward = true
   fs.writeFileSync(cfgPath, JSON.stringify(cfg, null, 2) + '\n', { mode: 0o600 })
-  const child = spawn(bin, ['-config', cfgPath], {
-    detached: true,
-    stdio: 'ignore',
-  })
-  child.unref()
-  fs.writeFileSync(pidFile, String(child.pid) + '\n', { mode: 0o600 })
-  return { ok: true, pid: child.pid, reused: false, configPath: cfgPath, listen_tcp: listenTcp }
+  const spawned = await spawnDetachedEgress(bin, cfgPath)
+  if (!spawned.ok) return spawned
+  fs.writeFileSync(pidFile, String(spawned.pid) + '\n', { mode: 0o600 })
+  return { ok: true, pid: spawned.pid, reused: false, configPath: cfgPath, listen_tcp: listenTcp }
 }
 
 export function stopEgressProcess(projectRoot, proxyId) {
@@ -481,6 +542,70 @@ export function localEgressProxyUrl(env = process.env) {
   return ''
 }
 
+const EGRESS_STOP_TIMEOUT_MS = 8000
+const EGRESS_KILL_GRACE_MS = 3000
+
+/** Wait for an egress PID to exit after SIGTERM, then SIGKILL if needed. */
+export async function waitEgressExit(
+  pid,
+  { termTimeoutMs = EGRESS_STOP_TIMEOUT_MS, killGraceMs = EGRESS_KILL_GRACE_MS } = {},
+) {
+  if (!pidAlive(pid)) return { ok: true }
+  const termStart = Date.now()
+  while (Date.now() - termStart < termTimeoutMs) {
+    if (!pidAlive(pid)) return { ok: true }
+    await delay(EGRESS_POLL_MS)
+  }
+  try {
+    process.kill(pid, 'SIGKILL')
+  } catch (error) {
+    if (error.code === 'ESRCH') return { ok: true }
+    return { ok: false, error: `egress_kill_failed: ${error.code || error.message}`, pid }
+  }
+  const killStart = Date.now()
+  while (Date.now() - killStart < killGraceMs) {
+    if (!pidAlive(pid)) return { ok: true }
+    await delay(EGRESS_POLL_MS)
+  }
+  return { ok: false, error: 'egress_stop_timeout', pid }
+}
+
+export async function waitPortReleased(host, port, timeoutMs = 3000) {
+  const start = Date.now()
+  while (Date.now() - start < timeoutMs) {
+    if (!waitListen(host, port, 200)) return { ok: true }
+    await delay(EGRESS_POLL_MS)
+  }
+  return { ok: false, error: 'egress_port_busy', port }
+}
+
+function spawnDetachedEgress(bin, cfgPath) {
+  return new Promise((resolve) => {
+    const child = spawn(bin, ['-config', cfgPath], { detached: true, stdio: 'ignore' })
+    let settled = false
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      resolve(result)
+    }
+    child.once('error', (error) => {
+      finish({ ok: false, error: `egress_spawn_failed: ${error.code || error.message}` })
+    })
+    child.once('spawn', () => {
+      child.unref()
+      finish({ ok: true, pid: child.pid })
+    })
+    setTimeout(() => {
+      if (child.pid) {
+        child.unref()
+        finish({ ok: true, pid: child.pid })
+        return
+      }
+      finish({ ok: false, error: 'egress_spawn_failed: no pid' })
+    }, 500)
+  })
+}
+
 function waitListen(host, port, timeoutMs = 8000) {
   const start = Date.now()
   const h = host || '127.0.0.1'
@@ -498,7 +623,7 @@ function waitListen(host, port, timeoutMs = 8000) {
       })
     )
       return true
-    sh(['python3', '-c', 'import time; time.sleep(0.1)'], { timeout: 1000 })
+    sleepMsSync(100)
   }
   return false
 }
@@ -530,7 +655,7 @@ export function ensureLocalProxyEgress(proxy, { runDocker = docker } = {}) {
   return { ok: true, mode: 'local', ...info, reused: false, proxy_id: proxyId }
 }
 
-export function ensureProxyEgress(
+export async function ensureProxyEgress(
   projectRoot,
   proxy,
   {
@@ -559,7 +684,7 @@ export function ensureProxyEgress(
     tcpPort: ports.tcp,
     dnsPort: ports.dns,
   })
-  const started = startEgressProcess({
+  const started = await startEgressProcess({
     projectRoot,
     proxyId,
     proxyUrl,
@@ -591,6 +716,8 @@ export function ensureProxyEgress(
 }
 
 export function stopProxyEgress(projectRoot, proxyId, { subnet, runDocker = docker, runIptables = iptables } = {}) {
+  // A node's local row owns nothing here; its bridge name is the control plane's px-local one.
+  if (localEgressNodeId(proxyId)) return { ok: true, skipped: 'node_local' }
   const net = inspectEgressNetwork(proxyId, runDocker)
   const plan = iptablesPlan({
     chain: chainName(proxyId),

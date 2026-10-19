@@ -170,6 +170,60 @@ test('credential refresh failure is 无效凭证 even if usage snapshot exists',
   assert.equal(av.reason, 'credential_refresh_failed')
 })
 
+test('expired access with worker_output_invalid is 无效凭证', () => {
+  const now = Date.now()
+  const av = evaluateAccount({
+    vm: {
+      has_token: true,
+      has_refresh: true,
+      expires_at: Math.floor((now - 6 * 3600_000) / 1000),
+      refresh_error: 'worker_output_invalid',
+    },
+    hasToken: true,
+    hasRefresh: true,
+    schedulable: true,
+    expiresAt: now - 6 * 3600_000,
+    workerCredential: {
+      has_access: true,
+      has_refresh: true,
+      needs_refresh: true,
+      expires_at: now - 6 * 3600_000,
+    },
+    quota: { utilization_5h: 0.1, status_5h: 'allowed' },
+    now,
+  })
+  assert.equal(av.key, 'bad')
+  assert.equal(av.text, '无效凭证')
+  assert.equal(av.reason, 'credential_refresh_failed')
+  assert.equal(av.accept, false)
+})
+
+test('live access is kept despite a transient refresh error', () => {
+  const now = Date.now()
+  const av = evaluateAccount({
+    vm: {
+      has_token: true,
+      has_refresh: true,
+      expires_at: Math.floor((now + 3600_000) / 1000),
+      refresh_error: 'worker_output_invalid',
+    },
+    hasToken: true,
+    hasRefresh: true,
+    schedulable: true,
+    expiresAt: now + 3600_000,
+    workerCredential: {
+      has_access: true,
+      has_refresh: true,
+      needs_refresh: false,
+      expires_at: now + 3600_000,
+    },
+    quota: { utilization_5h: 0.1, status_5h: 'allowed' },
+    now,
+  })
+  assert.notEqual(av.key, 'bad')
+  assert.equal(av.accept, true)
+})
+
 test('leftover invalid_grant after a live refresh does not block the pool', () => {
   const now = Date.now()
   const av = evaluateAccount({
@@ -488,4 +542,17 @@ test('availabilityFromQuotaRefresh still aliases evaluateAccount', () => {
     quota: { utilization_5h: 0.2, status_5h: 'allowed' },
   })
   assert.equal(av.key, 'ok')
+})
+
+test('rest stays restricted even with a stale cooldown left on the slot', () => {
+  const now = Date.parse('2026-09-17T12:00:00.000Z')
+  const until = Date.parse('2026-09-17T20:00:00.000Z')
+  const triad = resolveScheduleState({
+    schedulable: true,
+    availability: { key: 'rest', reason: 'rest_period', until },
+    restrictionUntil: now - 60_000,
+    restrictionReason: 'rate_limited',
+    now,
+  })
+  assert.deepEqual(triad, { schedule_state: 'restricted', restriction_reason: 'rest_period', restriction_until: until })
 })

@@ -7,6 +7,8 @@ import { PoolScheduler, formatPoolSelectionSummary } from '../../src/lib/pool/po
 import { AccountQuota } from '../../src/lib/pool/account-quota.mjs'
 import { StickyRouter } from '../../src/lib/pool/sticky-router.mjs'
 import { FailoverRunner } from '../../src/lib/pool/failover-runner.mjs'
+import { PanelUserStore } from '../../src/lib/admin/panel-users.mjs'
+import { persistVmOwner } from '../../src/lib/vm/vm-registry.mjs'
 import { kernelFaults } from '../../src/lib/transport/rust-kernel-client.mjs'
 import {
   applyCrsIdentityReplace,
@@ -1559,6 +1561,36 @@ test('platform scope skips tenant-owned VMs', async (t) => {
   assert.equal(miss.ok, false)
 })
 
+test('deleting a tenant makes its assigned spare selectable while the primary quota is exhausted', async (t) => {
+  const root = project()
+  const quota = new AccountQuota({ dataDir: path.join(root, 'data'), config: {} })
+  let pool
+  t.after(() => {
+    quota.db.close()
+    cleanupProject(root, pool)
+  })
+  const users = new PanelUserStore({ db: quota.db, projectRoot: root })
+  const user = users.create({ username: 'tenant', password: 'tenant-pass' })
+  persistVmOwner(root, 'vm-02', { ownerUserId: user.id, origin: 'admin_assigned' })
+  quota.ensure({ account_id: 'account-1', vm_id: 'vm-01' })
+  quota.ensure({ account_id: 'account-2', vm_id: 'vm-02' })
+  quota.ingestHeaders('account-1', {
+    'anthropic-ratelimit-unified-5h-utilization': '1',
+    'anthropic-ratelimit-unified-5h-status': 'rejected',
+    'anthropic-ratelimit-unified-5h-reset': new Date(Date.now() + 3600_000).toISOString(),
+  })
+  pool = scheduler(root, { accountQuota: quota })
+  const exhausted = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(exhausted.ok, false)
+
+  assert.equal(users.remove(user.id), true)
+  const recovered = await pool.selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(recovered.ok, true)
+  assert.equal(recovered.vmId, 'vm-02')
+  assert.equal(recovered.accountId, 'account-2')
+  recovered.release()
+})
+
 function busyKernelHealth() {
   return { ok: true, ready_slots: 0, cli_pid: 9, credential: { generation: 1, has_access: true } }
 }
@@ -2401,8 +2433,9 @@ test('family VM left only for kernel slot_busy keeps the family pin', async (t) 
   assert.equal(sticky.resolve(familyKey).vmId, home.vmId)
 })
 
-function applyRebuildAttempt(callerSession, stickyBound, extra = {}) {
+function applyRebuildAttempt(callerSession, extra = {}) {
   return async (_body, selected, attemptExtra = {}) => {
+    const stickyBound = attemptExtra.freshSlot ? null : attemptExtra.stickyBound
     const sessionId = resolveOutboundSessionId(callerSession, {
       mode: 'rebuild',
       officialClient: true,
@@ -2443,13 +2476,12 @@ test('rebuild outbound session stays on one VM and changes after failover', asyn
   const stickyKey = sticky.canonicalSessionKey(caller)
   const seen = []
   const headers = []
-  const firstBound = sticky.resolve(stickyKey)
   const first = await runner.run({
     requestId: 'rebuild-1',
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
     stickyKey,
-    applyAttempt: applyRebuildAttempt(caller, firstBound, { seen, headers, epoch: 1000 }),
+    applyAttempt: applyRebuildAttempt(caller, { seen, headers, epoch: 1000 }),
     callAttempt: () => verifiedHop('one'),
   })
   assert.equal(first.ok, true)
@@ -2460,14 +2492,13 @@ test('rebuild outbound session stays on one VM and changes after failover', asyn
   assert.equal(headers[0]['x-claude-code-session-id'], headers[0].metadata_session_id)
   assert.equal(headers[0]['x-claude-code-session-id'], seen[0].sessionId)
 
-  const secondBound = sticky.resolve(stickyKey)
   const secondSeen = []
   const second = await runner.run({
     requestId: 'rebuild-2',
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
     stickyKey,
-    applyAttempt: applyRebuildAttempt(caller, secondBound, { seen: secondSeen, epoch: 2000 }),
+    applyAttempt: applyRebuildAttempt(caller, { seen: secondSeen, epoch: 2000 }),
     callAttempt: () => verifiedHop('two'),
   })
   assert.equal(second.ok, true)
@@ -2501,7 +2532,7 @@ test('family migration remints parent and child outbound sessions', async (t) =>
     model: 'claude-opus-test',
     stickyKey: parentKey,
     familyKey,
-    applyAttempt: applyRebuildAttempt('parent-A', sticky.resolve(parentKey), { seen: parentSeen, epoch: 11 }),
+    applyAttempt: applyRebuildAttempt('parent-A', { seen: parentSeen, epoch: 11 }),
     callAttempt: () => verifiedHop('parent'),
   })
   const childSeen = []
@@ -2512,7 +2543,7 @@ test('family migration remints parent and child outbound sessions', async (t) =>
     stickyKey: childKey,
     familyKey,
     familyVmId: sticky.resolve(familyKey).vmId,
-    applyAttempt: applyRebuildAttempt('child-A', sticky.resolve(childKey), { seen: childSeen, epoch: 12 }),
+    applyAttempt: applyRebuildAttempt('child-A', { seen: childSeen, epoch: 12 }),
     callAttempt: () => verifiedHop('child'),
   })
   assert.equal(parent.ok, true)
@@ -2536,7 +2567,7 @@ test('family migration remints parent and child outbound sessions', async (t) =>
     stickyKey: parentKey,
     familyKey,
     familyVmId: otherVm,
-    applyAttempt: applyRebuildAttempt('parent-A', sticky.resolve(parentKey), { seen: parentAfter, epoch: 21 }),
+    applyAttempt: applyRebuildAttempt('parent-A', { seen: parentAfter, epoch: 21 }),
     callAttempt: () => verifiedHop('parent-2'),
   })
   const child2 = await runner.run({
@@ -2546,7 +2577,7 @@ test('family migration remints parent and child outbound sessions', async (t) =>
     stickyKey: childKey,
     familyKey,
     familyVmId: otherVm,
-    applyAttempt: applyRebuildAttempt('child-A', sticky.resolve(childKey), { seen: childAfter, epoch: 22 }),
+    applyAttempt: applyRebuildAttempt('child-A', { seen: childAfter, epoch: 22 }),
     callAttempt: () => verifiedHop('child-2'),
   })
   assert.equal(parent2.ok, true)
@@ -2577,7 +2608,6 @@ test('intra-request failover remints and persists the second outbound session', 
   const caller = 'fail-A'
   const stickyKey = sticky.canonicalSessionKey(caller)
   const seen = []
-  const snapshot = sticky.resolve(stickyKey)
   let attempts = 0
   const result = await runner.run({
     requestId: 'rebuild-fail',
@@ -2585,7 +2615,7 @@ test('intra-request failover remints and persists the second outbound session', 
     model: 'claude-opus-test',
     stickyKey,
     applyAttempt: async (body, selected, attemptExtra) =>
-      applyRebuildAttempt(caller, snapshot, { seen, epoch: attemptExtra.attemptNo })(body, selected, attemptExtra),
+      applyRebuildAttempt(caller, { seen, epoch: attemptExtra.attemptNo })(body, selected, attemptExtra),
     callAttempt: () => {
       attempts += 1
       if (attempts === 1) {
@@ -2631,7 +2661,7 @@ test('returning to a previously used VM mints a new outbound session', async (t)
     canonicalBody: { model: 'claude-opus-test' },
     model: 'claude-opus-test',
     stickyKey,
-    applyAttempt: applyRebuildAttempt(caller, sticky.resolve(stickyKey), { seen: firstSeen, epoch: 1 }),
+    applyAttempt: applyRebuildAttempt(caller, { seen: firstSeen, epoch: 1 }),
     callAttempt: () => verifiedHop('one'),
   })
   const firstVm = first.vmId
@@ -2649,7 +2679,7 @@ test('returning to a previously used VM mints a new outbound session', async (t)
     model: 'claude-opus-test',
     stickyKey,
     pinVmId: firstVm,
-    applyAttempt: applyRebuildAttempt(caller, sticky.resolve(stickyKey), { seen: backSeen, epoch: 3 }),
+    applyAttempt: applyRebuildAttempt(caller, { seen: backSeen, epoch: 3 }),
     callAttempt: () => verifiedHop('back'),
   })
   assert.equal(back.ok, true)
@@ -2731,4 +2761,81 @@ test('a vm pool drops a sticky VM that is no longer a member', async (t) => {
   })
   assert.equal(blocked.ok, false)
   assert.equal(blocked.vmId, undefined)
+})
+
+function setActiveHours(root, id, activeHours) {
+  const file = path.join(root, 'vms', `${id}.json`)
+  const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+  vm.policy = { ...(vm.policy || {}), active_hours: activeHours }
+  fs.writeFileSync(file, JSON.stringify(vm))
+}
+
+// A UTC window opening ~2h from now: `now` is always outside, `until` is exact.
+function restingWindow() {
+  const now = new Date()
+  const pad = (n) => String(n).padStart(2, '0')
+  const startHour = (now.getUTCHours() + 2) % 24
+  const endHour = (now.getUTCHours() + 4) % 24
+  const until = new Date(now)
+  until.setUTCMinutes(0, 0, 0)
+  until.setUTCHours(startHour)
+  if (until.getTime() <= now.getTime()) until.setUTCDate(until.getUTCDate() + 1)
+  return {
+    config: { start: `${pad(startHour)}:00`, end: `${pad(endHour)}:00`, timezone: 'UTC' },
+    until: until.getTime(),
+  }
+}
+
+test('a resting slot is skipped and the pool fails over', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  setActiveHours(root, 'vm-01', restingWindow().config)
+  const selected = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-02')
+  selected.release()
+})
+
+test('an all-rest pool reports retry_after_ms for the next window open', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const rest = restingWindow()
+  setActiveHours(root, 'vm-01', rest.config)
+  setActiveHours(root, 'vm-02', rest.config)
+  const selected = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.reason, 'no_eligible_accounts')
+  const delta = rest.until - Date.now()
+  assert.ok(selected.retry_after_ms > 0, `retry_after_ms=${selected.retry_after_ms}`)
+  assert.ok(Math.abs(selected.retry_after_ms - delta) < 5000)
+})
+
+test('a pinned diagnostic still reaches a resting slot', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  setActiveHours(root, 'vm-01', restingWindow().config)
+  const selected = await scheduler(root).selectAndReserve({
+    model: 'claude-test',
+    pinVmId: 'vm-01',
+    allowWait: false,
+  })
+  assert.equal(selected.ok, true)
+  assert.equal(selected.vmId, 'vm-01')
+  selected.release()
+})
+
+test('a resting slot that cannot serve the model does not promise a Retry-After', async (t) => {
+  const root = project()
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const rest = restingWindow()
+  for (const id of ['vm-01', 'vm-02']) {
+    setActiveHours(root, id, rest.config)
+    const file = path.join(root, 'vms', `${id}.json`)
+    const vm = JSON.parse(fs.readFileSync(file, 'utf8'))
+    vm.policy.allowed_models = ['claude-other']
+    fs.writeFileSync(file, JSON.stringify(vm))
+  }
+  const selected = await scheduler(root).selectAndReserve({ model: 'claude-test', allowWait: false })
+  assert.equal(selected.ok, false)
+  assert.equal(selected.retry_after_ms, null)
 })

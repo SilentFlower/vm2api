@@ -18,13 +18,24 @@ import {
   isToolArgumentsError,
   toCodexResponses,
 } from './codex-convert.mjs'
-import { extraFromCodexHeaders, codexQuotaPark, CODEX_DEFAULT_PARK_MS } from './codex-usage.mjs'
-import { extractOpenaiUsage } from './openai-usage.mjs'
+import {
+  extraFromCodexHeaders,
+  codexCreditsFromHeaders,
+  codexQuotaPark,
+  CODEX_DEFAULT_PARK_MS,
+} from './codex-usage.mjs'
+import { extractOpenaiUsage, openaiAnthropicUsageFromExtract, disjointOpenaiUsage } from './openai-usage.mjs'
 import { streamCodexKernel } from '../transport/codex-kernel-client.mjs'
-import { ensureCodexKernel, writeCodexKernelConfig } from '../transport/codex-kernel-supervisor.mjs'
-import { boundProxyUrl, isLocalEgressProxy } from '../vm/egress.mjs'
+import {
+  codexKernelRequestOptions,
+  ensureCodexKernel,
+  writeCodexKernelConfig,
+} from '../transport/codex-kernel-supervisor.mjs'
+import { isLocalEgressProxy } from '../vm/egress.mjs'
+import { vmNodeId } from '../cluster/placement.mjs'
 import { hostProxyUrlForVm } from '../vm/slot-host.mjs'
 import { readCodexAccounts, upsertCodexAccount } from '../vm/codex-slot.mjs'
+import { scopeAccountFromVm } from './jev-intercept.mjs'
 import {
   CODEX_APP_VERSION,
   CODEX_CATALOG_ORIGINATOR,
@@ -35,12 +46,13 @@ import {
 } from './codex-models.mjs'
 import { orderCodexSessionSlots, codexSlotAllowsModel, isCodexFailoverError } from '../pool/codex-slot-pool.mjs'
 import {
+  holdOpenAIAccount,
   reportOpenAIAttempt,
   tryAcquireOpenAISlot,
   waitForOpenAICapacity,
   wakeOpenAIWaiter,
 } from '../pool/openai-account-runtime.mjs'
-import { CLIENT_POOL_BUSY_MESSAGE } from '../core/errors.mjs'
+import { CLIENT_POOL_BUSY_MESSAGE, CLIENT_POOL_UNAVAILABLE_MESSAGE, ErrorCode } from '../core/errors.mjs'
 import { applyOpenaiWashLog } from './openai-wash.mjs'
 import { sessionIdForLog } from './log-fields.mjs'
 import { redactHeaders } from '../admin/request-log.mjs'
@@ -132,6 +144,45 @@ function firstUserIdentityFromCodex(body = {}) {
   return extractFirstUserIdentity(body?.messages) || String(body?.prompt || '')
 }
 
+/** Codex failover shares the Claude pool's attempt budget. */
+export function codexFailoverBudget(routing = {}) {
+  const failover = routing?.failover || {}
+  const attempts = Number(failover.max_total_attempts)
+  const switches = Number(failover.max_account_switches)
+  const sameRetries = Number(failover.max_same_account_retries)
+  return {
+    maxAttempts: Number.isFinite(attempts) && attempts > 0 ? Math.min(64, Math.floor(attempts)) : 12,
+    maxSwitches: Number.isFinite(switches) && switches >= 0 ? Math.min(63, Math.floor(switches)) : 3,
+    maxSameAccountRetries: Number.isFinite(sameRetries) && sameRetries >= 0 ? Math.min(16, Math.floor(sameRetries)) : 3,
+  }
+}
+
+/** Same-account retries are only useful for transient failures; auth and quota errors switch seats. */
+export function isRetryableSameCodexAccount(
+  result,
+  { headersSent = false, conversionError = null, signal = null } = {},
+) {
+  if (!result || result.ok === true || result.committed === true || headersSent || conversionError) return false
+  if (signal?.aborted) return false
+  const status = Number(result.status) || 0
+  const code = String(result.body?.error?.code || result.error_code || '')
+  const message = String(result.body?.error?.message || result.error || '')
+  if (
+    /content_policy|refusal|usage_policy|guard|tool_arguments_mismatch|upstream_protocol_error/i.test(
+      `${code} ${message}`,
+    )
+  )
+    return false
+  if (result.transportError === true || status === 0) return true
+  if (status === 408) return true
+  if (status === 500 || status === 502 || status === 503 || status === 504) {
+    return (
+      code === '' || /server_error|provider_error|upstream_error|overloaded_error|internal_error|transport/i.test(code)
+    )
+  }
+  return false
+}
+
 function applyCodexRebuildBody(body, sessionId, mode) {
   const out = { ...body }
   if (mode !== 'rebuild') return out
@@ -199,13 +250,15 @@ export function pickCodexCandidates(
     excluded,
     quotaPolicy: routingPolicy,
   })
-  if (bound?.vmId && sessionKey && ordered.boundState === 'gone') {
+  // A resting home migrates the conversation like a gone one: the next slot rebinds it.
+  const boundLeft = ordered.boundState === 'gone' || ordered.boundState === 'resting'
+  if (bound?.vmId && sessionKey && boundLeft) {
     for (const key of stickyKeys.length ? stickyKeys : [sessionKey]) stickyRouter?.unbind?.(key)
     try {
       sessions?.drop?.(bound.vmId, sessionKey)
     } catch {}
   }
-  if (continuesResponse && (ordered.boundState === 'gone' || ordered.error === 'candidates_exhausted')) {
+  if (continuesResponse && (boundLeft || ordered.error === 'candidates_exhausted')) {
     return { error: 'response_not_portable', ids: [], sessionKey, stickyKeys, boundVmId: bound.vmId }
   }
   return { ...ordered, sessionKey, stickyKeys }
@@ -215,15 +268,17 @@ function ingestCodexHop(projectRoot, vmId, result, now = Date.now(), policy = nu
   const headers = result?.headers || {}
   const extra = extraFromCodexHeaders(headers, now)
   let limitedUntil = null
+  let quotaExceeded = false
   if (
     isCodexFailoverError(result) &&
     (Number(result?.status) === 429 || /usage_limit_reached/.test(String(result?.body?.error?.code || '')))
   ) {
     const park = extra ? codexQuotaPark(extra, now) : { limited: true, until: now + CODEX_DEFAULT_PARK_MS }
     limitedUntil = park.until || now + CODEX_DEFAULT_PARK_MS
+    quotaExceeded = String(result?.body?.error?.code || result?.error_code || '') === 'usage_limit_reached'
   }
-  if (!extra && !limitedUntil) return null
-  return persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, now, policy })
+  if (!extra && !limitedUntil && !codexCreditsFromHeaders(headers, now)) return null
+  return persistCodexUsage(projectRoot, vmId, { headers, extra, limitedUntil, quotaExceeded, now, policy })
 }
 
 function execFor(projectRoot, vm) {
@@ -244,6 +299,32 @@ export function isRetryableCodexTransport(result) {
   if (status === 0) return true
   if (status === 502 && /upstream_transport|worker_transport|transport/i.test(`${code} ${msg}`)) return true
   return /upstream_transport|worker_transport_error/i.test(code)
+}
+
+/**
+ * Short process-local hold for an account that just failed upstream. This is
+ * not the operator scheduling switch: it expires by itself and keeps the next
+ * request from spending another turn on the same dead 401 / rate-limited
+ * account. Committed streams and request-shaped errors are never parked.
+ */
+export function codexFailureHold(result, now = Date.now()) {
+  if (!result || result.ok === true || result.committed === true) return null
+  const status = Number(result.status) || 0
+  const code = String(result.body?.error?.code || result.error_code || '')
+  const message = String(result.body?.error?.message || result.error || '')
+  if (status === 400 || status === 422) return null
+  if (
+    /content_policy|refusal|usage_policy|guard|tool_arguments_mismatch|upstream_protocol_error/i.test(
+      `${code} ${message}`,
+    )
+  )
+    return null
+  if (status === 401) return { until: now + 5 * 60_000, reason: 'oauth_401' }
+  if (status === 403) return { until: now + 5 * 60_000, reason: 'permission_denied' }
+  if (status === 429) return { until: now + 60_000, reason: 'rate_limited' }
+  if (status === 408 || status >= 500) return { until: now + 30_000, reason: 'upstream_5xx' }
+  if (result.transportError === true || status === 0) return { until: now + 30_000, reason: 'transport_error' }
+  return null
 }
 
 /** Idle SOCKS / first hop 502 is retryable only before any SSE byte is committed. */
@@ -433,6 +514,8 @@ export async function handleCodexProtocol({
   sessions = null,
   body = null,
   captureOutbound = false,
+  requestStartedAt = Date.now(),
+  accountGate = null,
 }) {
   const codex = normalizeCodexRouting(routing.codex)
   const allowed = isCodexProtocolAllowed(protocol, { codex })
@@ -509,10 +592,16 @@ export async function handleCodexProtocol({
   }
   const deadline = Date.now() + codexWaitTimeoutMs(routing)
   const gone = clientGoneSignal(req, res)
+  const failoverBudget = codexFailoverBudget(routing)
+  const sameRetryDelay = Number(routing?.failover?.same_account_retry_delay_ms)
+  const sameRetryDelayMs =
+    Number.isFinite(sameRetryDelay) && sameRetryDelay >= 0 ? Math.min(10_000, sameRetryDelay) : 100
   logBag.via = 'codex-kernel'
   logBag.attempt_count = 0
   let last = null
   let hops = 0
+  let attempts = 0
+  let switches = 0
   let counted = false
   try {
     for (;;) {
@@ -534,10 +623,25 @@ export async function handleCodexProtocol({
         pickOpts.excluded.add(admitted.vmId)
         continue
       }
+      attempts += 1
+      if (attempts > failoverBudget.maxAttempts) {
+        lease.release()
+        break
+      }
       if (!counted) {
         counted = true
         stats.requests++
         stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
+      }
+      // The slot is known here, so an account scope can be applied. `true`
+      // means the 403 is already written.
+      if (accountGate) {
+        logBag.vm_id = vm.id
+        const blocked = await accountGate(scopeAccountFromVm(vm))
+        if (blocked) {
+          lease.release()
+          return
+        }
       }
       const stickyKeys = picked.stickyKeys?.length ? picked.stickyKeys : picked.sessionKey ? [picked.sessionKey] : []
       const stickyBound = picked.sessionKey ? stickyRouter?.resolve?.(picked.sessionKey) : null
@@ -566,9 +670,13 @@ export async function handleCodexProtocol({
       }
       let attemptKind = 'failed'
       try {
-        writeCfg(projectRoot, vm, {
-          proxyUrl: boundProxyUrl(vm.proxy),
+        const localExit = isLocalEgressProxy(vm.proxy)
+        const written = writeCfg(projectRoot, vm, {
+          // Same rule as slot start: a node on local egress must leave through
+          // that node's forwarder, not the control plane's deployment proxy.
+          proxyUrl: localExit && !vmNodeId(vm) ? '' : hostProxyUrlForVm(vm),
           proxyRequired: true,
+          routing,
         })
         const ready = await ensure(execFor(projectRoot, vm))
         if (!ready?.ok) {
@@ -586,7 +694,11 @@ export async function handleCodexProtocol({
             },
           }
           pickOpts.excluded.add(vm.id)
-          if (!res.headersSent) continue
+          switches += 1
+          if (!res.headersSent) {
+            if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
+            continue
+          }
           stats.errors++
           logBag.error_code = 'codex_kernel_unavailable'
           return json(res, 503, last.body)
@@ -626,56 +738,87 @@ export async function handleCodexProtocol({
         const outboundHeaders = codexKernelHeaders(req.headers, outboundBody, session)
         if (captureOutbound) logBag.outbound_body = outboundBody
         logBag.outbound_headers = redactHeaders(outboundHeaders)
-        const result = await runCodexKernelHop({
-          hop,
-          args: {
-            exec: execFor(projectRoot, vm),
-            signal: gone.signal,
-            body: outboundBody,
-            reqHeaders: req.headers,
-            envelope: {
+        let hopEmitted = false
+        const runHop = () =>
+          runCodexKernelHop({
+            hop,
+            args: {
+              exec: execFor(projectRoot, vm),
+              signal: gone.signal,
               body: outboundBody,
-              headers: outboundHeaders,
-              stream: true,
-              session,
+              reqHeaders: req.headers,
+              envelope: {
+                body: outboundBody,
+                headers: outboundHeaders,
+                stream: true,
+                session,
+                options: { ...codexKernelRequestOptions(routing), installation_id: written?.installationId },
+              },
             },
-          },
-          onReasoningFallback: ({ body: retryBody }) => {
-            if (captureOutbound) logBag.outbound_body = retryBody
-          },
-          onEvent: async (line) => {
-            if (conversionError) return
-            const tier = serviceTierFromSseLine(line)
-            if (tier) responseServiceTier = tier
-            const seen = usageFromSseLine(line)
-            if (seen) streamedUsage = preferUsage(streamedUsage, seen)
-            if (!stream) {
-              chunks.push(line)
-              return
-            }
-            if (!res.headersSent) writeSSEHeaders(res)
-            if (protocol !== 'openai.responses') {
-              try {
-                const mapped =
-                  protocol === 'anthropic.messages'
-                    ? responsesSseToAnthropicEvents(line, anthropicSse)
-                    : responsesSseToChatChunk(line, 'codex', chatSse)
-                if (mapped) res.write(mapped)
-              } catch (error) {
-                if (error.code !== 'tool_arguments_mismatch') throw error
-                conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
-                res.write(
-                  protocol === 'anthropic.messages'
-                    ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
-                    : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
-                )
+            onReasoningFallback: ({ body: retryBody }) => {
+              if (captureOutbound) logBag.outbound_body = retryBody
+            },
+            onEvent: async (line) => {
+              hopEmitted = true
+              if (conversionError) return
+              const tier = serviceTierFromSseLine(line)
+              if (tier) responseServiceTier = tier
+              const seen = usageFromSseLine(line)
+              if (seen) streamedUsage = preferUsage(streamedUsage, seen)
+              if (!stream) {
+                chunks.push(line)
+                return
               }
-              return
-            }
-            const named = nameSseEvent(line)
-            if (named) res.write(named)
-          },
-        })
+              if (!res.headersSent) writeSSEHeaders(res)
+              if (protocol !== 'openai.responses') {
+                try {
+                  const mapped =
+                    protocol === 'anthropic.messages'
+                      ? responsesSseToAnthropicEvents(line, anthropicSse)
+                      : responsesSseToChatChunk(line, 'codex', chatSse)
+                  if (mapped) res.write(mapped)
+                } catch (error) {
+                  if (error.code !== 'tool_arguments_mismatch') throw error
+                  conversionError = { type: 'upstream_protocol_error', code: error.code, message: error.message }
+                  res.write(
+                    protocol === 'anthropic.messages'
+                      ? `event: error\ndata: ${JSON.stringify({ type: 'error', error: conversionError })}\n\n`
+                      : `data: ${JSON.stringify({ error: conversionError })}\n\ndata: [DONE]\n\n`,
+                  )
+                }
+                return
+              }
+              const named = nameSseEvent(line)
+              if (named) res.write(named)
+            },
+          })
+        let result = await runHop()
+        // A transient seat-local failure gets the same account up to N retries
+        // before the request spends a switch. 401/403/429 are never retried here:
+        // they are credential/account state and must move to another seat.
+        let sameAccountRetries = result?.transport_retried || result?.reasoning_history_retried ? 1 : 0
+        while (
+          sameAccountRetries < failoverBudget.maxSameAccountRetries &&
+          attempts < failoverBudget.maxAttempts &&
+          isRetryableSameCodexAccount(result, {
+            headersSent: res.headersSent || hopEmitted,
+            conversionError,
+            signal: gone.signal,
+          })
+        ) {
+          sameAccountRetries += 1
+          attempts += 1
+          hops += 1
+          logBag.attempt_count = hops
+          logBag.codex_same_account_retried = sameAccountRetries
+          await new Promise((resolve) => setTimeout(resolve, sameRetryDelayMs))
+          hopEmitted = false
+          result = await runHop()
+        }
+        // The log and total duration share ingress time; pool scoring keeps hop TTFT.
+        logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
+          ? Math.max(0, result.firstTokenAt - requestStartedAt)
+          : (result?.ttftMs ?? null)
         if (conversionError) {
           result.ok = false
           result.status = 502
@@ -699,17 +842,23 @@ export async function handleCodexProtocol({
           bindSticky(outboundSessionId)
           const extracted = extractOpenaiUsage(usage)
           const serviceTier = responseServiceTier || converted.body?.service_tier || usage?.service_tier || null
-          logBag.usage = usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage
-          logBag.input_tokens = extracted?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
-          logBag.output_tokens = extracted?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
+          const disjoint = extracted ? openaiAnthropicUsageFromExtract(extracted) : null
+          const logged = disjointOpenaiUsage(usage && serviceTier ? { ...usage, service_tier: serviceTier } : usage)
+          logBag.usage = logged
+          logBag.input_tokens = disjoint?.input_tokens ?? usage?.input_tokens ?? usage?.prompt_tokens ?? null
+          logBag.output_tokens = disjoint?.output_tokens ?? usage?.output_tokens ?? usage?.completion_tokens ?? null
           logBag.cache_read_tokens =
-            extracted?.cached_tokens ?? usage?.input_tokens_details?.cached_tokens ?? usage?.cache_read_tokens ?? null
+            disjoint?.cache_read_input_tokens ??
+            extracted?.cached_tokens ??
+            usage?.input_tokens_details?.cached_tokens ??
+            usage?.cache_read_tokens ??
+            null
           logBag.cache_creation_tokens =
+            disjoint?.cache_creation_input_tokens ??
             extracted?.cache_write_tokens ??
             usage?.input_tokens_details?.cache_write_tokens ??
             usage?.cache_creation_tokens ??
             null
-          logBag.first_token_ms = result.ttftMs ?? null
           reportOpenAIAttempt(vm.id, 'succeeded', result.ttftMs ?? null)
           logBag.final_state = result?.ok ? result.terminalState || 'verified' : 'verified'
           logBag.upstream_model = converted.body.model
@@ -737,7 +886,9 @@ export async function handleCodexProtocol({
           return res.end()
         }
         reportOpenAIAttempt(vm.id, attemptKind, result?.ttftMs ?? null)
-        if (res.headersSent) {
+        const failureHold = codexFailureHold(result)
+        if (failureHold) holdOpenAIAccount(vm.id, failureHold)
+        if (res.headersSent || hopEmitted) {
           stats.errors++
           logBag.error_code = result?.body?.error?.code || 'codex_upstream'
           logBag.upstream_status = result?.status || 0
@@ -746,6 +897,8 @@ export async function handleCodexProtocol({
         if (isCodexFailoverError(result)) {
           pickOpts.excluded.add(vm.id)
           leaveSticky()
+          switches += 1
+          if (switches > failoverBudget.maxSwitches || attempts >= failoverBudget.maxAttempts) break
           continue
         }
         break
@@ -832,6 +985,19 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
         code: 'pool_overloaded',
         message: CLIENT_POOL_BUSY_MESSAGE,
         details: { reason: picked.error },
+      },
+    })
+  }
+  if (picked.error === 'pool_resting') {
+    // Every slot is off-shift: 503 like the Claude pool, timed to the first window open.
+    const waitMs = Number(picked.retryAt) - Date.now()
+    res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
+    return json(res, 503, {
+      error: {
+        type: 'api_error',
+        code: ErrorCode.POOL_UNAVAILABLE,
+        message: CLIENT_POOL_UNAVAILABLE_MESSAGE,
+        details: { reason: 'pool_resting' },
       },
     })
   }

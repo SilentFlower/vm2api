@@ -9,6 +9,7 @@ import crypto from 'node:crypto'
 import { resolveStoreDb } from '../db/database.mjs'
 import { UsersRepo } from '../db/repos/users-repo.mjs'
 import { clampVmCreateQuota } from './resource-owner.mjs'
+import { reclaimAssignedVms } from '../vm/vm-registry.mjs'
 
 export const PANEL_ROLES = ['admin', 'super', 'user']
 
@@ -117,9 +118,10 @@ export function publicUserView(rec) {
 }
 
 export class PanelUserStore {
-  constructor({ dataDir, db } = {}) {
+  constructor({ dataDir, db, projectRoot = null } = {}) {
     this.db = resolveStoreDb({ db, dataDir })
     this.repo = new UsersRepo(this.db)
+    this.projectRoot = projectRoot
   }
 
   rebind(db) {
@@ -148,7 +150,20 @@ export class PanelUserStore {
     if (!name || !password) return null
     const existing = this.repo.getByUsername(name)
     if (existing) return publicUserView(existing)
-    return publicUserView(this.create({ username: name, password, role: 'admin' }))
+    // Import the already accepted env credential; new passwords still go through assertPassword.
+    return publicUserView(
+      this.repo.insert({
+        id: crypto.randomUUID(),
+        username: assertUsername(name),
+        password_hash: hashPassword(password),
+        role: 'admin',
+        enabled: true,
+        vm_create_quota: 0,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+        last_login_at: null,
+      }),
+    )
   }
 
   authenticate(username, password) {
@@ -236,6 +251,8 @@ export class PanelUserStore {
       err.code = 'last_admin'
       throw err
     }
+    // Validate deletion first; a failed slot write must leave the user available for retry.
+    if (this.projectRoot) reclaimAssignedVms(this.projectRoot, new Set([rec.id]))
     return this.repo.remove(id)
   }
 }

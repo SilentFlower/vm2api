@@ -32,31 +32,32 @@ import { ensureSlotSubscriptionType } from './lib/oauth/oauth-credentials.mjs'
 import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
 import { ensureTelemetrySidecar } from './lib/vm/slot-process-status.mjs'
 
+import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
+import { createCatalogMonitor } from './lib/admin/catalog-monitor.mjs'
 import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs'
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
 import { createPeakPrimeMonitor, normalizePeakPrimeConfig } from './lib/admin/peak-prime.mjs'
 import { normalizeNotifyConfig, createNotifyMonitor, dispatchNotify } from './lib/admin/notify.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
+import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
 import { setManualScheduleWins } from './lib/pool/schedule-policy.mjs'
 import { AccountQuota } from './lib/pool/account-quota.mjs'
 import { normalizeTiers } from './lib/pool/quota-tiers.mjs'
 import { ApiKeyStore } from './lib/admin/api-keys.mjs'
+import { keyScopeFromRequest } from './lib/admin/key-scope.mjs'
 import { GroupsRepo } from './lib/db/repos/groups-repo.mjs'
+import { SettingsRepo } from './lib/db/repos/settings-repo.mjs'
 import { ApiEndpointStore } from './lib/admin/api-endpoints.mjs'
 import { ApiScheduler } from './lib/pool/api-scheduler.mjs'
 import { resolveInferenceBackend } from './lib/pool/api-protocol.mjs'
-import {
-  startApiKernelProcess,
-  apiKernelPaths,
-  ensureApiKernelToken,
-  apiKernelSnapshot,
-} from './lib/transport/api-kernel-client.mjs'
+import { bootApiKernel, apiKernelPaths, apiKernelSnapshot } from './lib/transport/api-kernel-client.mjs'
 import { PanelUserStore } from './lib/admin/panel-users.mjs'
 import { RequestLogStore } from './lib/admin/request-log.mjs'
 import {
+  bindVmProxy,
   listVms,
   getVm,
   getActiveVmId,
@@ -78,9 +79,12 @@ import { BackupService } from './lib/admin/backup-service.mjs'
 import { ClusterNodesRepo } from './lib/db/repos/cluster-nodes-repo.mjs'
 import { ClusterManager } from './lib/cluster/cluster-manager.mjs'
 import { createClusterRoutes } from './lib/cluster/cluster-routes.mjs'
-import { bindPlacement } from './lib/cluster/placement.mjs'
-import { startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
+import { bindPlacement, nodeImageBuildRunning } from './lib/cluster/placement.mjs'
+import { ClusterError } from './lib/cluster/ssh-link.mjs'
+import { nodeEgressProxyUrl, startNodeEgressSocks } from './lib/cluster/node-egress-socks.mjs'
 import { createSlotShell } from './lib/vm/slot-shell.mjs'
+import { vmLockBusy } from './lib/vm/vm-file.mjs'
+import { refreshSlotGuestBinDir } from './lib/vm/vm-runtime.mjs'
 
 import {
   classifyCredentialRefresh,
@@ -91,10 +95,12 @@ import { normalizeCredentialMode } from './lib/oauth/credential-mode.mjs'
 import { ensureWorkerCredential } from './lib/transport/go-worker-client.mjs'
 import { stopAllRustKernels } from './lib/transport/rust-kernel-supervisor.mjs'
 import { createRespond, parseRequestUrl } from './lib/http/respond.mjs'
+import { corsHeadersForRequest } from './lib/http/cors.mjs'
 import { isConsoleEntry, tryServeWebDist } from './lib/http/web-dist.mjs'
 import { createRoutingRuntime } from './lib/admin/routing-runtime.mjs'
 import { createImportCommit } from './lib/oauth/import-commit.mjs'
 import { createHandleProtocol } from './lib/protocol/handle-protocol.mjs'
+import { createResponsesWsHandler } from './lib/protocol/responses-ws.mjs'
 import { handleUserCountTokens, handleUserUsage } from './lib/protocol/user-count-tokens.mjs'
 import { createPanelHandler } from './lib/admin/panel-routes.mjs'
 
@@ -156,6 +162,9 @@ if (vmSync.upserted || vmSync.rebuilt) {
 if (vmSync.proxy_cli_repaired) {
   console.log(`[vm] repaired proxy_cli_enabled on ${vmSync.proxy_cli_repaired} slot(s)`)
 }
+if (vmSync.reclaimed_vm_ids.length) {
+  console.log(`[vm] reclaimed ${vmSync.reclaimed_vm_ids.length} slot(s) assigned to deleted users`)
+}
 
 // --- P3 sticky + quota ---
 
@@ -166,6 +175,7 @@ let credentialRefreshMonitor = null
 let kernelWatchdog = null
 let cliNodeGuard = null
 let usageProbeMonitor = null
+let catalogMonitor = null
 let notifyMonitor = null
 
 let routingConfig = {}
@@ -304,9 +314,7 @@ groupsRepo = new GroupsRepo()
 const apiEndpointStore = new ApiEndpointStore({ dataDir: cfg.paths.data })
 const apiScheduler = new ApiScheduler()
 apiScheduler.reload(apiEndpointStore.listRaw())
-ensureApiKernelToken(apiKernelPaths(cfg).tokenPath)
-startApiKernelProcess(cfg)
-const panelUsers = new PanelUserStore({ dataDir: cfg.paths.data })
+const panelUsers = new PanelUserStore({ dataDir: cfg.paths.data, projectRoot: cfg.paths.project })
 try {
   panelUsers.bootstrapFromEnv(getPanelAdmin())
 } catch (e) {
@@ -335,8 +343,26 @@ try {
 } catch {}
 requestLog.startCleanupScheduler()
 
+// Set once the cluster manager exists; node local rows probe through it.
+let localEgressCluster = null
 proxyPool = new ProxyPool({
   dataDir,
+  // null = control plane; undefined = no such slot.
+  vmNodeOf: (vmId) => {
+    const vm = getVm(cfg.paths.project, vmId)
+    return vm ? vm.node_id || null : undefined
+  },
+  localExitUrl: (nodeId) => nodeEgressProxyUrl(nodeId),
+  localExitHealth: (nodeId) => {
+    // Boot order: the first probe may run before the cluster is up. Unknown, not down.
+    if (!localEgressCluster) return { ok: true, latency_ms: null }
+    const node = localEgressCluster.get(nodeId)
+    const state = node.link?.state || 'idle'
+    if (state === 'ready') return { ok: true, latency_ms: node.health?.latency_ms ?? null }
+    // Still dialling (boot, reconnect): no verdict; the link-state hook re-probes once it settles.
+    if (state === 'idle' || state === 'connecting') return { pending: true, error: `node_link_${state}` }
+    return { ok: false, error: `node_link_${state}` }
+  },
   onDisableVm: (vmId, reason, proxyId) => {
     setVmSchedulable(cfg.paths.project, vmId, false, `${reason}|proxy=${proxyId}`)
   },
@@ -352,6 +378,12 @@ proxyPool = new ProxyPool({
   egressCheck: (proxy) => proxyEgressReady(proxy, cfg.paths.project),
   repairEgress: (proxy) => ensureProxyEgress(cfg.paths.project, proxy),
 })
+// An upgrade replaces bin/ files; slots mounting data/run/slot-guest-bin must see the new ones.
+try {
+  refreshSlotGuestBinDir(cfg.paths.project)
+} catch (err) {
+  console.warn('[bootstrap] slot-guest-bin refresh failed:', err?.message || err)
+}
 proxyPool.startScheduler()
 
 // 首次安装的出口池是空的，槽没有可绑出口就起不来。本机出口永远成立，先补上。
@@ -359,7 +391,7 @@ try {
   if (!proxyPool.snapshot().proxies?.length) {
     const seeded = proxyPool.ensureLocal()
     if (seeded.created) {
-      ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(seeded.proxy.id))
+      void ensureProxyEgress(cfg.paths.project, proxyPool.getProxyByIdWithAuth(seeded.proxy.id))
       console.log('[bootstrap] seeded local egress px-local')
     }
   }
@@ -458,6 +490,20 @@ peakPrimeMonitor = createPeakPrimeMonitor({
       extraHeaders: { [HEALTH_REAL_HEADER]: '1' },
     }),
 })
+const vmTestSchedule = new VmTestScheduleRunner({
+  projectRoot: cfg.paths.project,
+  settings: () => new SettingsRepo(),
+  list: () => listVms(cfg.paths.project),
+  runTest: (vmId, params) =>
+    runVmTestChat({
+      projectRoot: cfg.paths.project,
+      vmId,
+      ...params,
+      baseUrl: `http://127.0.0.1:${cfg.port}`,
+      apiKey: cfg.api_key,
+      accountQuota,
+    }),
+})
 credentialRefreshMonitor = createCredentialRefreshMonitor({
   config: normalizeCredentialRefreshConfig(routingConfig.credential_refresh),
   listTargets: () =>
@@ -478,12 +524,17 @@ credentialRefreshMonitor = createCredentialRefreshMonitor({
       force: false,
     }),
 })
+function bootSlot(id) {
+  return powerOnSlot({ projectRoot: cfg.paths.project, id, proxyPool, routing: routingConfig })
+}
 kernelWatchdog = createKernelWatchdog({
   config: routingConfig.kernel_watchdog,
   listTargets: () => listVms(cfg.paths.project),
   getRouting: () => routingConfig,
   homeDirFor: (vm) => path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
   ensureTelemetry: (vm) => ensureTelemetrySidecar({ projectRoot: cfg.paths.project, vm }),
+  revive: (vm) => bootSlot(vm.id),
+  healBridges: createSlotBridgeHealer({ projectRoot: cfg.paths.project }),
   onFault: (vm, reason) => {
     const title = `槽内核故障 ${vm.id}`
     dispatchNotify(routingConfig.notify, {
@@ -517,6 +568,11 @@ usageProbeMonitor = createUsageProbeMonitor({
     } catch {}
   },
   probeOne: (vm) => panel.buildProbeOne({ cfg, accountQuota, id: vm.id, routingConfig }),
+})
+catalogMonitor = createCatalogMonitor({
+  projectRoot: cfg.paths.project,
+  codexCatalogVersion: () => routingConfig.codex?.catalog_client_version || 'auto',
+  log: (event) => console.log(JSON.stringify(event)),
 })
 notifyMonitor = createNotifyMonitor({
   config: routingConfig.notify,
@@ -580,6 +636,7 @@ backupService.onRestored((db) => {
 
   initPoolRuntime()
   reloadActiveVm(cfg)
+  vmTestSchedule.reload()
 })
 backupService.startScheduler()
 
@@ -783,8 +840,8 @@ function requireAuth(req, res) {
   return true
 }
 
-function fetchWorkerModels() {
-  return gatewayModelCatalog()
+function fetchWorkerModels(opts) {
+  return gatewayModelCatalog(opts)
 }
 
 const importCommit = createImportCommit({
@@ -843,16 +900,61 @@ const { handleProtocol, handleSearch } = createHandleProtocol({
   },
 })
 
+const responsesWs = createResponsesWsHandler({
+  handleProtocol,
+  requireAuth,
+  json,
+  getRouting: () => routingConfig,
+  maxBodyBytes: cfg.limits.max_body_bytes,
+})
+
+/**
+ * One local egress row per VPS: rows for current nodes, and slots still on
+ * another machine's row (the shared px-local before per-node rows) move onto
+ * their own node's row, with the slot's recorded proxy rewritten to match.
+ */
+function syncNodeLocalEgress() {
+  try {
+    proxyPool.syncLocalNodes(clusterManager.list().map((node) => node.id))
+    for (const move of proxyPool.adoptNodeLocalBindings()) {
+      bindVmProxy(cfg.paths.project, move.vm_id, proxyPool.getProxyByIdWithAuth(move.to))
+      console.log(`[local-egress] ${move.vm_id}: ${move.from} -> ${move.to}`)
+    }
+  } catch (e) {
+    console.warn('[local-egress] node sync failed', e?.message || e)
+  }
+}
+
 const clusterManager = new ClusterManager({
   repo: new ClusterNodesRepo(),
   dataDir,
   listen: { host: cfg.host, port: cfg.port },
   vmsOnNode: (nodeId) => listVms(cfg.paths.project).filter((vm) => vm.node_id === nodeId),
+  assertNodeEditable: (nodeId) => {
+    const busy = listVms(cfg.paths.project).some(
+      (vm) =>
+        vm.node_id === nodeId &&
+        (Number(poolScheduler?.vmInflight?.get(vm.id) || 0) > 0 ||
+          vmLockBusy(path.join(cfg.paths.project, 'vms', `${vm.id}.json`))),
+    )
+    if (busy || nodeImageBuildRunning(nodeId)) {
+      throw new ClusterError(409, 'node_in_use', '节点仍有进行中的请求、虚拟机操作或镜像构建，请完成后重试')
+    }
+  },
+  onNodesChanged: () => syncNodeLocalEgress(),
+  // A node's local row follows its link: re-probe as soon as the link settles.
+  onLinkState: (nodeId, state) => {
+    if (state === 'ready' || state === 'error' || state === 'backoff') {
+      proxyPool.probeLocalNode(nodeId).catch(() => {})
+    }
+  },
 })
+localEgressCluster = clusterManager
 bindPlacement({ manager: clusterManager, projectRoot: cfg.paths.project })
 await startNodeEgressSocks({ clientFor: (nodeId) => clusterManager.client(nodeId) })
 clusterManager.start()
 clusterManager.restoreSlotRelays()
+syncNodeLocalEgress()
 if (proxyPool.snapshot().config.ipv6_enabled !== true) {
   const exits = await syncIpv6ProxyEgress(cfg.paths.project, proxyPool)
   for (const exit of exits.filter((item) => !item.ok)) {
@@ -905,6 +1007,9 @@ const handlePanel = createPanelHandler({
   get notifyMonitor() {
     return notifyMonitor
   },
+  get kernelWatchdog() {
+    return kernelWatchdog
+  },
   get runtimeRepo() {
     return runtimeRepo
   },
@@ -923,6 +1028,7 @@ const handlePanel = createPanelHandler({
   apiScheduler,
   panelUsers,
   requestLog,
+  vmTestSchedule,
   backupService,
   stats,
   persistRoutingPatch,
@@ -946,13 +1052,9 @@ const handlePanel = createPanelHandler({
 
 const server = http.createServer(async (req, res) => {
   try {
+    res.req = req
     if (req.method === 'OPTIONS') {
-      res.writeHead(204, {
-        'access-control-allow-origin': '*',
-        'access-control-allow-headers':
-          'authorization, content-type, x-api-key, anthropic-version, anthropic-beta, x-session-id, x-kin-rewrite, x-panel-token, x-kin-vm, x-kin-backend',
-        'access-control-allow-methods': 'GET,POST,OPTIONS,PUT,DELETE',
-      })
+      res.writeHead(204, corsHeadersForRequest(req))
       return res.end()
     }
 
@@ -1059,7 +1161,7 @@ const server = http.createServer(async (req, res) => {
       if (resolveInferenceBackend(req) === 'api') {
         return json(res, 200, apiScheduler.catalog())
       }
-      const result = await fetchWorkerModels()
+      const result = await fetchWorkerModels({ groupType: keyScopeFromRequest(req).group_type })
       return json(res, 200, result)
     }
     if (req.method === 'POST' && p === '/admin/models/refresh') {
@@ -1099,6 +1201,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'POST' && (p === '/v1/responses' || p === '/responses')) {
       return await handleProtocol(req, res, 'openai.responses', p)
     }
+    if (req.method === 'GET' && (p === '/v1/responses' || p === '/responses')) {
+      return json(res, 426, {
+        error: {
+          type: 'invalid_request_error',
+          code: 'websocket_upgrade_required',
+          message: 'WebSocket upgrade required',
+        },
+      })
+    }
     if (req.method === 'POST' && (p === '/v1/messages' || p === '/messages')) {
       return await handleProtocol(req, res, 'anthropic.messages', p)
     }
@@ -1121,6 +1232,7 @@ const server = http.createServer(async (req, res) => {
 })
 
 server.on('upgrade', (req, socket, head) => {
+  if (responsesWs.handleUpgrade(req, socket, head)) return
   if (clusterRoutes.handleUpgrade(req, socket, head)) return
   if (!slotShell.handleUpgrade(req, socket, head)) socket.destroy()
 })
@@ -1146,6 +1258,8 @@ server.on('clientError', (err, socket) => {
   )
 })
 
+const publicEndpoint = (suffix) => (cfg.base_url ? `${cfg.base_url}${suffix}` : null)
+
 const pub = {
   base_url: cfg.base_url,
   api_key_set: !!cfg.api_key,
@@ -1156,13 +1270,13 @@ const pub = {
   capabilities: GATEWAY_CAPABILITIES,
   limitations: LIMITATIONS,
   endpoints: {
-    health: `${cfg.base_url}/health`,
-    chat: `${cfg.base_url}/v1/chat/completions`,
-    responses: `${cfg.base_url}/v1/responses`,
-    messages: `${cfg.base_url}/v1/messages`,
-    count_tokens: `${cfg.base_url}/v1/messages/count_tokens`,
-    usage: `${cfg.base_url}/v1/usage`,
-    intercept_rules: `${cfg.base_url}/admin/intercept/rules`,
+    health: publicEndpoint('/health'),
+    chat: publicEndpoint('/v1/chat/completions'),
+    responses: publicEndpoint('/v1/responses'),
+    messages: publicEndpoint('/v1/messages'),
+    count_tokens: publicEndpoint('/v1/messages/count_tokens'),
+    usage: publicEndpoint('/v1/usage'),
+    intercept_rules: publicEndpoint('/admin/intercept/rules'),
   },
 }
 // Never persist the raw API key. Public snapshot only.
@@ -1177,6 +1291,9 @@ function shutdown(signal) {
   if (_shuttingDown) return
   _shuttingDown = true
   console.log(`[shutdown] ${signal} — closing`)
+  try {
+    vmTestSchedule.stop()
+  } catch {}
   try {
     backupService.stopScheduler()
   } catch {}
@@ -1200,6 +1317,9 @@ function shutdown(signal) {
   } catch {}
   try {
     usageProbeMonitor?.stop?.()
+  } catch {}
+  try {
+    catalogMonitor?.stop?.()
   } catch {}
 
   try {
@@ -1225,7 +1345,14 @@ function shutdown(signal) {
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
 
+await bootApiKernel(cfg)
+
 server.listen(cfg.port, cfg.host, () => {
+  try {
+    vmTestSchedule.start()
+  } catch (e) {
+    console.warn('[vm-test-schedule] start failed', e?.message || e)
+  }
   try {
     healthMonitor?.start?.({ immediate: true })
   } catch (e) {
@@ -1246,6 +1373,12 @@ server.listen(cfg.port, cfg.host, () => {
   } catch (e) {
     console.warn('[kernel-watchdog] start failed', e?.message || e)
   }
+  // Boot fills what Docker's restart policy missed (removed or exited slot containers); off with the watchdog.
+  if (process.env.KIN_CRS_MOCK !== '1' && normalizeKernelWatchdogConfig(routingConfig.kernel_watchdog).enabled) {
+    reviveDownSlots({ vms: listVms(cfg.paths.project), powerOn: bootSlot, watchdog: kernelWatchdog }).catch((e) =>
+      console.warn('[slot-revive] boot pass failed', e?.message || e),
+    )
+  }
   try {
     cliNodeGuard?.start?.({ immediate: true })
   } catch (e) {
@@ -1255,6 +1388,14 @@ server.listen(cfg.port, cfg.host, () => {
     usageProbeMonitor?.start?.({ immediate: true })
   } catch (e) {
     console.warn('[usage-probe] start failed', e?.message || e)
+  }
+  // The KIN_CRS_MOCK harness promises no outbound network; catalogs stay on builtin data there.
+  if (process.env.KIN_CRS_MOCK !== '1') {
+    try {
+      catalogMonitor?.start?.()
+    } catch (e) {
+      console.warn('[catalog-sync] start failed', e?.message || e)
+    }
   }
   try {
     notifyMonitor?.start?.({ immediate: true })

@@ -5,12 +5,12 @@ import {
   Cpu,
   Database,
   Download,
-  Gauge,
   KeyRound,
   Layers,
   LayoutDashboard,
   MessageSquareText,
   ScrollText,
+  Send,
   Server,
   Settings,
   ShieldAlert,
@@ -18,8 +18,8 @@ import {
 } from 'lucide-react'
 import type { NavGroup, NavItem, SidebarData } from '../types'
 
-// 监控组对应 claude-code-hub 的 仪表盘 / 使用记录 / 限额管理：
-// 总览看集群健康，统计看趋势与排行，日志看逐条请求，用量看账号限额。
+// 监控组对应 claude-code-hub 的 仪表盘 / 使用记录：
+// 总览看集群健康，统计看趋势与排行，日志看逐条请求。账号限额在虚拟机列表的用量窗口。
 const ALL_GROUPS: NavGroup[] = [
   {
     title: '监控',
@@ -27,7 +27,6 @@ const ALL_GROUPS: NavGroup[] = [
       { title: '总览', url: '/overview', icon: LayoutDashboard },
       { title: '统计', url: '/statistics', icon: ChartColumn },
       { title: '日志', url: '/logs', icon: ScrollText },
-      { title: '用量', url: '/usage', icon: Gauge },
     ],
   },
   {
@@ -46,6 +45,7 @@ const ALL_GROUPS: NavGroup[] = [
       { title: '模型', url: '/models', icon: Sparkles },
       { title: '风险审计', url: '/risk', icon: ShieldAlert },
       { title: 'system提示词', url: '/system', icon: MessageSquareText },
+      { title: 'Anthropic', url: '/anthropic', icon: Send },
       { title: '密钥', url: '/keys', icon: KeyRound },
     ],
   },

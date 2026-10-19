@@ -28,12 +28,8 @@ import { SettingRow } from '@/components/setting-row'
 import { dashboardQueryOptions } from '@/features/overview/queries'
 import { AboutPane } from '@/features/settings/about-pane'
 import { BackupPane } from '@/features/settings/backup-pane'
-import { CacheBreakpointsPane } from '@/features/settings/cache-breakpoints-pane'
-import { ClaudeCodeOnlyPane } from '@/features/settings/claude-code-only-pane'
 import { ClientAccessPane } from '@/features/settings/client-access-pane'
-import { GptPane } from '@/features/settings/gpt-pane'
 import { HealthPane } from '@/features/settings/health-pane'
-import { KernelRoutingPane } from '@/features/settings/kernel-routing-pane'
 import { LogsPane } from '@/features/settings/logs-pane'
 import {
   SETTINGS_TAB_LABELS,
@@ -42,10 +38,15 @@ import {
 } from '@/features/settings/navigation'
 import { NotifyPane } from '@/features/settings/notify-pane'
 import { OfficialCcSettingsPane } from '@/features/settings/official-cc-pane'
+import { OpenaiPane } from '@/features/settings/openai-pane'
 import { PeakPrimePane } from '@/features/settings/peak-prime-pane'
 import { PersonaRulesPane } from '@/features/settings/persona-rules-pane'
 import { PoolPane } from '@/features/settings/pool-pane'
-import { inheritProtocolOnSlots } from '@/features/settings/protocol-authority'
+import {
+  cchEnabledFromCompat,
+  inheritProtocolOnSlots,
+  sessionIdleTtlFromInference,
+} from '@/features/settings/protocol-authority'
 import {
   notifyQueryOptions,
   routingQueryOptions,
@@ -58,6 +59,7 @@ import { Socks5Pane } from '@/features/settings/socks5-pane'
 import { StickyPane } from '@/features/settings/sticky-pane'
 import { TelemetryPane } from '@/features/settings/telemetry-pane'
 import { WarmupInterceptPane } from '@/features/settings/warmup-intercept-pane'
+import { ProtocolPane } from './protocol-pane'
 
 /**
  * 展示上游设置和 build 分支的专有策略，并保存路由配置。
@@ -119,6 +121,8 @@ export function SettingsPage() {
           },
           detect_proxied_official_cc: detectProxiedOfficialCcFromCompat(compat),
           claude_code_only: compat.claude_code_only === true,
+          official_cc_passthrough: compat.official_cc_passthrough === true,
+          cch_enabled: cchEnabledFromCompat(compat),
           persona_rules: rules,
         }
       }
@@ -132,6 +136,7 @@ export function SettingsPage() {
           ...inference,
           engine: 'rust',
           fallback_to_go: false,
+          session_idle_ttl_seconds: sessionIdleTtlFromInference(inference),
         }
       }
       return api<RoutingSaveResult>('/api/panel/routing', {
@@ -224,7 +229,16 @@ export function SettingsPage() {
   })
 
   return (
-    <PageHeader title={VIEW_TITLES.settings}>
+    <PageHeader
+      title={VIEW_TITLES.settings}
+      description={
+        tab === 'quota'
+          ? 'Claude 配额闸线、并发和 RPM。GPT 配额在 OpenAI 页。个人自用引导会把闸关掉并拉到上限；这里仍可再改。'
+          : tab === 'openai'
+            ? 'GPT 传输、准入、配额与客户端画像。全局 WebSocket 只作用于推理，不影响终端或集群。'
+            : undefined
+      }
+    >
       <div className='md:grid md:grid-cols-[10.5rem_1fr] md:gap-8'>
         <SettingsNav active={tab} />
         <div className={cn('mt-4 min-w-0 md:mt-0', showSaveBar && 'pb-16')}>
@@ -301,10 +315,6 @@ export function SettingsPage() {
                         Record<string, QuotaTierPolicy> | undefined) || {}
                     }
                     quota={quota}
-                    codexQuota={
-                      ((draft.codex as Record<string, unknown> | undefined)
-                        ?.quota as Record<string, unknown> | undefined) || {}
-                    }
                     onChange={(tier, next) =>
                       setDraft((current) => {
                         const currentTiers =
@@ -345,23 +355,6 @@ export function SettingsPage() {
                                   },
                                 }
                               : {}),
-                          },
-                        }
-                      })
-                    }
-                    onCodexQuotaChange={(next) =>
-                      setDraft((current) => {
-                        const codex =
-                          (current.codex as Record<string, unknown>) || {}
-                        return {
-                          ...current,
-                          codex: {
-                            ...codex,
-                            quota: {
-                              ...((codex.quota as Record<string, unknown>) ||
-                                {}),
-                              ...next,
-                            },
                           },
                         }
                       })
@@ -444,6 +437,25 @@ export function SettingsPage() {
                   </Card>
                 </>
               ) : null}
+              {tab === 'openai' ? (
+                <OpenaiPane
+                  websocket={
+                    (draft.websocket as Record<string, unknown> | undefined) ||
+                    {}
+                  }
+                  codex={
+                    (draft.codex as Record<string, unknown> | undefined) || {}
+                  }
+                  onWebsocketChange={(next) =>
+                    setDraft((current) => ({ ...current, websocket: next }))
+                  }
+                  onCodexChange={(next) =>
+                    setDraft((current) => ({ ...current, codex: next }))
+                  }
+                  saving={save.isPending}
+                  pending={dirty}
+                />
+              ) : null}
               {tab === 'logs' ? (
                 <LogsPane
                   value={logging}
@@ -470,32 +482,27 @@ export function SettingsPage() {
                       setDraft({ ...draft, client_access: next })
                     }
                   />
-                  <GptPane
-                    value={
-                      (draft.codex as Record<string, unknown> | undefined) || {}
-                    }
-                    onChange={(next) => setDraft({ ...draft, codex: next })}
-                  />
-                  <KernelRoutingPane
-                    value={inference}
-                    onChange={(next) => setDraft({ ...draft, inference: next })}
-                  />
-                  <CacheBreakpointsPane
+                  <ProtocolPane
                     compat={
                       (draft.compatibility as
                         Record<string, unknown> | undefined) || {}
                     }
-                    onChange={(next) =>
-                      setDraft({ ...draft, compatibility: next })
+                    inference={inference}
+                    onCompatChange={(next) =>
+                      setDraft((current) => ({
+                        ...current,
+                        compatibility: next,
+                      }))
                     }
-                  />
-                  <ClaudeCodeOnlyPane
-                    compat={
-                      (draft.compatibility as
-                        Record<string, unknown> | undefined) || {}
-                    }
-                    onChange={(next) =>
-                      setDraft({ ...draft, compatibility: next })
+                    onInferenceChange={(patch) =>
+                      setDraft((current) => ({
+                        ...current,
+                        inference: {
+                          ...((current.inference as
+                            Record<string, unknown> | undefined) || {}),
+                          ...patch,
+                        },
+                      }))
                     }
                   />
                 </>
@@ -588,7 +595,7 @@ function settingsSaveToast(
     const hot =
       kernel && typeof kernel.updated === 'number'
         ? kernel.updated > 0
-          ? `缓存 TTL 已热更新 ${kernel.updated} 个槽`
+          ? `kernel 配置已热更新 ${kernel.updated} 个槽`
           : 'kernel 配置已一致'
         : '已写入'
     if (!inherited) return `已保存 · ${hot}`
@@ -598,6 +605,7 @@ function settingsSaveToast(
     const count = cleanPersonaRules(personaRulesFromCompat(compat)).length
     return `已保存 · ${count} 条规则`
   }
+  if (tab === 'openai') return '已保存 · GPT 配置'
   return '已保存'
 }
 

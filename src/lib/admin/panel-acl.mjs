@@ -2,7 +2,7 @@
  * Panel RBAC.
  *
  *   admin  — full console + user management
- *   super  — overview / cluster / usage / logs / statistics + VM page (schedule only)
+ *   super  — overview / cluster / logs / statistics + VM page (schedule only)
  *   user   — tenant: vm / proxies / keys / billing / logs / statistics (owner-scoped)
  */
 
@@ -12,13 +12,13 @@ export const PANEL_VIEWS = [
   'vm',
   'import',
   'specs',
-  'usage',
   'proxies',
   'models',
   'risk',
   'system',
   'keys',
   'api',
+  'anthropic',
   'logs',
   'statistics',
   'database',
@@ -30,7 +30,7 @@ export const PANEL_VIEWS = [
 
 const ROLE_VIEWS = {
   user: ['vm', 'proxies', 'keys', 'billing', 'logs', 'statistics'],
-  super: ['overview', 'cluster', 'usage', 'logs', 'statistics', 'vm'],
+  super: ['overview', 'cluster', 'logs', 'statistics', 'vm'],
   admin: PANEL_VIEWS.slice(),
 }
 
@@ -88,6 +88,7 @@ export function panelIdentity(req) {
 
 const USER_EXACT_GET = new Set([
   '/api/panel/me',
+  '/api/panel/onboarding',
   '/api/panel/vms',
   '/api/panel/vms/create-options',
   '/api/panel/pool/stream',
@@ -98,9 +99,15 @@ const USER_EXACT_GET = new Set([
   '/api/panel/request-logs/export',
   '/api/panel/request-logs/stats',
   '/api/panel/billing',
+  '/api/panel/test-schedule/default',
 ])
 
-const USER_EXACT_POST = new Set(['/api/panel/vms/create', '/api/panel/vms/import', '/api/panel/proxies/import'])
+const USER_EXACT_POST = new Set([
+  '/api/panel/vms/create',
+  '/api/panel/vms/import',
+  '/api/panel/proxies/import',
+  '/api/panel/test-schedule/sync',
+])
 
 const USER_VM_DENIED = new Set([
   'fleet-status',
@@ -162,10 +169,12 @@ function userVmPathAllowed(method, path) {
     if (!rest) return true
     if (rest === 'oauth/credential' || rest === 'package') return false
     return (
+      rest === 'test-schedule' ||
       rest.startsWith('oauth/') ||
       rest === 'probe' ||
       rest === 'count-tokens' ||
       rest === 'test-chat' ||
+      rest === 'diagnose' ||
       rest === 'official-cc-bootstrap'
     )
   }
@@ -183,6 +192,7 @@ function userVmPathAllowed(method, path) {
       rest === 'count-tokens' ||
       rest === 'start' ||
       rest === 'stop' ||
+      rest === 'recover' ||
       rest === 'openai-quota/refresh' ||
       rest === 'openai-quota/reset' ||
       rest === 'claude-reset/query' ||
@@ -190,8 +200,8 @@ function userVmPathAllowed(method, path) {
       rest.startsWith('oauth/')
     )
   }
-  if (method === 'DELETE') return !rest
-  if (method === 'PUT' && rest === 'oauth/credential') return true
+  if (method === 'PUT') return rest === 'test-schedule' || rest === 'oauth/credential'
+  if (method === 'DELETE') return !rest || rest === 'test-schedule'
   return false
 }
 
@@ -221,6 +231,7 @@ function isUserAllowed(method, path) {
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
   if (m === 'GET' && (USER_EXACT_GET.has(p) || isRequestLogPath(p) || LOG_STATS_GET.has(p))) return true
+  if (m === 'PUT' && p === '/api/panel/onboarding') return true
   if (m === 'POST' && USER_EXACT_POST.has(p)) return true
   if (p.startsWith('/api/panel/vms')) return userVmPathAllowed(m, p)
   if (p.startsWith('/api/panel/proxies')) return userProxyPathAllowed(m, p)
@@ -234,7 +245,12 @@ export function authorizePanelRoute(method, path, role) {
   const m = String(method || 'GET').toUpperCase()
   const p = String(path || '')
 
+  if (p === '/api/panel/test-schedule/default' && m === 'PUT') {
+    return { ok: false, role: r, code: 'forbidden', message: '当前权限无法执行此操作' }
+  }
+
   if (r === 'user' && isUserAllowed(m, p)) return { ok: true, role: r }
+  if (p === '/api/panel/onboarding' && (m === 'GET' || m === 'PUT')) return { ok: true, role: r }
   if (
     r === 'super' &&
     m === 'GET' &&

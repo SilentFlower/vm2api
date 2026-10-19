@@ -1,6 +1,6 @@
 /**
  * Global `routing.vm` defaults and the per-slot `vm.machine` record.
- * Docker slots only consume memory; KVM uses the full spec. Invalid values
+ * Docker slots consume memory and an optional explicit CPU quota; KVM uses its own spec. Invalid values
  * never persist through normalize (defaults) or a PUT/create patch (400).
  */
 import crypto from 'node:crypto'
@@ -30,6 +30,82 @@ export const VM_CONFIG_DEFAULTS = Object.freeze({
   mac_oui: '52:54:00',
   allow_tcg: false,
 })
+
+/** Desktop OEM identities. No commas: QEMU `-smbios` splits on them. */
+export const SMBIOS_CATALOG = Object.freeze([
+  Object.freeze({ manufacturer: 'Dell Inc.', product: 'OptiPlex 7090', version: '1.0', family: 'OptiPlex' }),
+  Object.freeze({ manufacturer: 'Dell Inc.', product: 'Latitude 5440', version: '1.0', family: 'Latitude' }),
+  Object.freeze({ manufacturer: 'Dell Inc.', product: 'XPS 15 9530', version: '1.0', family: 'XPS' }),
+  Object.freeze({
+    manufacturer: 'LENOVO',
+    product: 'ThinkPad T14 Gen 3',
+    version: 'ThinkPad T14 Gen 3',
+    family: 'ThinkPad T14 Gen 3',
+  }),
+  Object.freeze({
+    manufacturer: 'LENOVO',
+    product: 'ThinkPad X1 Carbon Gen 11',
+    version: 'ThinkPad X1 Carbon Gen 11',
+    family: 'ThinkPad X1 Carbon Gen 11',
+  }),
+  Object.freeze({
+    manufacturer: 'HP',
+    product: 'HP EliteBook 840 G8',
+    version: '1.0',
+    family: '103C_5336AN HP EliteBook',
+  }),
+  Object.freeze({ manufacturer: 'HP', product: 'HP ProBook 450 G9', version: '1.0', family: '103C_5336AN HP ProBook' }),
+  Object.freeze({
+    manufacturer: 'ASUSTeK COMPUTER INC.',
+    product: 'ExpertBook B1502CBA',
+    version: '1.0',
+    family: 'ExpertBook',
+  }),
+  Object.freeze({ manufacturer: 'Acer', product: 'TravelMate P215-54', version: 'V1.0', family: 'TravelMate' }),
+  Object.freeze({ manufacturer: 'Framework', product: 'Laptop 13', version: '1.0', family: 'Laptop' }),
+  Object.freeze({
+    manufacturer: 'Micro-Star International Co. Ltd.',
+    product: 'Modern 15 A11MU',
+    version: '1.0',
+    family: 'Modern',
+  }),
+  Object.freeze({ manufacturer: 'GIGABYTE', product: 'AERO 16 YE5', version: '1.0', family: 'AERO' }),
+  Object.freeze({ manufacturer: 'Dell Inc.', product: 'Precision 3560', version: '1.0', family: 'Precision' }),
+  Object.freeze({ manufacturer: 'Dell Inc.', product: 'Inspiron 15 3520', version: '1.0', family: 'Inspiron' }),
+  Object.freeze({
+    manufacturer: 'LENOVO',
+    product: 'ThinkCentre M70q Gen 3',
+    version: 'ThinkCentre M70q Gen 3',
+    family: 'ThinkCentre M70q',
+  }),
+  Object.freeze({
+    manufacturer: 'HP',
+    product: 'HP EliteDesk 800 G6',
+    version: '1.0',
+    family: '103C_53307F HP EliteDesk',
+  }),
+  Object.freeze({
+    manufacturer: 'ASUSTeK COMPUTER INC.',
+    product: 'VivoBook 15 X1502ZA',
+    version: '1.0',
+    family: 'VivoBook',
+  }),
+  Object.freeze({ manufacturer: 'Acer', product: 'Veriton N4670G', version: 'V1.0', family: 'Veriton' }),
+])
+
+function copySmbios(row) {
+  return {
+    manufacturer: row.manufacturer,
+    product: row.product,
+    version: row.version,
+    family: row.family,
+  }
+}
+
+/** One catalog portrait. Create writes this onto the slot; later reads use the stored row. */
+export function randomSmbios() {
+  return copySmbios(SMBIOS_CATALOG[crypto.randomInt(SMBIOS_CATALOG.length)])
+}
 
 const SMBIOS_KEYS = Object.freeze(['manufacturer', 'product', 'version', 'family'])
 const OVERRIDE_KEYS = Object.freeze(['memory', 'vcpus', 'disk_gb'])
@@ -162,13 +238,27 @@ function randomDiskSerial() {
   return `KIN${crypto.randomBytes(8).toString('hex')}`.slice(0, 20)
 }
 
+/** Explicit per-slot Docker quota. Missing/zero preserves the historic unlimited CPU policy. */
+export function slotDockerCpus(vm) {
+  const machine = vm?.machine
+  if (!machine || !Object.hasOwn(machine, 'docker_cpus')) return 0
+  const value = machine.docker_cpus
+  if (typeof value !== 'number' || !Number.isFinite(value) || (value !== 0 && (value < 0.01 || value > 16))) {
+    throw invalidMachine('docker_cpus must be 0 (unlimited) or a number from 0.01 to 16')
+  }
+  return value
+}
+
 export function resolveMachineSpec({ config, overrides, runtime } = {}) {
-  void runtime
   const base = normalizeVmConfig(config)
   if (overrides != null && !isPlainObject(overrides)) {
     throw invalidMachine('machine 必须是对象')
   }
   if (isPlainObject(overrides)) {
+    if (Object.hasOwn(overrides, 'docker_cpus')) {
+      if (runtime === 'kvm') throw invalidMachine('docker_cpus is only supported for Docker slots; use vcpus for KVM')
+      base.docker_cpus = slotDockerCpus({ machine: overrides })
+    }
     const patch = {}
     for (const key of OVERRIDE_KEYS) {
       if (Object.prototype.hasOwnProperty.call(overrides, key)) patch[key] = overrides[key]
@@ -179,22 +269,45 @@ export function resolveMachineSpec({ config, overrides, runtime } = {}) {
     if (Object.prototype.hasOwnProperty.call(patch, 'vcpus')) base.vcpus = patch.vcpus
     if (Object.prototype.hasOwnProperty.call(patch, 'disk_gb')) base.disk_gb = patch.disk_gb
   }
+  const brand = randomSmbios()
   return {
     memory: base.memory,
+    ...(Object.hasOwn(base, 'docker_cpus') ? { docker_cpus: base.docker_cpus } : {}),
     vcpus: base.vcpus,
     disk_gb: base.disk_gb,
     cpu_model: base.cpu_model,
     mac: randomMac(base.mac_oui),
     smbios: {
-      manufacturer: base.smbios.manufacturer,
-      product: base.smbios.product,
-      version: base.smbios.version,
-      family: base.smbios.family,
+      manufacturer: brand.manufacturer,
+      product: brand.product,
+      version: brand.version,
+      family: brand.family,
       serial: randomSerial(),
       uuid: crypto.randomUUID(),
     },
     disk_serial: randomDiskSerial(),
   }
+}
+
+/** Fill a missing per-slot SMBIOS. An existing manufacturer/product/family stays put. */
+export function ensureSlotSmbios(vm) {
+  if (!vm?.id) return false
+  const machine = isPlainObject(vm.machine) ? vm.machine : {}
+  const current = isPlainObject(machine.smbios) ? machine.smbios : {}
+  if (current.manufacturer && current.product && current.family) return false
+  const brand = randomSmbios()
+  vm.machine = {
+    ...machine,
+    smbios: {
+      manufacturer: brand.manufacturer,
+      product: brand.product,
+      version: brand.version,
+      family: brand.family,
+      serial: current.serial || randomSerial(),
+      uuid: current.uuid || crypto.randomUUID(),
+    },
+  }
+  return true
 }
 
 export function slotMemory(vm, routing) {

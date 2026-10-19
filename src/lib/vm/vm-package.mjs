@@ -12,14 +12,15 @@ import { persistOauthToVm, readWorkerCredentialFile, writeWorkerCredentialFile }
 import { oauthToSub2apiExport, sub2apiAccountToOauth } from '../oauth/sub2api-account.mjs'
 import { parseScheduleLevelInput } from '../pool/credential-weight.mjs'
 import { parseAllowedModelsPatch } from '../pool/slot-model-gate.mjs'
+import { activeHoursOf, parseActiveHoursInput } from '../pool/active-hours.mjs'
 import { parseVmQuotaOverride } from '../pool/vm-quota-override.mjs'
 import { defaultSeedPolicy, standardSeedPolicy } from '../protocol/seed-policy.mjs'
 import {
   applyGeneratedFingerprint,
-  generateWorkstationFingerprint,
   takenFingerprintKeys,
   writeGuestMachineIdFile,
 } from '../identity/workstation-fingerprint.mjs'
+import { assignComputerFingerprint } from '../identity/slot-computer.mjs'
 import { VM_ORIGIN, canBindProxyToVm, normalizeOwnerId } from '../admin/resource-owner.mjs'
 import { readCodexAccounts, writeCodexAccounts } from './codex-slot.mjs'
 import { hasBoundExit, isLocalEgressProxy } from './egress.mjs'
@@ -105,6 +106,8 @@ function policyFromVm(vm, codex) {
   if (policy.priority != null) out.priority = policy.priority
   if (policy.quota && typeof policy.quota === 'object') out.quota = policy.quota
   if (Array.isArray(policy.allowed_models)) out.allowed_models = policy.allowed_models
+  // Explicit null: writing the package back restores a 24h slot instead of keeping a later window.
+  out.active_hours = activeHoursOf({ policy })
   return out
 }
 
@@ -248,6 +251,11 @@ function parsePolicy(raw, codex) {
     const parsed = parseAllowedModelsPatch(raw.allowed_models, { platform: codex ? 'openai' : 'anthropic' })
     if (!parsed.ok) return fail('invalid_package', parsed.error || '允许模型无效')
     value.allowed_models = parsed.value
+  }
+  if (has(raw, 'active_hours')) {
+    const parsed = parseActiveHoursInput(raw.active_hours)
+    if (!parsed.ok) return fail('invalid_package', parsed.error || '工作时段配置无效')
+    value.active_hours = parsed.value
   }
   return { ok: true, value }
 }
@@ -409,6 +417,10 @@ function applyPolicy(vm, policy, codex) {
       vm.policy.allowed_models = policy.allowed_models
     } else delete vm.policy.allowed_models
   }
+  if (has(policy, 'active_hours')) {
+    if (policy.active_hours) vm.policy.active_hours = policy.active_hours
+    else delete vm.policy.active_hours
+  }
 }
 
 function applyTraits(vm, spec) {
@@ -527,7 +539,8 @@ async function attachProxy(projectRoot, id, spec, proxyPool, ownerUserId) {
     if (!proxyId) return fail('proxy_import_failed', '本机直连出口不可用')
     const bound = proxyPool.bind(proxyId, id)
     if (!bound.ok) return fail(bound.error || 'proxy_bind_failed', '绑定直连出口失败')
-    bindVmProxy(projectRoot, id, proxyPool.getProxyByIdWithAuth(proxyId))
+    // bind() lands a node slot on its own VPS's local row, not the control plane's.
+    bindVmProxy(projectRoot, id, proxyPool.getProxyByIdWithAuth(bound.proxy?.id || proxyId))
     return { ok: true }
   }
   const ensured = proxyPool.ensureSocks(spec.proxy, { ownerUserId, label: spec.proxy.label })
@@ -606,8 +619,9 @@ export async function commitVmPackage({
   let vm
   if (create) {
     const existing = listVms(projectRoot)
-    const generated = generateWorkstationFingerprint(
-      { id, kernel: spec.vm.kernel, timezone: spec.vm.timezone, locale: spec.vm.locale },
+    const generated = assignComputerFingerprint(
+      projectRoot,
+      { id, kernel: spec.vm.kernel, timezone: spec.vm.timezone, locale: spec.vm.locale, runtime: { type: 'docker' } },
       { taken: takenFingerprintKeys(existing) },
     )
     vm = {

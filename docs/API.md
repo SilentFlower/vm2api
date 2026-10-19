@@ -39,12 +39,29 @@ x-api-key: sk-vm-…
 | `POST` | `/v1/chat/completions` 或 `/chat/completions` | OpenAI Chat | OpenAI Chat / SSE |
 | `POST` | `/v1/completions` 或 `/completions` | OpenAI Completions | OpenAI Completions |
 | `POST` | `/v1/responses` 或 `/responses` | OpenAI Responses | OpenAI Responses |
+| `GET` + Upgrade | `/v1/responses` 或 `/responses` | Responses WebSocket | JSON `response.*` 帧，不包 SSE |
 | `GET` | `/v1/models` | — | 本地模型策略目录 |
 | `GET` | `/health` · `/` · `/v1/meta` | 无鉴权 | 能力 / 限制 / 计数 |
 
 上游 hop **永远** `stream: true`。客户端 `stream: true` 收 SSE；`stream: false` 或 `x-kin-delivery: verified` 由网关聚合成 JSON。
 
 别名路径（无 `/v1` 前缀）与上表相同处理函数。
+
+## Responses WebSocket
+
+用相同 Bearer API key 对 `GET /v1/responses` 发起标准 WebSocket Upgrade，然后发送文本帧：
+
+```json
+{"type":"response.create","model":"gpt-5.4","input":[{"role":"user","content":"hi"}]}
+```
+
+`stream` 可省略，显式指定时必须为 `true`。每轮走既有鉴权、密钥范围、限流、调度、用量与日志链路；响应为独立 JSON `response.*` 事件，不带 `event:` / `data:` 或 `[DONE]`。同连接串行执行，接收队列最多 32 条，累计排队字节还受现有请求体上限约束；超过帧/字节上限关闭 1009，队列条数超限关闭 1008，二进制帧关闭 1003。客户端断开会取消当前 hop。普通 GET 未带 Upgrade 返回 426。
+
+同连接已完成响应的 `previous_response_id` 会展开为原输入与完整输出（含 reasoning / tool items）再执行，不依赖上游保留旧 WS。回放缓存最多 32 条 / 8 MiB。未知、已淘汰或另一连接的 ID 返回 `400 previous_response_not_found`，要求携带完整上下文重发；不会假装原生跨连接续接。当前只接受 `response.create`，未实现的控制事件返回明确协议错误，不伪装已转发或成功。
+
+`websocket.enabled` 和 `codex.websocket.enabled` 必须同时为 true；任一关闭，新握手返回 `403 websocket_disabled`，已有连接的后续 create 也会复核。HTTP/SSE 不关闭，上游强制 HTTP。仅把 `codex.upstream_transport` 设为 `http` 时，入站 WS 仍可用，但每轮走 HTTP/SSE 上游；依赖 WS 的 `generate:false` 预热返回 `400 unsupported_prewarm`，零上游执行。配置入口见 [OpenAI 传输与隐私](PANEL_API.md#openai-传输与隐私)。
+
+握手后的失败形态为 `{"type":"error","status":400,"error":{"type":"invalid_request_error","code":"…","message":"…"}}`，保留已确认的真实错误；没有终态时报告 `incomplete_response`，不合成 `response.completed`。
 
 ## 公共请求头
 
@@ -53,12 +70,12 @@ x-api-key: sk-vm-…
 | `content-type: application/json` | 必填 |
 | `x-session-id` / `x-conversation-id` / `x-claude-code-session-id` | sticky 键（见 `routing.sticky`） |
 | 交付模式 `verified` | 缓冲到 `message_stop` 再回放 |
-| 缓存 TTL `1h` | 出站 cache 默认 1h；`x-kin-cache-ttl: 5m` 可降到 5m |
+| 缓存 TTL `1h` | Node 新增点的缺省值；`x-kin-cache-ttl: 5m` 参与首次会话选择，不覆盖 native 透传 caller / 模板显式 TTL |
 | 调试开关 | 单请求日志模式 |
 | 钉槽（仅 master） | 虚拟机测试 loopback |
 | `X-Request-ID` | 原样回写响应头 |
 
-体大小上限默认 128MB（`KIN_MAX_BODY` 可覆盖）。超限在选号之前返回 `413 body_too_large`，不进入号池。
+体大小上限由设置里的「请求体上限」决定（`failover.max_request_mib`，未设置时槽内 kernel 为 32 MiB）。网关进程天花板是 `KIN_MAX_BODY`（默认 128MB），面板值不能超过它。超限在选号之前返回 `413 body_too_large`；已经进槽、仍大于 kernel 缓冲的请求由 kernel 返回 413。改完保存后，各槽 kernel 在没有请求时重启一次才生效。
 
 ## Messages
 
@@ -81,6 +98,8 @@ curl -sS http://127.0.0.1:8787/v1/messages \
 非官方入站会被改写成配置选定的 persona system 再发给上游；**回包不带改写后的 system**。`persona_preset=official` 保留 billing、identity、调用方 agent prompt（若有）和调用方 system；`persona_preset=official_full` 才固定追加完整 Claude Code agent prompt。非官方 `usage` 按「没有 persona system、没有注入 tools」估算。官方 Claude Code 四闸全过则体不改、usage 不藏。
 
 支持的 Messages 字段原样进入清洗层：`system`、`tools`、`tool_choice`、`thinking`、`output_config`、`metadata`、`stop_sequences`、图片块、`cache_control`。非法 `role` 会洗掉。OpenAI 形态 tools 出现在本口时先转成 Anthropic tools，但仍判非官方。
+
+native cli-hop 开启官方家族透传时，调用方 `cache_control` 的位置、显式 TTL 与缺失 TTL 保留。超过四个 breakpoint、thinking 上打点、非法 TTL，或 `5m`（含缺失 TTL）之后出现 `1h`，返回 `400 invalid_cache_control`，不静默裁剪或降级、不执行上游。非透传仍按协议重写规则生成自产点；kernel 不再替前置层修复 TTL 顺序。
 
 ### Sonnet 5.5 兼容边界
 
@@ -152,7 +171,7 @@ curl -sS http://127.0.0.1:8787/v1/chat/completions \
 curl -sS http://127.0.0.1:8787/v1/models -H "Authorization: Bearer $KEY"
 ```
 
-读面板持久化的 `model_policy`，**不** hop 槽位 `/v1/models`。未入库的 id → `400`，请求被拒，不上游。别名如 `claude-haiku-4-5` 可解析到带日期的目录项。出站 `model` 去掉 `[1m]` 后缀。
+读面板持久化的 `model_policy`，**不** hop 槽位 `/v1/models`。列表按密钥 `group_type` 过滤：`openai` 只列 GPT，`anthropic` 只列 Claude，`all` 与 master 两者都列。`POST /admin/models/refresh` 仍回完整目录。未入库的 id → `400`，请求被拒，不上游。别名如 `claude-haiku-4-5` 可解析到带日期的目录项。出站 `model` 去掉 `[1m]` 后缀。
 
 ## count_tokens / usage
 
@@ -199,6 +218,26 @@ curl -sS http://127.0.0.1:8787/v1/usage -H "Authorization: Bearer $KEY"
 
 
 
+### 周期额度查询的重置后错峰
+
+`PUT /api/panel/routing` 可设置（沿用面板鉴权；不是手动 `/probe` 请求体）：
+
+```json
+{
+  "usage_probe": {
+    "enabled": true,
+    "reset_delay_sec": 120,
+    "reset_jitter_sec": 600
+  }
+}
+```
+
+两项均默认 `0`、范围 `0`–`3600` 秒，省略时保留旧行为。对已到期且带有效重置时间的 Extra `5h` 窗口，周期查询的最早时间为 `reset + reset_delay_sec + 每账号稳定偏移`；偏移在 `0`–`reset_jitter_sec` 内，由账号身份和该轮 reset 确定，重复 tick、进程重启及列表重排不会重新抽签。上例为重置后 120–720 秒；实际执行仍受 `interval_sec` 的 tick 粒度、并发、单飞及退避限制，不保证每个账号不同秒执行。等待项在 `GET /api/panel/usage-probe` 的快照中显示 `reason: "reset_probe_delay"` 和 `next_probe_at`（最早时间，不是预约保证）。
+
+这只调整**周期额度探测链路的执行时间**，不新增探测：现有链路以官方 `GET /api/oauth/usage` 查询为主，满足套餐复核条件时仍可能执行现有 Fable Messages 探测；本改动不改变这些条件。没有有效已到期 5h reset 的未采样账号、仅 7d 到期或无有效 5h reset 的账号保留原逻辑；已有 `last_probe.ok === true` 且探测时间不早于本轮 reset 的账号不再被旧 reset 延迟，仅由真实流量更新的 `headers.sampled_at` 不触发该豁免。官方 usage 退避优先，主动/过期样本和套餐复核路径不会绕过等待。主动调用 `POST /api/panel/usage-probe` 同样运行周期规则；手动 `POST /api/panel/probe`、事件 `probeNow`、真实用户流量及独立 Messages 健康检查不受此延迟影响。
+
+因此，这些设置**不保证上游 5h 计费/额度窗口错开**：官方 usage GET 是否会开启窗口没有得到验证，既有 Fable Messages、真实流量及独立 Messages 健康检查也可能触发新窗口。延迟会让面板/额度恢复信息更晚刷新；需要即时查询时使用手动 `/probe`。当前仅提供 routing/API 配置，不新增面板控件。
+
 ## 健康
 
 ```bash
@@ -227,6 +266,7 @@ curl -sS http://127.0.0.1:8787/health
 |------|-----------|
 | `authentication_error` | 401 |
 | `permission_error` | 403 |
+| `policy_blocked`（拒答守卫） | 400 |
 | `invalid_request_error` | 400 |
 | `rate_limit_error` | 429 |
 | `quota_error` | 429 |
@@ -235,7 +275,7 @@ curl -sS http://127.0.0.1:8787/health
 | `upstream_error` | 401/403/502 |
 | `api_error` | 500 |
 
-上游 429 失败转移用尽后原样返回 429 `upstream_rate_limit`，有上游 `retry-after` 时透传；529 一定带 `retry-after`（号池估计，上游 529 取上游值，都没有时为 1）。恢复备份期间协议口 `503 restore_in_progress`。健康探测短请求在无缓存且 fail-closed 时 `503`。Claude Code Usage Policy `API Error`（含内核报成 400 的）不换号、不修复重试，客户端收到 503 `refusal_guard`，并把该 prompt 永久写入拒答缓存；再次相同请求，或用户正文与已缓存正文的估计 Jaccard 达到面板阈值（默认 0.90，可选 0.80/0.85/0.90/0.95），都在 hop 前被拦。`content_policy`、`cyber_policy`、`moderation_blocked` 等内容错误码同样入库。协议硬正则，或面板所选的 Jev / Laya / ModernBERT（`/v1/systemone`，`noul ≥ 0.5`）判为 NSFW、蒸馏、破解、破限时返回 403 `policy_blocked`，不 hop，并在拒答守卫开启时入库、可封禁 device。近似和 device 封禁可在面板关闭。拒答命中在 device 封禁开启时还会永久封禁该入站 device id。
+上游 429 失败转移用尽后原样返回 429 `upstream_rate_limit`，有上游 `retry-after` 时透传；529 一定带 `retry-after`（号池估计，上游 529 取上游值，都没有时为 1）。恢复备份期间协议口 `503 restore_in_progress`。健康探测短请求在无缓存且 fail-closed 时 `503`。Claude Code Usage Policy `API Error`（含内核报成 400 的）不换号、不修复重试，客户端收到 400 `policy_blocked` / `refusal_guard`，避免 Claude Code 误提示 `/login` 或按一般 400 做修复重试；并把该 prompt 永久写入拒答缓存；再次相同请求，或用户正文与已缓存正文的估计 Jaccard 达到面板阈值（默认 0.90，可选 0.80/0.85/0.90/0.95），都在 hop 前被拦。`content_policy`、`cyber_policy`、`moderation_blocked` 等内容错误码同样入库。协议硬正则，或面板所选的 Jev / Laya / ModernBERT（`/v1/systemone`，`noul ≥ 0.5`）判为 NSFW、蒸馏、破解、破限时返回 403 `policy_blocked`，不 hop，不写入拒答缓存；device 封禁开启时封禁入站 device。模型不可用且 `fail_open` 为 false 时同样 403，文案写明决策模型不可用，不封设备。近似和 device 封禁可在面板关闭。拒答命中在 device 封禁开启时还会永久封禁该入站 device id。400 的原文后追加原因，`details.reason` 为 `device` / `exact` / `similar`。
 
 号池结果分开返回，不互相伪装：
 
@@ -325,6 +365,7 @@ stateDiagram-v2
 - 5h/7d 闸（`routing.quota`）：用量进入闸线下 `critical_band`（默认 5 个百分点）起为「临近闸线」，一直到闸线上 `gate_overshoot`（默认 5 个百分点）。这一段里已入座的 device 留在原 VM：同账号一次只跑一个请求（额度读数滞后于在飞请求），第二个并发在原 VM 排队，不换 VM；新 device 优先开到其他正常 VM，用量已过闸线时不再开新席位。用量达到闸线 + `gate_overshoot` 才让出席位换 VM；上游 rejected / 100% / 429 冷却始终立即换。
 - 重试预算：每个 VM 每请求最多 3 次实际执行；准入竞争失败不算一次执行。`failover.max_total_attempts` / `max_account_switches` 用完后只再尝试本请求还没试过的 VM，直到 `total_retry_deadline_ms`。
 - 流空闲上限：上游流连续无事件超过 `failover.stream_idle_timeout_ms`（默认 180 秒，面板「重试与切号」可调，30 秒–60 分钟）即判超时。网关、槽内 kernel 的流空闲上限和 job 看门狗（kernel 读的是不带前缀的环境变量 `JOB_IDLE_SECS`，由 kernel 启动脚本从 `kernel.json` 读取并导出；`KIN_JOB_IDLE_SECS` 不生效）共用这个值。保存后立即热写入各槽 `kernel.json`；job 看门狗只在 kernel 启动时读取，所以值变化后各运行中的 Claude 槽会在没有任务时自动重启 kernel（有任务则等它结束，另每 15 秒复查一次）。不带 `eager_input_streaming` 时，上游会把大工具入参（如长 `Write` 内容）整段缓冲，期间可能静默数分钟。未配置时用环境变量 `KIN_STREAM_IDLE_TIMEOUT`。
+- 排队保活（仅 Claude `stream: true`）：选席、同会话串行、失败重试都发生在上游尝试开始之前，这段时间原先不下发任何字节。Cloudflare 约 100 秒收不到响应会回 524。`failover.queue_keepalive_delay_ms`（默认 60 秒，上限 90 秒，也可用 `KIN_QUEUE_KEEPALIVE_DELAY`）过后开始写 SSE `event: ping`，间隔与 `stream_keepalive_ms` 相同，并一直持续到首个内容事件。延迟之内失败仍是 HTTP 429/529/503。一旦写出 ping，状态码不能再改，后续失败改为 SSE `event: error`（例如 `overloaded_error`）。同会话排队另有 `failover.session_queue_timeout_ms`（默认 15 分钟；`0` 表示不限制），超时按 529 `overloaded_error` 返回，不会和仍在跑的上一轮并发。Codex / OpenAI 路径不变。
 - 工具参数流式下发：`failover.eager_tool_streaming`（默认开，面板「重试与切号」开关；显式 `false` 关闭）。开启后给所有自定义工具加 `eager_input_streaming: true`（服务端工具不动），上游边生成边下发大参数，不再长时间静默。这与官方 Claude Code 开启细粒度工具流式时的形态一致：官方只在直连官方 base URL 且服务端开关 `tengu_fgts` 打开，或设置 `CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1` 时给全部工具加这个字段，所以经中转的客户端默认不带。客户端自己带了这个布尔值时以客户端为准。参数在 `max_tokens` 截断时可能是不完整的 JSON。OpenAI chat/responses 入口的 function 工具在转成 Anthropic 后同样加这个字段。
 - 子请求：带显式 `parent_session_id` / `root_session_id` 且父会话在本地已有绑定时，子请求跟随父会话所在 VM（family 粘性）；同一 device 的父子请求共用该 device 的席位。没有显式父子字段时，同设备的新会话不会被当作子请求。
 - Claude Code 子 agent：请求头带 `x-claude-code-agent-id` 时，按上一条的子请求处理，父会话是 `metadata.user_id.session_id`，子会话 ID 由它和 agent ID 派生。每个 agent 单独串行，不等父会话当前这一轮。

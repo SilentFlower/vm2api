@@ -1,3 +1,5 @@
+import type { WindowEstimate } from './panel-pricing'
+
 /**
  * 出站认证头方案。gateway 规范化后只有这两个值。
  *
@@ -26,13 +28,6 @@ export type ProxyGeo = {
   timezone?: string | null
   checked_at?: string | null
   error?: string | null
-}
-
-export type LocalBoundNode = {
-  node_id: string | null
-  /** Admin-only display name. Tenants never receive this field. */
-  node_name?: string | null
-  bound_vm_ids: string[]
 }
 
 export type VmProxySnap = {
@@ -64,15 +59,13 @@ export type VmProxySnap = {
   geo?: ProxyGeo | null
   /** 公网 IPv6 出口地理位置；从未检测过为 null。 */
   geo_v6?: ProxyGeo | null
-  /** 槽位所在节点；仅本地代理的槽位视图会带。共享池行没有这一项。 */
+  /** 本地代理所在节点：池行是它那台 VPS（控制面为 null），槽位视图是槽所在节点。 */
   node_id?: string | null
   /**
    * 节点显示名。Admin 本地代理槽位视图：控制面为 null，节点为标签。
    * 字段出现即允许展示节点名；租户响应省略该字段。
    */
   node_name?: string | null
-  /** Admin 本地代理池行：按节点分组的绑定。租户省略。 */
-  bound_nodes?: LocalBoundNode[]
 }
 
 export type InferenceEngine = 'auto' | 'go' | 'rust'
@@ -153,12 +146,46 @@ export type VmSmbios = {
 /** 创建时固化到槽位的机器规格。旧槽可能缺省。 */
 export type VmMachine = {
   memory?: string
+  /** Optional Docker hard CPU quota. Missing/zero = unlimited; separate from KVM vcpus. */
+  docker_cpus?: number
   vcpus?: number
   disk_gb?: number
   cpu_model?: string
   mac?: string
   smbios?: VmSmbios
   disk_serial?: string
+}
+
+/** `GET /vms/:id` 的脱敏客户机特征。不含 machine-id / token / 代理账密。 */
+export type VmPhysicalDmi = {
+  manufacturer?: string | null
+  product?: string | null
+  version?: string | null
+  family?: string | null
+  serial?: string | null
+  uuid?: string | null
+}
+
+export type VmPhysicalFeatures = {
+  observed_at?: string | null
+  runtime_type?: RuntimeType | string | null
+  hostname?: string | null
+  os_id?: string | null
+  os_pretty?: string | null
+  kernel_release?: string | null
+  arch?: string | null
+  machine_id_present?: boolean
+  timezone?: string | null
+  locale?: string | null
+  cpu_model?: string | null
+  cpu_cores?: number | null
+  memory_bytes?: number | null
+  root_disk?: string | null
+  mac?: string | null
+  dmi?: VmPhysicalDmi | null
+  shell?: string | null
+  package_managers?: string | null
+  runtimes?: string | null
 }
 
 export type Vm = {
@@ -186,13 +213,14 @@ export type Vm = {
   auth_scheme?: string
   availability?: {
     /**
-     * 后端 `availability.mjs` 实际产出 7 种：
-     * `none` / `bad` / `off` / `quota` / `cool` / `drain` / `ok`。
+     * 后端 `availability.mjs` 实际产出 8 种：
+     * `none` / `bad` / `off` / `quota` / `cool` / `drain` / `rest` / `ok`。
+     * `rest`：`policy.active_hours` 工作时段外，休息中不接单。
      * `drain`：5h/7d 进入闸线前 `critical_band` 到闸线 + `gate_overshoot` 之间，
      * 仍接单（一次一个），但不再是单纯的「可用」。
      * 注意 `off` 的 `usable` 为 false，判断顺序上必须先于 `!usable`。
      */
-    key: 'ok' | 'none' | 'bad' | 'off' | 'quota' | 'cool' | 'drain'
+    key: 'ok' | 'none' | 'bad' | 'off' | 'quota' | 'cool' | 'drain' | 'rest'
     usable: boolean
     text?: string
     reason?: string
@@ -211,8 +239,8 @@ export type Vm = {
   circuit?: VmCircuit | null
   cooldown_until?: number
   cooldown_reason?: string
-  utilization_5h?: number
-  utilization_7d?: number
+  utilization_5h?: number | null
+  utilization_7d?: number | null
   utilization_7d_oi?: number
   utilization_7d_sonnet?: number
   status_5h?: string
@@ -224,12 +252,12 @@ export type Vm = {
   codex_usage?: {
     windows?: Array<{
       id?: string
-      used_percent?: number
+      used_percent?: number | null
       reset_at?: string | null
     }>
     quota?: {
-      utilization_5h?: number
-      utilization_7d?: number
+      utilization_5h?: number | null
+      utilization_7d?: number | null
     }
   } | null
   /** Raw OpenAI `plan_type` from wham/usage (GPT slots only). */
@@ -278,6 +306,8 @@ export type Vm = {
   runtime_type?: RuntimeType | null
   /** 创建时固化的机器规格；旧槽可能缺省。 */
   machine?: VmMachine | null
+  /** 观测到的客户机特征；列表也可能带上。缺省按未采集展示。 */
+  physical_features?: VmPhysicalFeatures | null
 
   region?: string
   /** 槽位环境时区（容器 `TZ` + persona `# Environment`）。 */
@@ -320,6 +350,12 @@ export type Vm = {
   schedule_level?: number
   /** 调度等级来源；缺失时按自动模式展示。 */
   schedule_level_mode?: 'auto' | 'manual'
+  /** 本槽工作时段；null / 缺省 = 24h 接单。窗口外不参与调度。 */
+  active_hours?: VmActiveHours | null
+  /** 工作时段实际使用的时区（自身钉住 → 槽位时区 → UTC）。 */
+  active_hours_timezone?: string | null
+  /** 此刻是否在工作时段内；未设时段为 null。独立于 availability（它可能被冷却/额度盖住）。 */
+  active_hours_active?: boolean | null
   rpm?: number
   /** 同等级权重（只用于 Codex 选槽；Claude 预调度不看），不是调度等级。 */
   weight?: number
@@ -339,6 +375,8 @@ export type Vm = {
   today_cache_read_tokens?: number
   today_cache_creation_tokens?: number
   total_cost?: number
+  /** 累计 token（含缓存），与 total_cost 同源。 */
+  total_tokens?: number
   expires_at?: string
   refreshed_at?: string
   oauth_source?: string
@@ -404,6 +442,10 @@ export type Vm = {
   window_7d_success?: number
   window_7d_errors?: number
   window_7d_tokens?: number
+  window_fable_cost?: number
+  estimate_5h?: WindowEstimate
+  estimate_7d?: WindowEstimate
+  estimate_fable?: WindowEstimate | null
   [key: string]: unknown
 }
 
@@ -592,6 +634,18 @@ export type VmQuotaView = {
 }
 
 export type VmQuotaOverride = Partial<VmQuotaView>
+
+/** 单槽工作时段（`vm.policy.active_hours`）。start 晚于 end = 跨夜班次。 */
+export type VmActiveHours = {
+  /** 本地 'HH:MM' 开工时间。 */
+  start: string
+  /** 本地 'HH:MM' 收工时间；与 start 不允许相同。 */
+  end: string
+  /** IANA 时区钉住值；缺省跟随槽位时区（代理出口时区）。 */
+  timezone?: string
+  /** 允许窗口开始的星期，0 = 周日；缺省 = 每天。 */
+  days?: number[]
+}
 
 /** VM 并发 / RPM / 席位上限跟随时的取值：并发与 RPM 来自分档，席位来自 `inference.session_slots`。 */
 export type VmSchedulingInherited = {

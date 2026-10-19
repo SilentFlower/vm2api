@@ -25,6 +25,65 @@ export function streamIdleTimeoutMs(routing, fallbackMs = Number(process.env.KIN
   return Math.min(STREAM_IDLE_TIMEOUT_MAX_MS, Math.max(STREAM_IDLE_TIMEOUT_MIN_MS, Math.round(ms)))
 }
 
+/** Gateway stream path: panel routing → cfg.limits → KIN_STREAM_IDLE_TIMEOUT → 180s default. */
+export function resolveStreamIdleTimeoutMs(routing, cfg) {
+  const limitsMs = Number(cfg?.limits?.stream_idle_timeout_ms)
+  const fallback =
+    Number.isFinite(limitsMs) && limitsMs > 0 ? limitsMs : Number(process.env.KIN_STREAM_IDLE_TIMEOUT) || 180_000
+  return streamIdleTimeoutMs(routing, fallback)
+}
+
+/**
+ * How long a Claude stream may sit in the queue before the first downstream
+ * byte. Cloudflare returns 524 when the origin writes nothing for ~100s.
+ * The default is under that window and after one seat wait (fallback 30s,
+ * sticky 45s), so a short miss can still answer HTTP 429/529. Values above
+ * 90s are capped: the first byte has to land before the proxy gives up.
+ * `0` writes the first ping immediately.
+ */
+export const DEFAULT_QUEUE_KEEPALIVE_DELAY_MS = 60_000
+export const QUEUE_KEEPALIVE_DELAY_MAX_MS = 90_000
+
+export function queueKeepaliveDelayMs(routing, fallbackMs) {
+  const envRaw = process.env.KIN_QUEUE_KEEPALIVE_DELAY
+  const envMs = envRaw == null || String(envRaw).trim() === '' ? Number.NaN : Number(envRaw)
+  const fallback = Number.isFinite(Number(fallbackMs))
+    ? Number(fallbackMs)
+    : Number.isFinite(envMs) && envMs >= 0
+      ? envMs
+      : DEFAULT_QUEUE_KEEPALIVE_DELAY_MS
+  const raw = routing?.failover?.queue_keepalive_delay_ms
+  const ms = raw == null || raw === '' ? fallback : Number(raw)
+  const chosen = Number.isFinite(ms) && ms >= 0 ? ms : fallback >= 0 ? fallback : DEFAULT_QUEUE_KEEPALIVE_DELAY_MS
+  return Math.min(QUEUE_KEEPALIVE_DELAY_MAX_MS, Math.round(chosen))
+}
+
+export const DEFAULT_MAX_REQUEST_BYTES = 32 * 1024 * 1024
+const MAX_REQUEST_MIB_MIN = 8
+const MAX_REQUEST_MIB_MAX = 128
+
+/**
+ * Bytes the slot kernel will buffer. The panel value
+ * (failover.max_request_mib) is the receive size; axum rejects anything
+ * larger with 413 before the CLI runs. Absent or invalid keeps fallbackBytes
+ * (32 MiB on the kernel, the process ceiling on the gateway).
+ */
+export function maxRequestBytes(routing, fallbackBytes = DEFAULT_MAX_REQUEST_BYTES) {
+  const mib = Number(routing?.failover?.max_request_mib)
+  if (!Number.isFinite(mib) || mib <= 0) return fallbackBytes
+  const clamped = Math.min(MAX_REQUEST_MIB_MAX, Math.max(MAX_REQUEST_MIB_MIN, Math.round(mib)))
+  return clamped * 1024 * 1024
+}
+
+/** Protocol ingress limit. A panel value cannot exceed the process ceiling. */
+export function inboundBodyLimit(routing, ceilingBytes) {
+  const ceiling = Number(ceilingBytes)
+  const cap = Number.isFinite(ceiling) && ceiling > 0 ? ceiling : DEFAULT_MAX_REQUEST_BYTES
+  const mib = Number(routing?.failover?.max_request_mib)
+  if (!Number.isFinite(mib) || mib <= 0) return cap
+  return Math.min(cap, maxRequestBytes(routing))
+}
+
 /** Live routing.json. KIN_ROUTING_FILE wins; otherwise <project>/src/config/routing.json. */
 export function routingConfigFile(projectRoot = PROJECT) {
   const override = String(process.env.KIN_ROUTING_FILE || '').trim()
@@ -46,6 +105,45 @@ export function readRoutingConfigFile(projectRoot = PROJECT) {
   } catch (error) {
     throw new Error(`Routing config '${file}' has invalid JSON: ${error?.message || error}`, { cause: error })
   }
+}
+
+const BIND_WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '[::]'])
+
+/** Listen/bind addresses that must never appear in client-facing URLs. */
+export function isBindWildcardHost(host) {
+  const h = String(host ?? '')
+    .trim()
+    .toLowerCase()
+  return BIND_WILDCARD_HOSTS.has(h)
+}
+
+function trimPublicBaseUrl(raw) {
+  if (raw == null) return null
+  const s = String(raw).trim().replace(/\/+$/, '')
+  return s || null
+}
+
+/** PUBLIC_HOST only; never falls back to HOST (bind address). */
+export function resolvePublicHost(env = process.env) {
+  const publicHost = String(env.PUBLIC_HOST ?? '').trim()
+  if (!publicHost || isBindWildcardHost(publicHost)) return null
+  return publicHost
+}
+
+/**
+ * Client-facing base URL for /health, /v1/meta, and panel snapshots.
+ * PUBLIC_BASE_URL wins; else build from PUBLIC_HOST. Unconfigured → null.
+ */
+export function resolvePublicBaseUrl(env = process.env, port = Number(env.PORT || 8787)) {
+  const explicit = trimPublicBaseUrl(env.PUBLIC_BASE_URL)
+  if (explicit) return explicit
+
+  const publicHost = resolvePublicHost(env)
+  if (!publicHost) return null
+
+  const scheme = String(env.PUBLIC_SCHEME || 'http').trim() || 'http'
+  const needsPort = scheme !== 'https'
+  return `${scheme}://${publicHost}${needsPort ? `:${port}` : ''}`
 }
 
 function readActiveVmRecord(projectRoot) {
@@ -114,15 +212,14 @@ export function loadConfig() {
 
   const port = Number(process.env.PORT || 8787)
   const host = process.env.HOST || '0.0.0.0'
-  const publicHost = process.env.PUBLIC_HOST || process.env.HOST || '127.0.0.1'
+  const publicHost = resolvePublicHost(process.env)
+  const base_url = resolvePublicBaseUrl(process.env, port)
 
   const cfg = {
     port,
     host,
     public_host: publicHost,
-    base_url:
-      process.env.PUBLIC_BASE_URL ||
-      `${process.env.PUBLIC_SCHEME || 'http'}://${publicHost}${String(process.env.PUBLIC_SCHEME || 'http') === 'https' ? '' : ':' + port}`,
+    base_url,
     api_key: apiKey,
     api_key_hash: hashKey(apiKey),
     // rewrite pipeline — DEFAULT OFF (passthrough preferred)
@@ -142,6 +239,7 @@ export function loadConfig() {
       upstream_timeout_ms: Number(process.env.KIN_UPSTREAM_TIMEOUT || 600000),
       stream_idle_timeout_ms: streamIdleTimeoutMs(),
       stream_keepalive_ms: Number(process.env.KIN_STREAM_KEEPALIVE || 10000),
+      queue_keepalive_delay_ms: queueKeepaliveDelayMs(null),
       rate_capacity: Number(process.env.KIN_RATE_CAP || 60),
       rate_refill: Number(process.env.KIN_RATE_REFILL || 1),
     },
