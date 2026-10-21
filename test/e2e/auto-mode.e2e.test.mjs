@@ -11,6 +11,7 @@ import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs
 import { createRespond, readBody } from '../../src/lib/http/respond.mjs'
 import { prepareClassifierBody } from '../../src/lib/protocol/request-purpose.mjs'
 import { rememberRustHealth, clearRustHealthCache } from '../../src/lib/transport/kernel-router.mjs'
+import { CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 
 const root = path.resolve(import.meta.dirname, '../..')
 const cli = process.env.KIN_AUTOMODE_CLI || path.join(root, 'share/wrap-cli/cli-node')
@@ -605,8 +606,11 @@ test('classifier terminal/error/cancel/concurrency boundaries through actual ELF
   assert.equal(ordinary.status, 200, ordinary.text)
   const wire = h.captured.at(-1)
   assert.equal(wire.max_tokens, 128)
-  assert.deepEqual(wire.thinking, { type: 'adaptive' })
-  assert.ok(wire.system.some((block) => block.text.includes('# Environment')))
+  assert.deepEqual(wire.thinking, { type: 'adaptive', display: 'summarized' })
+  assert.deepEqual(
+    wire.system.map((block) => block.text),
+    [CRS_OFFICIAL_CLI_SYSTEM, 'Ordinary caller prompt'],
+  )
   assert.equal(wire.request_context, undefined)
   h.setHealth({ ...h.health, classifier_request_context: false })
   const count = h.captured.length
@@ -694,19 +698,19 @@ test('actual kernel+CLI ELF keeps per-message effort and top-level high', { time
     )
   }
 })
-test('actual kernel+CLI ELF preserves mixed thinking signature blocks on final wire', { timeout: 30000 }, async (t) => {
+test('actual kernel+CLI ELF drops thinking without a usable signature on final wire', { timeout: 30000 }, async (t) => {
   const h = await harness(t)
   const result = await h.send({
     model: 'claude-opus-5-5',
     max_tokens: 256,
     thinking: { type: 'adaptive' },
-    system: [{ type: 'text', text: 'Preserve the prior thinking blocks exactly.' }],
+    system: [{ type: 'text', text: 'Drop thinking blocks that have no usable signature.' }],
     messages: [
       { role: 'user', content: 'Continue the prior turn.' },
       {
         role: 'assistant',
         content: [
-          { type: 'thinking', thinking: 'existing thinking', signature: 'existing-signature' },
+          { type: 'thinking', thinking: 'existing thinking', signature: 'existing-signature-0123456789' },
           { type: 'thinking', thinking: 'missing signature' },
           { type: 'thinking', thinking: '', signature: 'empty-thinking-signature' },
           { type: 'redacted_thinking', data: 'redacted-thinking' },
@@ -720,8 +724,7 @@ test('actual kernel+CLI ELF preserves mixed thinking signature blocks on final w
   const wireMessage = h.captured.at(-1).messages.find((message) => message.role === 'assistant')
   assert.ok(wireMessage)
   assert.deepEqual(wireMessage.content, [
-    { type: 'thinking', thinking: 'existing thinking', signature: 'existing-signature' },
-    { type: 'thinking', thinking: 'missing signature', signature: '' },
+    { type: 'thinking', thinking: 'existing thinking', signature: 'existing-signature-0123456789' },
     { type: 'thinking', thinking: '', signature: 'empty-thinking-signature' },
     { type: 'redacted_thinking', data: 'redacted-thinking' },
     { type: 'text', text: 'previous answer' },
