@@ -11,7 +11,6 @@ import { createHandleProtocol } from '../../src/lib/protocol/handle-protocol.mjs
 import { createRespond, readBody } from '../../src/lib/http/respond.mjs'
 import { prepareClassifierBody } from '../../src/lib/protocol/request-purpose.mjs'
 import { rememberRustHealth, clearRustHealthCache } from '../../src/lib/transport/kernel-router.mjs'
-import { CRS_OFFICIAL_CLI_SYSTEM } from '../../src/lib/identity/crs-persona.mjs'
 
 const root = path.resolve(import.meta.dirname, '../..')
 const cli = process.env.KIN_AUTOMODE_CLI || path.join(root, 'share/wrap-cli/cli-node')
@@ -404,7 +403,7 @@ for (const layout of ['zero', 'identity'])
         assert.equal(response.stop_sequence, stage === 'xml_s1' ? input.stop_sequences[0] : null)
         const wire = h.captured.at(-1)
         assert.deepEqual(wire.thinking, { type: 'disabled' })
-        assert.equal(wire.temperature, 0)
+        assert.equal(wire.temperature, input.temperature)
         assert.equal(wire.max_tokens, input.max_tokens)
         assert.deepEqual(wire.stop_sequences, input.stop_sequences)
         assert.equal(wire.output_config, undefined)
@@ -606,12 +605,12 @@ test('classifier terminal/error/cancel/concurrency boundaries through actual ELF
   assert.equal(ordinary.status, 200, ordinary.text)
   const wire = h.captured.at(-1)
   assert.equal(wire.max_tokens, 128)
-  assert.deepEqual(wire.thinking, { type: 'adaptive', display: 'summarized' })
-  assert.deepEqual(
-    wire.system.map((block) => block.text),
-    [CRS_OFFICIAL_CLI_SYSTEM, 'Ordinary caller prompt'],
-  )
+  assert.deepEqual(wire.thinking, { type: 'adaptive' })
   assert.equal(wire.request_context, undefined)
+  const ordinarySystem = wire.system.map((block) => block.text).join('\n')
+  assert.match(ordinarySystem, /Ordinary caller prompt$/)
+  assert.match(ordinarySystem, /You are Claude Code, Anthropic's official CLI for Claude\./)
+  assert.equal(wire.messages.at(-1).role, 'user')
   h.setHealth({ ...h.health, classifier_request_context: false })
   const count = h.captured.length
   const unsupported = await h.send(classifierFixture())

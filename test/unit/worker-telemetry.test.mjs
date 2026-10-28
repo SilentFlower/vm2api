@@ -3,8 +3,14 @@ import assert from 'node:assert/strict'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { buildWorkerTelemetry, touchTelemetrySession } from '../../src/lib/vm/worker-telemetry.mjs'
+import {
+  buildWorkerTelemetry,
+  telemetryUploadInterval,
+  touchTelemetrySession,
+  validateTelemetryRoutingPatch,
+} from '../../src/lib/vm/worker-telemetry.mjs'
 import { syncWorkerTelemetry } from '../../src/lib/vm/vm-runtime.mjs'
+import { FULL_ENV_KEYS, OPTIONAL_ENV_KEYS } from '../../src/lib/identity/telemetry-env.mjs'
 import { slotRuntimeOwner } from '../../src/lib/oauth/oauth-credentials.mjs'
 
 const MACHINE = 'aa'.repeat(32)
@@ -62,9 +68,11 @@ test('sidecar enables with official ~/.claude.json IDs', () => {
   assert.equal(out.identity.env.shell, 'zsh')
   assert.equal(out.identity.env.vcs, 'git')
   assert.equal(out.identity.env.runtimes, 'bun,node')
-  assert.equal(out.identity.env.build_time, '2026-10-07T06:36:42Z')
-  assert.equal(out.identity.env.node_version, undefined)
-  assert.equal(out.identity.env.is_running_with_bun, undefined)
+  assert.equal(out.identity.env.build_time, '2026-10-18T20:20:57Z')
+  assert.equal(out.identity.build_time, '2026-10-18T20:20:57Z')
+  assert.equal(out.identity.env.node_version, 'v26.3.0')
+  assert.equal(out.identity.env.is_running_with_bun, true)
+  assert.equal(out.identity.email, undefined)
   fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -76,6 +84,48 @@ test('machine id alone is not the 64-hex device id', () => {
   const out = buildWorkerTelemetry({ id: 'vm-02', seed_policy: { telemetry_disabled: false } }, root)
   assert.equal(out.enabled, false)
   assert.equal(out.reason, 'waiting_official_identity')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('current CLI writes only userID into CLAUDE_CONFIG_DIR and the sidecar still enables', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-'))
+  const home = path.join(root, 'vms', 'vm-04', 'cli-home')
+  fs.mkdirSync(path.join(home, '.claude'), { recursive: true })
+  fs.writeFileSync(
+    path.join(home, '.claude', '.claude.json'),
+    JSON.stringify({ userID: USER, oauthAccount: { accountUuid: 'acc-new', organizationUuid: 'org-new' } }),
+  )
+  const out = buildWorkerTelemetry({ id: 'vm-04', seed_policy: { telemetry_disabled: false } }, root)
+  assert.equal(out.enabled, true)
+  assert.equal(out.identity.user_id, USER)
+  assert.equal(out.identity.account_uuid, 'acc-new')
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('slot record official_user_id is the fallback when the CLI config is gone', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-'))
+  fs.mkdirSync(path.join(root, 'vms', 'vm-05', 'cli-home', '.claude'), { recursive: true })
+  const out = buildWorkerTelemetry(
+    {
+      id: 'vm-05',
+      seed_policy: { telemetry_disabled: false },
+      fingerprint: { official_user_id: USER, identity_source: 'official-cc-init' },
+    },
+    root,
+  )
+  assert.equal(out.enabled, true)
+  assert.equal(out.identity.user_id, USER)
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('GPT slots never run the Claude sidecar even with a CLI userID on disk', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-'))
+  writeOfficialHome(root, 'vm-codex-02')
+  const out = buildWorkerTelemetry(
+    { id: 'vm-codex-02', platform: 'openai', seed_policy: { telemetry_disabled: false } },
+    root,
+  )
+  assert.equal(out.enabled, false)
   fs.rmSync(root, { recursive: true, force: true })
 })
 
@@ -103,7 +153,44 @@ test('syncWorkerTelemetry writes enabled:true when official IDs exist', () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-test('syncWorkerTelemetry chowns the replaced worker.json to the slot uid', () => {
+test('upload interval comes from routing.json and falls back to 10 minutes', (t) => {
+  const saved = process.env.KIN_ROUTING_FILE
+  delete process.env.KIN_ROUTING_FILE
+  t.after(() => {
+    if (saved === undefined) delete process.env.KIN_ROUTING_FILE
+    else process.env.KIN_ROUTING_FILE = saved
+  })
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-'))
+  writeOfficialHome(root, 'vm-02')
+  const vm = { id: 'vm-02', seed_policy: { telemetry_disabled: false } }
+  assert.equal(buildWorkerTelemetry(vm, root).upload_interval_seconds, 600)
+  fs.mkdirSync(path.join(root, 'src', 'config'), { recursive: true })
+  fs.writeFileSync(
+    path.join(root, 'src', 'config', 'routing.json'),
+    JSON.stringify({ telemetry: { upload_interval_seconds: 7200 } }),
+  )
+  assert.equal(buildWorkerTelemetry(vm, root).upload_interval_seconds, 7200)
+  assert.equal(
+    buildWorkerTelemetry(vm, root, { telemetry: { upload_interval_seconds: 180 } }).upload_interval_seconds,
+    180,
+  )
+  for (const bad of [0, 30, 90, 86_460, '600', null]) {
+    assert.equal(telemetryUploadInterval({ telemetry: { upload_interval_seconds: bad } }), 600)
+  }
+  fs.rmSync(root, { recursive: true, force: true })
+})
+
+test('routing patch accepts whole minutes from 1 minute to 24 hours', () => {
+  assert.deepEqual(validateTelemetryRoutingPatch({ telemetry: { upload_interval_seconds: 60 } }), [])
+  assert.deepEqual(validateTelemetryRoutingPatch({ telemetry: { upload_interval_seconds: 86_400 } }), [])
+  assert.deepEqual(validateTelemetryRoutingPatch({ sticky: {} }), [])
+  for (const bad of [0, 59, 90, 86_460, '600', 600.5]) {
+    assert.equal(validateTelemetryRoutingPatch({ telemetry: { upload_interval_seconds: bad } }).length, 1)
+  }
+  assert.equal(validateTelemetryRoutingPatch({ telemetry: [] }).length, 1)
+})
+
+test('syncWorkerTelemetry 保留槽位 UID，并按运行身份选择组', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-owner-'))
   writeOfficialHome(root, 'vm-02')
   const vm = {
@@ -115,6 +202,7 @@ test('syncWorkerTelemetry chowns the replaced worker.json to the slot uid', () =
   fs.mkdirSync(path.dirname(cfgPath), { recursive: true })
   fs.writeFileSync(cfgPath, JSON.stringify({ vm_id: 'vm-02', proxy_required: false }))
   const owner = slotRuntimeOwner(vm)
+  const expectedGid = process.getuid() === 0 ? owner.gid : process.getgid()
   const calls = []
   const chown = mock.method(fs, 'chownSync', (file, uid, gid) => {
     calls.push({ file, uid, gid })
@@ -124,7 +212,7 @@ test('syncWorkerTelemetry chowns the replaced worker.json to the slot uid', () =
     assert.equal(out.wrote, true)
     const owned = calls.filter((call) => String(call.file).includes(`${path.sep}worker.json`))
     assert.ok(owned.length >= 1)
-    assert.ok(owned.every((call) => call.uid === owner.uid && call.gid === owner.gid))
+    assert.ok(owned.every((call) => call.uid === owner.uid && call.gid === expectedGid))
     assert.ok(owned.some((call) => call.file !== cfgPath && String(call.file).startsWith(`${cfgPath}.`)))
     assert.equal(JSON.parse(fs.readFileSync(cfgPath, 'utf8')).telemetry.enabled, true)
   } finally {
@@ -133,7 +221,7 @@ test('syncWorkerTelemetry chowns the replaced worker.json to the slot uid', () =
   }
 })
 
-test('sidecar env uses observed hardware instead of workstation profile', () => {
+test('sidecar env uses observed shell/runtimes and never guest hardware', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-tel-hw-'))
   writeOfficialHome(root, 'vm-02')
   const vm = {
@@ -173,19 +261,28 @@ test('sidecar env uses observed hardware instead of workstation profile', () => 
   assert.equal(out.identity.env.shell, 'zsh')
   assert.equal(out.identity.env.package_managers, 'apt,pacman')
   assert.equal(out.identity.env.runtimes, 'bun,node')
-  assert.equal(out.identity.env.cpu_model, 'Intel(R) Xeon(R) CPU')
-  assert.equal(out.identity.cpu_model, 'Intel(R) Xeon(R) CPU')
-  assert.equal(out.identity.cpu_cores, 4)
-  assert.equal(out.identity.env.cpu_cores, 4)
-  assert.equal(out.identity.env.memory_bytes, 4294967296)
-  assert.equal(out.identity.env.root_disk, '/dev/vda2')
-  assert.equal(out.identity.env.mac, '52:54:00:11:22:33')
-  assert.equal(out.identity.env.dmi_manufacturer, 'Dell Inc.')
-  assert.equal(out.identity.env.dmi_product, 'OptiPlex 7090')
-  assert.equal(out.identity.env.dmi_version, '1.0')
-  assert.equal(out.identity.env.dmi_family, 'OptiPlex')
-  assert.equal(out.identity.env.dmi_serial, 'ABC123')
-  assert.equal(out.identity.env.dmi_uuid, '11111111-2222-3333-4444-555555555555')
+  // Official CLI env carries none of these; they stay on the panel card only.
+  for (const key of [
+    'cpu_model',
+    'cpu_cores',
+    'memory_bytes',
+    'root_disk',
+    'mac',
+    'dmi_manufacturer',
+    'dmi_product',
+    'dmi_version',
+    'dmi_family',
+    'dmi_serial',
+    'dmi_uuid',
+  ]) {
+    assert.equal(Object.hasOwn(out.identity.env, key), false, key)
+    assert.equal(Object.hasOwn(out.identity, key), false, key)
+  }
+  const allowed = new Set([...FULL_ENV_KEYS, ...OPTIONAL_ENV_KEYS])
+  assert.deepEqual(
+    Object.keys(out.identity.env).filter((key) => !allowed.has(key)),
+    [],
+  )
   assert.equal(out.identity.env.linux_kernel, '6.8.0-guest')
   fs.rmSync(root, { recursive: true, force: true })
 })

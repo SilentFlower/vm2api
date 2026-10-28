@@ -14,12 +14,22 @@ import (
 )
 
 const (
-	sessionTTL         = 10 * time.Minute
-	eventBatchInterval = 10 * time.Second
-	growthbookInterval = 6 * time.Hour
-	tickInterval       = time.Second
-	touchName          = "telemetry.touch"
+	sessionTTL           = 10 * time.Minute
+	defaultBatchInterval = 10 * time.Minute
+	minBatchInterval     = 60 * time.Second
+	maxBatchInterval     = 24 * time.Hour
+	growthbookInterval   = 6 * time.Hour
+	tickInterval         = time.Second
+	touchName            = "telemetry.touch"
 )
+
+func batchInterval(tel config.TelemetryConfig) time.Duration {
+	d := time.Duration(tel.UploadIntervalSecs) * time.Second
+	if d < minBatchInterval || d > maxBatchInterval {
+		return defaultBatchInterval
+	}
+	return d
+}
 
 type Deps struct {
 	HTTP       *Client
@@ -58,22 +68,50 @@ func WriteTouch(path string) error {
 }
 
 func lastActivity(path string, fallback time.Time) time.Time {
+	when, _ := readTouch(path)
+	if when.IsZero() {
+		return fallback
+	}
+	return when
+}
+
+func readTouch(path string) (time.Time, string) {
 	if strings.TrimSpace(path) == "" {
-		return fallback
+		return time.Time{}, ""
 	}
-	info, err := os.Stat(path)
+	raw, err := os.ReadFile(path)
 	if err != nil {
-		return fallback
+		return time.Time{}, ""
 	}
-	return info.ModTime()
+	fields := strings.Fields(string(raw))
+	if len(fields) == 0 {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return time.Time{}, ""
+		}
+		return info.ModTime(), ""
+	}
+	when, err := time.Parse(time.RFC3339Nano, fields[0])
+	if err != nil {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			return time.Time{}, ""
+		}
+		when = info.ModTime()
+	}
+	model := ""
+	if len(fields) > 1 {
+		model = fields[1]
+	}
+	return when, model
 }
 
 // Run mirrors cc-bridge telemetry_loop:
 // /v1 (or worker start) activates a 10-minute session.
-// Every 10s: event_logging/v2/batch tengu_api_success.
+// tengu_api_success batches at upload_interval_seconds (60s–24h, default 10 min).
 // Every 6h (first immediate): GrowthBook /api/eval.
 // worker.json telemetry is re-read when the file mtime moves, so identity,
-// betas, headers, env, and enabled flip without bouncing the process.
+// betas, headers, env, enabled, and upload interval flip without bouncing the process.
 // A disabled config with no file still returns immediately.
 func Run(ctx context.Context, cfg config.Config, deps Deps) error {
 	if deps.Now == nil {
@@ -177,9 +215,10 @@ func Run(ctx context.Context, cfg config.Config, deps Deps) error {
 			}
 		}
 
-		if batchOK && (lastBatch.IsZero() || now.Sub(lastBatch) >= eventBatchInterval) {
+		if batchOK && (lastBatch.IsZero() || now.Sub(lastBatch) >= batchInterval(tel)) {
 			uptime := now.Sub(started).Seconds()
-			ev := SuccessEvent(identity, now, uptime, "")
+			_, model := readTouch(deps.TouchPath)
+			ev := SuccessEvent(identity, now, uptime, model)
 			if err := postBatch(ctx, deps, live, token, ev); err != nil {
 				if stopOn4xx(err) {
 					batchOK = false

@@ -38,7 +38,9 @@ import {
 import { sanitizeInboundBody, defaultSeedPolicy, callerAutoCompactWindow } from './seed-policy.mjs'
 import { fingerprintRequest } from './client-fingerprint.mjs'
 import { validateOfficialModel } from './models.mjs'
-import { handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
+import { handleCodexImages, handleCodexProtocol, handleCodexSearch } from './handle-codex.mjs'
+import { isMultipartFormData, normalizeImageEditBody } from './image-edit-multipart.mjs'
+import { readRawBody } from '../http/respond.mjs'
 import { disjointOpenaiUsage } from './openai-usage.mjs'
 import { costColumnsFromUsage } from '../admin/pricing.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
@@ -55,6 +57,7 @@ import {
 } from '../admin/health-probe.mjs'
 import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.mjs'
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
+import { agentSummarySession } from './agent-summary.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
@@ -82,7 +85,9 @@ import {
 } from '../core/errors.mjs'
 import { resolveWorkspaceMode, isOfficialClaudeClient } from './workspace-mode.mjs'
 import { officialMessagesBody } from './anthropic-messages.mjs'
-import { prepareOutboundEnvelope, prepareCliHopBody } from './outbound-attempt.mjs'
+import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } from './outbound-attempt.mjs'
+import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
+import { profileForPreset } from '../identity/official-profiles.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
 import { touchTelemetrySession } from '../vm/worker-telemetry.mjs'
 import {
@@ -106,6 +111,9 @@ import {
 import {
   applyCrsUnofficialPersona,
   detectProxiedOfficialCcFromRoutingFile,
+  billingIndexesFromMessages,
+  ccEntrypointFromRouting,
+  ensureBillingAttribution,
   extractFirstUserText,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
@@ -141,7 +149,7 @@ import {
   fillMissingCacheTtl,
   validateCacheBreakpoints,
 } from './cache-ttl.mjs'
-import { confirmCachePrefix, describeCacheContinuity, formatCacheBreak, trackCachePrefix } from './cache-prefix.mjs'
+import { confirmCachePrefix, describeCacheContinuity, formatCacheBreak, prepareCachePrefix } from './cache-prefix.mjs'
 import { ensureClaudeWebSearch, shouldInjectClaudeWebSearch } from './web-search.mjs'
 import { dispatchStreamInference } from '../transport/kernel-router.mjs'
 import { syncClaudeKernelConfigsFromFile } from '../transport/rust-kernel-supervisor.mjs'
@@ -220,6 +228,56 @@ export function createHandleProtocol(deps) {
         officialCost: priced.total_cost,
       })
     } catch {}
+  }
+
+  function keyGateErrorBody(gate) {
+    return makeError({
+      type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
+      code: gate.code,
+      message: gate.message,
+      status: gate.status,
+      details: gate.detail || undefined,
+    }).body
+  }
+
+  // Codex handlers write usage onto logBag themselves. The key is charged the
+  // official cost usage_logs prices for the same row (image generation
+  // included) times the group rate; logBag is left as is so the row is too.
+  function billCodexKey(managedKey, logBag) {
+    if (logBag.final_state !== 'verified') return
+    const model = logBag.upstream_model || logBag.model
+    const image = logBag.image_usage
+      ? { usage: logBag.image_usage, model: logBag.image_model || null, only: logBag.protocol === 'openai.images' }
+      : null
+    try {
+      const priced = costColumnsFromUsage(logBag.usage || {}, model, image)
+      apiKeyStore.recordUsage(managedKey, logBag.usage || {}, {
+        model,
+        rateMultiplier: deps.groupsRepo.rateMultiplier(managedKey.group_id ?? 1),
+        officialCost: priced.total_cost,
+      })
+    } catch {}
+  }
+
+  /** Codex handlers take the same managed-key acquire / release / spend as the Claude paths. */
+  async function runWithCodexKey(req, res, logBag, run) {
+    const managedKey = req.apiKeyRecord || null
+    if (!managedKey) return run()
+    const gate = apiKeyStore.acquire(managedKey)
+    if (!gate.ok) {
+      stats.errors++
+      logBag.error_code = gate.code
+      logBag.error_message = gate.message
+      return json(res, gate.status, keyGateErrorBody(gate))
+    }
+    try {
+      return await run()
+    } finally {
+      try {
+        apiKeyStore.release(managedKey)
+      } catch {}
+      billCodexKey(managedKey, logBag)
+    }
   }
 
   function finishClientCancel(res, result, logBag) {
@@ -338,6 +396,7 @@ export function createHandleProtocol(deps) {
     logBag.error_code = decision.error?.body?.error?.code || null
     logBag.error_message = decision.errorMessage || decision.error?.body?.error?.message || null
     logBag.intercept = decision.intercept || null
+    logBag.jev_state = decision.jevState || null
     json(res, decision.error.status, decision.error.body)
     return true
   }
@@ -440,9 +499,12 @@ export function createHandleProtocol(deps) {
     want1m = false,
     preserveCacheBreakpoints = false,
     cliHop = false,
+    repaired = false,
     requestContext = null,
     routing = {},
     noGoFallback = false,
+    onEnvelope = null,
+    onOutboundHeaders = null,
   }) {
     const assembler = createClaudeMessageAssembler()
     const workerResult = await dispatchStreamInference({
@@ -458,10 +520,13 @@ export function createHandleProtocol(deps) {
       routing,
       preserveCacheBreakpoints,
       cliHop,
+      repaired,
       requestContext,
       slotWaitMs: candidate.slotWaitMs,
       noGoFallback,
       ensureCredential: (exec) => ensureWorkerCredential(exec),
+      onEnvelope,
+      onOutboundHeaders,
       onEvent: async (line) => {
         if (/response_headers/.test(String(line))) return
         applyClaudeSSELineToMessage(restoreToolNamesInSSELine(line, toolNames), assembler)
@@ -489,6 +554,8 @@ export function createHandleProtocol(deps) {
       upstream_status: null,
       outbound_body: null,
       outbound_headers: null,
+      outbound_headers_source: 'unavailable',
+      worker_envelope_headers: null,
       outbound_summary: null,
       cache_continuity: null,
       vm_id: null,
@@ -807,10 +874,12 @@ export function createHandleProtocol(deps) {
     if (platform.platform === 'openai') {
       const routing = getRouting() || {}
       const codexSticky = {
+        cfg,
         requestStartedAt: logCtx.t0,
         stickyRouter,
         sessions: accountQuota?.sessions || null,
         body: ctx.body,
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
       }
       // Account scope needs the slot, so the Codex hop runs the same gate again
       // once a candidate is claimed. Without a scope the pre-hop verdict stands.
@@ -827,7 +896,38 @@ export function createHandleProtocol(deps) {
         })
       if (protocol === 'anthropic.messages') {
         const codex = normalizeCodexRouting(routing.codex)
-        return handleCodexProtocol({
+        return runWithCodexKey(req, res, logBag, () =>
+          handleCodexProtocol({
+            req,
+            res,
+            protocol,
+            ctx,
+            inbound,
+            logBag,
+            stats,
+            json,
+            writeSSEHeaders,
+            routing: {
+              ...routing,
+              codex: {
+                ...codex,
+                protocols: {
+                  ...codex.protocols,
+                  'anthropic.messages': { mode: 'convert', enabled: true },
+                },
+                convert: { ...codex.convert, anthropic_to_codex: true },
+              },
+            },
+            projectRoot: cfg.paths.project,
+            captureOutbound: logCtx.capture_outbound === true,
+            accountGate,
+            ops: deps.codexOps || {},
+            ...codexSticky,
+          }),
+        )
+      }
+      return runWithCodexKey(req, res, logBag, () =>
+        handleCodexProtocol({
           req,
           res,
           protocol,
@@ -837,41 +937,14 @@ export function createHandleProtocol(deps) {
           stats,
           json,
           writeSSEHeaders,
-          routing: {
-            ...routing,
-            codex: {
-              ...codex,
-              protocols: {
-                ...codex.protocols,
-                'anthropic.messages': { mode: 'convert', enabled: true },
-              },
-              convert: { ...codex.convert, anthropic_to_codex: true },
-            },
-          },
+          routing,
           projectRoot: cfg.paths.project,
           captureOutbound: logCtx.capture_outbound === true,
           accountGate,
           ops: deps.codexOps || {},
           ...codexSticky,
-        })
-      }
-      return handleCodexProtocol({
-        req,
-        res,
-        protocol,
-        ctx,
-        inbound,
-        logBag,
-        stats,
-        json,
-        writeSSEHeaders,
-        routing,
-        projectRoot: cfg.paths.project,
-        captureOutbound: logCtx.capture_outbound === true,
-        accountGate,
-        ops: deps.codexOps || {},
-        ...codexSticky,
-      })
+        }),
+      )
     }
     if (protocol === 'openai.responses') {
       stats.errors++
@@ -951,6 +1024,8 @@ export function createHandleProtocol(deps) {
     }
     const officialClient = isOfficialClaudeClient(fp.client_class)
     const callerSession = extractCallerSession({ inbound, body: ctx.body, headers: req.headers })
+    const summarySession = agentSummarySession(inbound, { officialTraffic })
+    const executionSession = summarySession || callerSession
     const firstUserText = extractFirstUserText(ctx.body?.messages) || extractFirstUserText(inbound?.messages)
     // Seed identity skips a leading <system-reminder>; firstUserText stays billing-only.
     const firstUserIdentity =
@@ -992,20 +1067,26 @@ export function createHandleProtocol(deps) {
     // One-shot test calls (sub2api account test, new-api channel test) keep their
     // sticky identity but never hold a session seat the main conversation needs.
     const seatless = isProbe || isShortProbeRequest(inbound)
-    // Seat = inbound device (R1/R2); the API key never scopes it.
+    // Seat = this client session. Same device, other session = other slot.
     const seatKey = seatless
       ? null
-      : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
-    const sessionKeys = stickyRouter?.sessionPoolKeys
-      ? stickyRouter.sessionPoolKeys(req, inbound, {
-          sessionId: inboundIdentity.sessionId,
-          deviceId: stickyDeviceId,
-          migrate: !isProbe,
-        })
-      : {
-          stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
-          stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
-        }
+      : summarySession
+        ? `seat:sess:${summarySession}`
+        : resolveSeatIdentity({ inbound, body: ctx.body, headers: req.headers, clientIp: clientIp(req) }).key
+    // Summary forks retain parent affinity, but must not migrate/bind its
+    // aliases or join its serialization queue while the parent is streaming.
+    const sessionKeys = summarySession
+      ? { stickyKey: null, stickyKeys: [] }
+      : stickyRouter?.sessionPoolKeys
+        ? stickyRouter.sessionPoolKeys(req, inbound, {
+            sessionId: inboundIdentity.sessionId,
+            deviceId: stickyDeviceId,
+            migrate: !isProbe,
+          })
+        : {
+            stickyKey: stickyRouter?.extractPoolKey?.(req, inbound, { platform: 'anthropic' }) || null,
+            stickyKeys: stickyRouter?.collectPoolKeys?.(req, inbound, { platform: 'anthropic' }) || [],
+          }
     const stickyKey = sessionKeys.stickyKey || null
     const stickyKeys = sessionKeys.stickyKeys || []
     const deviceKey = stickyDeviceId ? stickyRouter?.canonicalDeviceKey?.(stickyDeviceId) || null : null
@@ -1021,7 +1102,7 @@ export function createHandleProtocol(deps) {
     const familyVmId = familyKey ? stickyRouter?.resolve?.(familyKey)?.vmId || null : null
     const stickyBound =
       stickyKey && typeof stickyRouter?.resolve === 'function' ? stickyRouter.resolve(stickyKey) : null
-    const outboundSessionId = resolveOutboundSessionId(callerSession, {
+    const outboundSessionId = resolveOutboundSessionId(executionSession, {
       ...sessionContext,
       accountId: stickyBound?.accountId || '',
       boundSessionId: stickyBound?.sessionId || '',
@@ -1054,10 +1135,22 @@ export function createHandleProtocol(deps) {
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
     ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
     const personaIn = ctx.body
+    // Capture ownership before rendering supplies gateway markers or projects
+    // the caller's automatic cache policy onto a CLI message block.
+    const preserveMessageCache =
+      personaIn.cache_control != null ||
+      // A zero template can interpolate cached caller system blocks into a
+      // message. Those boundaries must remain caller-owned after rendering.
+      (Array.isArray(personaIn.system) && personaIn.system.some((block) => block?.cache_control != null)) ||
+      (Array.isArray(personaIn.messages) &&
+        personaIn.messages.some(
+          (message) => Array.isArray(message?.content) && message.content.some((block) => block?.cache_control != null),
+        ))
     if (!requestContext)
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
         officialClient: officialTraffic,
         routingFile: routingConfigPath,
+        cacheTtl: requestedCacheTtl,
         headers: req.headers,
         sessionId: outboundSessionId,
         model: ctx.body?.model,
@@ -1082,6 +1175,7 @@ export function createHandleProtocol(deps) {
         officialClient: false,
         forceConfigured: true,
         routingFile: routingConfigPath,
+        cacheTtl: requestedCacheTtl,
         headers: req.headers,
         sessionId: outboundSessionId,
         model: ctx.body?.model,
@@ -1095,22 +1189,25 @@ export function createHandleProtocol(deps) {
       })
     }
     if (inferenceBackend === 'api') {
+      // API 直连走平台端点，不经过槽位；门禁与 api-kernel hop 同位，勿提前于 credential/intercept 链
+      if (ownerScopeFromRequest(req, apiKeyStore?.users).type !== 'platform') {
+        stats.errors++
+        const errorResult = makeError({
+          type: ErrorType.PERMISSION,
+          code: ErrorCode.API_BACKEND_FORBIDDEN,
+          message: '租户密钥只能调用自己名下的槽位',
+          status: 403,
+        })
+        logBag.error_code = ErrorCode.API_BACKEND_FORBIDDEN
+        logBag.error_message = errorResult.body?.error?.message || null
+        return json(res, 403, errorResult.body)
+      }
       const managedKey = req.apiKeyRecord || null
       if (managedKey) {
         const gate = apiKeyStore.acquire(managedKey)
         if (!gate.ok) {
           stats.errors++
-          return json(
-            res,
-            gate.status,
-            makeError({
-              type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
-              code: gate.code,
-              message: gate.message,
-              status: gate.status,
-              details: gate.detail || undefined,
-            }).body,
-          )
+          return json(res, gate.status, keyGateErrorBody(gate))
         }
       }
       const clientAbort = bindClientAbort(req, res)
@@ -1122,6 +1219,9 @@ export function createHandleProtocol(deps) {
       // stream:false only changes the client response shape (assembled JSON).
       const deliveryMode = requestedDelivery === 'verified' ? 'verified' : 'realtime'
       logBag.via = 'api-kernel'
+      // This backend forwards caller cache controls unchanged. Billing must
+      // use the upstream 5m/1h split, not the TTL requested for template fills.
+      cacheTtl = null
       let result
       try {
         result = await runApiInference({
@@ -1166,12 +1266,16 @@ export function createHandleProtocol(deps) {
       logBag.account_id = result?.accountId || null
       logBag.final_account_id = result?.accountId || null
       logBag.upstream_status = result?.status ?? null
-      logBag.usage = usageForLog(result?.body?.usage || result?.usage || null, { cacheTtl })
+      logBag.usage = usageForLog(result?.usage || result?.body?.usage || null, { cacheTtl })
       logBag.upstream_model = result?.model || null
-      // API transport still stamps the first data: line; subtract t0 for queue wait only.
+      // TTFT is generated content; the upstream window also includes hidden reasoning.
       logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
         ? Math.max(0, result.firstTokenAt - logCtx.t0)
         : (result?.ttftMs ?? null)
+      logBag.first_byte_ms = Number.isFinite(result?.firstByteAt)
+        ? Math.max(0, result.firstByteAt - logCtx.t0)
+        : (result?.firstByteMs ?? null)
+      logBag.generation_ms = result?.generationMs ?? null
       logBag.final_state = result?.terminalState || null
       attachPricing(logBag, {
         managedKey,
@@ -1217,17 +1321,7 @@ export function createHandleProtocol(deps) {
       const gate = apiKeyStore.acquire(managedKey)
       if (!gate.ok) {
         stats.errors++
-        return json(
-          res,
-          gate.status,
-          makeError({
-            type: gate.status === 429 ? ErrorType.RATE_LIMIT : ErrorType.PERMISSION,
-            code: gate.code,
-            message: gate.message,
-            status: gate.status,
-            details: gate.detail || undefined,
-          }).body,
-        )
+        return json(res, gate.status, keyGateErrorBody(gate))
       }
     }
 
@@ -1271,15 +1365,44 @@ export function createHandleProtocol(deps) {
     // Cache bypass is a client hint; only authenticated master-key probes may skip accounting.
     const healthReal = req.apiKeyKind === 'master' && isHealthRealBypass(req.headers)
     // Cache lives per account; a failover to another account starts cold by design.
+    // The image floor follows the caller session across accounts, scoped to its key.
+    // Returns the body to send: the image floor and break anchor may rewrite it.
+    const imageKey = callerSession ? `${req.apiKeyRecord?.id || req.apiKeyKind || ''}:${callerSession}` : null
     const noteCachePrefix = (selected, sessionId, body) => {
-      if (!sessionId) return
+      if (!sessionId) return body
       const key = `${selected.accountId}:${sessionId}`
-      const prefix = trackCachePrefix(key, body)
+      const { body: prepared, ...prefix } = prepareCachePrefix(key, body, Date.now(), {
+        imageKey,
+        preserveMessageCache,
+      }) || { body }
       logBag.cache_prefix = prefix
       logBag.cache_prefix_key = key
-      if (!prefix?.break) return
+      if (prefix.image_floor_moved) {
+        console.warn(
+          `[cache-prefix] request ${logCtx.request_id} turn ${prefix.turn} image floor messages[${prefix.image_floor}]`,
+        )
+      }
+      if (!prefix.break) return prepared
       const where = formatCacheBreak(prefix)
-      console.warn(`[cache-prefix] request ${logCtx.request_id} turn ${prefix.turn} broke at ${where}`)
+      const anchor = prefix.anchor == null ? '' : `; anchored messages[${prefix.anchor}]`
+      const checkpoint = prefix.checkpoint == null ? '' : `; checkpoint messages[${prefix.checkpoint}]`
+      console.warn(
+        `[cache-prefix] request ${logCtx.request_id} turn ${prefix.turn} broke at ${where}${anchor}${checkpoint}`,
+      )
+      return prepared
+    }
+    // Keep the envelope separately; only the CLI send boundary owns final headers.
+    // Clear each attempt so a failed retry cannot retain the previous hop's snapshot.
+    const noteOutboundEnvelope = (envelope) => {
+      if (logCtx.capture_outbound) logBag.outbound_body = envelope?.body ?? null
+      logBag.worker_envelope_headers = envelope?.headers ? redactHeaders(envelope.headers) : null
+      logBag.outbound_headers = null
+      logBag.outbound_headers_source = 'unavailable'
+    }
+    const noteOutboundHeaders = (headers) => {
+      if (!logCtx.capture_outbound) return
+      logBag.outbound_headers = redactHeaders(headers)
+      logBag.outbound_headers_source = 'cli_final'
     }
     let result
     try {
@@ -1292,7 +1415,7 @@ export function createHandleProtocol(deps) {
         stickyDeviceId,
         deviceKey,
         skipSessionSeat: seatless,
-        familyKey,
+        familyKey: summarySession ? null : familyKey,
         seatKey,
         familyVmId,
         pinVmId,
@@ -1302,6 +1425,7 @@ export function createHandleProtocol(deps) {
         quotaRequest: {
           body: canonicalBody,
           sessionId: outboundSessionId || callerSession || stickyKey,
+          preserveMessageCache,
         },
         stream: upstreamStream,
         deliveryMode,
@@ -1336,7 +1460,7 @@ export function createHandleProtocol(deps) {
             }
           }
           try {
-            touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm)
+            touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm, body?.model)
           } catch {}
           const identity = loadVmIdentity(selected.exec)
           const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
@@ -1345,7 +1469,7 @@ export function createHandleProtocol(deps) {
           const keptSession = extra.freshSlot ? '' : attemptBound?.sessionId || ''
           const keptAccount = extra.freshSlot ? '' : attemptBound?.accountId || ''
           const keptVm = extra.freshSlot ? '' : attemptBound?.vmId || ''
-          const attemptSessionId = resolveOutboundSessionId(callerSession, {
+          const attemptSessionId = resolveOutboundSessionId(executionSession, {
             ...sessionContext,
             accountId: selected.accountId,
             boundSessionId: keptSession,
@@ -1359,7 +1483,13 @@ export function createHandleProtocol(deps) {
           if (identity && attemptSessionId) identity.callerSessionId = attemptSessionId
           const credMode = credentialModeFromOauth(selected.vm?.claude || {})
           const modeOverride = slotPersonaModeOverride(selected.vm)
-          const routingNow = getRouting()
+          let routingNow = getRouting()
+          try {
+            routingNow = JSON.parse(fs.readFileSync(routingConfigPath, 'utf8'))
+          } catch {
+            // A mid-write routing file keeps the in-memory snapshot for this request.
+          }
+          const entrypointNow = ccEntrypointFromRouting(routingNow)
           const repaired = extra.repaired === true
           const preserveThinkingBlocks =
             !repaired &&
@@ -1379,8 +1509,25 @@ export function createHandleProtocol(deps) {
           let hopBody = body
           if (cliHop) {
             // The front rewrite already produces the official two-block shape.
-            const panelRewrite = false
-            hopBody = prepareCliHopBody(repaired ? body : hopBody, {
+            const outboundProfile = profileForPreset(resolvedPersona)
+            // Render once from caller input with the selected slot's identity, not the pre-selection environment.
+            if (!requestContext && !officialTraffic) {
+              hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(structuredClone(personaIn), resolvedPersona), {
+                forceConfigured: true,
+                routingFile: routingConfigPath,
+                cacheTtl: requestedCacheTtl,
+                mode: resolvedPersona,
+                sessionId: attemptSessionId,
+                model: hopBody?.model,
+                cliVersion: outboundProfile.cliVersion,
+                identity,
+                entrypoint: entrypointNow,
+              })
+              // The re-render starts from the raw caller body; re-apply this account's thinking ownership to it.
+              hopBody = filterThinkingForAccount(hopBody, selected.accountId, thinkingOwnerStore).body
+              for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
+            }
+            hopBody = prepareCliHopBody(hopBody, {
               stream: upstreamStream,
               repaired,
               cacheTtl: requestedCacheTtl,
@@ -1390,29 +1537,18 @@ export function createHandleProtocol(deps) {
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
               routing: routingNow,
+              personaPreset: !requestContext && !officialTraffic ? resolvedPersona : null,
             })
-            hopBody = await materializeRemoteImageSources(hopBody)
-            if (panelRewrite) {
-              hopBody = applyCrsUnofficialPersona(hopBody, {
-                officialClient: false,
-                forceConfigured: true,
-                routingFile: routingConfigPath,
-                mode: resolvedPersona,
+            if (!requestContext) {
+              hopBody = ensureBillingAttribution(hopBody, {
+                firstUserText,
                 sessionId: attemptSessionId,
-                model: hopBody?.model || personaIn?.model,
-                cliVersion: OFFICIAL_CLI_VERSION,
-                identity,
-              })
-              hopBody = fillMissingCacheTtl(hopBody, requestedCacheTtl)
-              enforceCacheLimit(hopBody)
-              validateCacheBreakpoints(hopBody)
-              personaHideTokens = personaHideForUnofficial(personaIn, hopBody, {
-                officialClient: false,
-                mode: resolvedPersona,
-                hides: personaHidesUsageFromRoutingFile(routingConfigPath, resolvedPersona),
-                standing: standingUsageFromRoutingFile(routingConfigPath, resolvedPersona),
+                cliVersion: outboundProfile.cliVersion,
+                indexes: billingIndexesFromMessages(hopBody.messages),
+                entrypoint: entrypointNow,
               })
             }
+            hopBody = await materializeRemoteImageSources(hopBody)
             if (identity) {
               hopBody = applyCrsIdentityReplace(hopBody, identity, inbound, req.headers, {
                 officialClient: officialTraffic,
@@ -1429,13 +1565,14 @@ export function createHandleProtocol(deps) {
             // Native wire may mix TTLs or leave caller TTL absent. The menu is
             // not an accounting authority; retain the upstream 5m/1h split.
             cacheTtl = null
-            if (logCtx.capture_outbound) logBag.outbound_body = hopBody
 
-            if (!panelRewrite) personaHideTokens = 0
+            personaHideTokens = 0
             logBag.inference_engine = resolveInferenceEngine(selected.vm, routingNow)
             logBag.persona_preset = resolveSlotPersonaPreset(selected.vm, routingNow)
+            logBag.outbound_profile = { cli_version: outboundProfile.cliVersion }
             logBag.official_cc_inference = 'cli-hop'
             logBag.provider = 'local_cli'
+            hopBody = noteCachePrefix(selected, attemptSessionId, hopBody)
             logBag.outbound_summary = summarizeBody(hopBody)
             logBag.cache_continuity = describeCacheContinuity({
               inbound,
@@ -1447,9 +1584,11 @@ export function createHandleProtocol(deps) {
               accountId: selected.accountId,
               requestId: logCtx.request_id,
             })
-            noteCachePrefix(selected, attemptSessionId, hopBody)
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
-            return { body: hopBody, meta: { toolNames: {}, sessionId: attemptSessionId, cliHop: true, requestContext } }
+            return {
+              body: hopBody,
+              meta: { toolNames: {}, sessionId: attemptSessionId, cliHop: true, requestContext, repaired },
+            }
           }
 
           cacheTtl = requestedCacheTtl
@@ -1459,6 +1598,7 @@ export function createHandleProtocol(deps) {
               officialClient: false,
               forceConfigured: true,
               routingFile: routingConfigPath,
+              cacheTtl: requestedCacheTtl,
               mode: configuredMode,
               sessionId: attemptSessionId,
               model: personaIn?.model,
@@ -1466,6 +1606,7 @@ export function createHandleProtocol(deps) {
               identity,
             })
             hopBody = officialMessagesBody(rewritten)
+            for (const policy of extra.repairs || []) hopBody = repairAnthropicRequest(hopBody, policy)
             personaHideTokens = personaHideForUnofficial(personaIn, rewritten, {
               officialClient: false,
               mode: configuredMode,
@@ -1510,12 +1651,11 @@ export function createHandleProtocol(deps) {
             authScheme: isApiKeyMode(credMode) ? 'apikey' : 'oauth',
             want1m,
           })
-          if (logCtx.capture_outbound) logBag.outbound_body = prepared.body
-          logBag.outbound_headers = redactHeaders(prepared.headers || {})
-          logBag.outbound_summary = summarizeBody(prepared.body)
+          const outbound = noteCachePrefix(selected, attemptSessionId, prepared.body)
+          logBag.outbound_summary = summarizeBody(outbound)
           logBag.cache_continuity = describeCacheContinuity({
             inbound,
-            outbound: prepared.body,
+            outbound,
             layer: 'node_object',
             ttl: cacheTtl,
             sessionId: attemptSessionId,
@@ -1523,9 +1663,8 @@ export function createHandleProtocol(deps) {
             accountId: selected.accountId,
             requestId: logCtx.request_id,
           })
-          noteCachePrefix(selected, attemptSessionId, prepared.body)
-          logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(prepared.body) || attemptSessionId)
-          return { body: prepared.body, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId } }
+          logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(outbound) || attemptSessionId)
+          return { body: outbound, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId, repaired } }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
           if (!clientStream) {
@@ -1541,10 +1680,13 @@ export function createHandleProtocol(deps) {
               cacheTtl,
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
+              repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               want1m,
               routing: getRouting(),
               noGoFallback: !!pinVmId,
+              onEnvelope: noteOutboundEnvelope,
+              onOutboundHeaders: noteOutboundHeaders,
             })
           }
           let state
@@ -1578,6 +1720,7 @@ export function createHandleProtocol(deps) {
               cacheTtl,
               preserveCacheBreakpoints,
               cliHop: attemptMeta?.cliHop === true,
+              repaired: attemptMeta?.repaired === true,
               requestContext: attemptMeta?.requestContext || requestContext,
               body,
               reqHeaders: req.headers,
@@ -1591,6 +1734,8 @@ export function createHandleProtocol(deps) {
               slotWaitMs: candidate.slotWaitMs,
               noGoFallback: !!pinVmId,
               ensureCredential: (exec) => ensureWorkerCredential(exec),
+              onEnvelope: noteOutboundEnvelope,
+              onOutboundHeaders: noteOutboundHeaders,
               onCommit: () => {
                 if (protocol === 'anthropic.messages' && !res.headersSent) writeSSEHeaders(res)
                 onCommit()
@@ -1659,7 +1804,7 @@ export function createHandleProtocol(deps) {
     logBag.attempt_count = result?.attemptCount ?? 0
     logBag.final_state = result?.finalState || result?.terminalState || null
     logBag.upstream_status = result?.status ?? null
-    logBag.usage = usageForLog(result?.body?.usage || result?.usage || null, {
+    logBag.usage = usageForLog(result?.usage || result?.body?.usage || null, {
       cacheTtl,
       requestedSpeed: wantsFastMode(ctx.body) ? 'fast' : null,
     })
@@ -1668,6 +1813,10 @@ export function createHandleProtocol(deps) {
     logBag.first_token_ms = Number.isFinite(result?.firstTokenAt)
       ? Math.max(0, result.firstTokenAt - logCtx.t0)
       : (result?.ttftMs ?? null)
+    logBag.first_byte_ms = Number.isFinite(result?.firstByteAt)
+      ? Math.max(0, result.firstByteAt - logCtx.t0)
+      : (result?.firstByteMs ?? null)
+    logBag.generation_ms = result?.generationMs ?? null
     logBag.stop_reason = result?.body?.stop_reason || result?.stopReason || null
     logBag.via = result?.via || 'go-worker-pool'
     if (result?.finalState === 'content_filter' || logBag.stop_reason === 'refusal') {
@@ -1839,22 +1988,139 @@ export function createHandleProtocol(deps) {
     }
     logBag.model = typeof body?.model === 'string' ? body.model : null
     logBag.inbound_summary = summarizeBody(body)
-    return handleCodexSearch({
-      req,
-      res,
-      body,
-      logBag,
-      stats,
-      json,
-      routing: getRouting() || {},
-      projectRoot: cfg.paths.project,
-      stickyRouter,
+    return runWithCodexKey(req, res, logBag, () =>
+      handleCodexSearch({
+        req,
+        res,
+        body,
+        logBag,
+        stats,
+        json,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+      }),
+    )
+  }
+
+  /** Field names and image count only: Images bodies carry base64 uploads. */
+  function summarizeImagesBody(body) {
+    if (!body || typeof body !== 'object') return null
+    return {
+      model: typeof body.model === 'string' ? body.model : null,
+      fields: Object.keys(body).sort(),
+      images: Array.isArray(body.images) ? body.images.length : body.image ? 1 : 0,
+      mask: body.mask != null,
+    }
+  }
+
+  /** POST /v1/images/{generations,edits}: same logging and auth as search; edits also take multipart. */
+  async function handleImages(req, res, pathName, kind) {
+    const protocol = 'openai.images'
+    const logCtx = requestLog.start(req, { protocol, pathName })
+    res._kinRequestId = logCtx.request_id
+    requestLog.tapResponse?.(logCtx, res)
+    const logBag = {
+      protocol,
+      model: null,
+      stream: false,
+      inbound_summary: null,
+      upstream_status: null,
+      vm_id: null,
+      account_id: null,
+      usage: null,
+      error_code: null,
+      error_message: null,
+      via: 'codex-images',
+      attempt_count: null,
+      final_state: null,
+    }
+    res.on('finish', () => {
+      try {
+        const groupId = req.apiKeyRecord?.group_id ?? 1
+        requestLog.finish(logCtx, {
+          status: res.statusCode || 0,
+          api_key_kind: req.apiKeyKind || null,
+          api_key_id: req.apiKeyRecord?.id || null,
+          user_id: req.apiKeyRecord?.user_id ?? null,
+          group_id: groupId,
+          rate_multiplier: deps.groupsRepo.rateMultiplier(groupId),
+          ...logBag,
+        })
+      } catch {}
     })
+    if (!requireAuth(req, res)) {
+      logBag.error_code = req.authError?.code || ErrorCode.INVALID_API_KEY
+      logBag.error_message = req.authError?.message || 'Invalid credentials'
+      logBag.api_key_presented = presentedApiKeyForLog(req.presentedApiKey)
+      return
+    }
+    let body
+    try {
+      const raw = await readRawBody(req, inboundBodyLimit(getRouting(), cfg.limits.max_body_bytes))
+      const contentType = req.headers?.['content-type']
+      if (kind === 'edits' && isMultipartFormData(contentType)) {
+        const converted = await normalizeImageEditBody(raw, contentType)
+        if (!converted.ok) {
+          stats.errors++
+          logBag.error_code = 'invalid_image_edit'
+          logBag.error_message = converted.message
+          return json(
+            res,
+            400,
+            makeError({
+              type: ErrorType.INVALID_REQUEST,
+              code: 'invalid_image_edit',
+              message: converted.message,
+              status: 400,
+            }).body,
+          )
+        }
+        body = converted.body
+      } else {
+        const text = raw.toString('utf8')
+        body = text ? JSON.parse(text) : {}
+      }
+    } catch (error) {
+      stats.errors++
+      logBag.error_code = error?.body?.error?.code || ErrorCode.INVALID_JSON
+      logBag.error_message = error?.body?.error?.message || String(error?.message || error)
+      if (error?.body?.error) return json(res, error.status || 400, error.body)
+      return json(
+        res,
+        400,
+        makeError({
+          type: ErrorType.INVALID_REQUEST,
+          code: ErrorCode.INVALID_JSON,
+          message: String(error?.message || error),
+          status: 400,
+        }).body,
+      )
+    }
+    logBag.model = typeof body?.model === 'string' ? body.model : null
+    logBag.inbound_summary = summarizeImagesBody(body)
+    return runWithCodexKey(req, res, logBag, () =>
+      handleCodexImages({
+        req,
+        res,
+        kind,
+        body,
+        logBag,
+        stats,
+        json,
+        routing: getRouting() || {},
+        projectRoot: cfg.paths.project,
+        stickyRouter,
+        ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+      }),
+    )
   }
 
   return {
     handleProtocol,
     handleSearch,
+    handleImages,
     mapProtocolClientError,
     applyProtocolIntercept,
     streamAndAssembleClaudeMessage,
