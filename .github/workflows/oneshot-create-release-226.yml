@@ -6,6 +6,8 @@ on:
   workflow_dispatch: {}
 jobs:
   create:
+    # 上游旧版本的临时发版任务，fork 合并时应跳过。
+    if: github.repository == 'dofastted/vm2api'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     permissions:
