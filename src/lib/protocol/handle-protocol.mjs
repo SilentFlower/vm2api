@@ -5,6 +5,7 @@
 import { applyIntercept } from '../core/intercept.mjs'
 import { resolveStreamIdleTimeoutMs, inboundBodyLimit, queueKeepaliveDelayMs } from '../core/config.mjs'
 import { applyEagerToolStreaming } from './eager-tool-streaming.mjs'
+import { validateToolChoice } from './model-policy.mjs'
 import {
   inboundRefusalDeviceId,
   isRefusalGuardEnabled,
@@ -44,6 +45,8 @@ import { readRawBody } from '../http/respond.mjs'
 import { disjointOpenaiUsage } from './openai-usage.mjs'
 import { costColumnsFromUsage } from '../admin/pricing.mjs'
 import { detectInboundPlatform } from './platform-detect.mjs'
+import { canonicalImageToolModel } from './image-tool-models.mjs'
+import { imageModelAnswer, imageModelStreamError, imagesRequestFromTurn } from './image-model-bridge.mjs'
 import { normalizeCodexRouting } from './codex-route.mjs'
 import { applyCodexInboundModelRewrite } from './codex-model-mapping.mjs'
 import { hasClaudeCode1mSuffix } from './context-1m.mjs'
@@ -59,6 +62,7 @@ import { resolveInferenceBackend, runApiInference } from '../pool/api-protocol.m
 import { classifyClaudeRequestPurpose, prepareClassifierBody, classifierRequestSummary } from './request-purpose.mjs'
 import { agentSummarySession } from './agent-summary.mjs'
 import { summarizeBody, redactHeaders, presentedApiKeyForLog } from '../admin/request-log.mjs'
+import { loggedReasoningEffort } from './thinking.mjs'
 import { reasoningEffortOf, sessionIdForLog } from './log-fields.mjs'
 import { ownerScopeFromRequest } from '../admin/resource-owner.mjs'
 import { keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
@@ -89,7 +93,6 @@ import { prepareOutboundEnvelope, prepareCliHopBody, prepareCliPersonaInput } fr
 import { repairAnthropicRequest } from '../pool/upstream-error-policy.mjs'
 import { profileForPreset } from '../identity/official-profiles.mjs'
 import { loadVmIdentity, OFFICIAL_CLI_VERSION } from '../identity/vm-identity.mjs'
-import { touchTelemetrySession } from '../vm/worker-telemetry.mjs'
 import {
   applyCrsIdentityReplace,
   extractCallerSession,
@@ -117,7 +120,7 @@ import {
   extractFirstUserText,
   isOfficialClaudeCodeTraffic,
   isProxiedOfficialClaudeCode,
-  officialCcPassthroughFromRouting,
+  officialFamilyBodyPassthrough,
   personaHidesUsageFromRoutingFile,
   standingUsageFromRoutingFile,
   personaModeFromRoutingFile,
@@ -167,6 +170,9 @@ import {
   prepareAnthropicRequest,
   enforceCacheLimit,
   rewriteToolNames,
+  scrubUpstreamClientBody,
+  toStandardAnthropicBody,
+  composeToolNames,
   restoreToolNames,
   restoreToolNamesInSSELine,
   wantsFastMode,
@@ -319,8 +325,17 @@ export function createHandleProtocol(deps) {
       result?.body,
     )
     const summary = formatPoolSelectionSummary(details)
-    logBag.error_code = originalCode || mapped.body?.error?.code
-    logBag.error_message = summary || originalMessage || mapped.body?.error?.message || null
+    const mappedCode = mapped.body?.error?.code
+    if (mappedCode === ErrorCode.REFUSAL_GUARD) {
+      // The kernel often names an AUP refusal upstream_invalid_request. Keep
+      // the refusal code so the audit feed can see it, and the upstream sentence
+      // so the row still shows what was refused.
+      logBag.error_code = mappedCode
+      logBag.error_message = originalMessage || mapped.body?.error?.message || null
+    } else {
+      logBag.error_code = originalCode || mappedCode
+      logBag.error_message = summary || originalMessage || mapped.body?.error?.message || null
+    }
     if (logBag.classifier) {
       logBag.classifier.error = {
         status: result?.status || null,
@@ -639,7 +654,7 @@ export function createHandleProtocol(deps) {
         }).body,
       )
     }
-    logBag.inbound_body = inbound
+    logBag.inbound_body = logCtx.mode === 'debug' ? inbound : null
     logBag.inbound_summary = summarizeBody(inbound)
     logBag.model = inbound?.model || null
     logBag.requested_model = inbound?.model || null
@@ -803,7 +818,9 @@ export function createHandleProtocol(deps) {
       ctx = { ...ctx, body: modelRewrite.body }
       logBag.upstream_model = modelRewrite.upstreamModel || null
     }
-    const platform = detectInboundPlatform(ctx.body?.model)
+    // Image models are listed in /v1/models but are not chat models: they run on the Images endpoint.
+    const imageModel = canonicalImageToolModel(ctx.body?.model)
+    const platform = imageModel ? { ok: true, platform: 'openai' } : detectInboundPlatform(ctx.body?.model)
     if (!platform.ok) {
       stats.errors++
       const errorResult = makeError({
@@ -843,6 +860,7 @@ export function createHandleProtocol(deps) {
       logBag.error_message = errorResult.body?.error?.message || null
       return json(res, 403, errorResult.body)
     }
+    if (imageModel) return serveImageModelTurn({ req, res, protocol, body: ctx.body, logBag })
     // Codex returns before conversion. Distill does not apply to OpenAI platform models; the rest
     // of the gate scans them only when jev.openai_platform_enabled is on.
     if (
@@ -979,11 +997,13 @@ export function createHandleProtocol(deps) {
     const officialInbound =
       isOfficialClaudeCodeTraffic(req.headers, inbound) ||
       (detectProxiedOfficialCcFromRoutingFile(routingConfigPath) && isProxiedOfficialClaudeCode(inbound, req.headers))
+    // Recognition alone is not passthrough. Only the protocol-tab switch keeps
+    // the Claude Code family body; every other inbound is rewritten below.
+    const officialPassthrough = officialFamilyBodyPassthrough(officialInbound, getRouting())
     const converted = toClaudeMessages(protocol, ctx.body, {
       rewrite: rewriteEnabled,
       model_map: false,
-      strict_passthrough: String(req.headers['x-kin-strict-passthrough'] || '') === '1',
-      preserve_content_shape: officialInbound,
+      preserve_content_shape: officialPassthrough,
     })
     stats.requests++
     stats.by_route[protocol] = (stats.by_route[protocol] || 0) + 1
@@ -1007,7 +1027,25 @@ export function createHandleProtocol(deps) {
         return json(res, error.status, error.body)
       }
     } else ctx.body = applyMinMaxTokens(ctx.body, getRouting()?.compatibility?.min_max_tokens)
-    if (!requestContext && officialTraffic && officialCcPassthroughFromRouting(getRouting())) {
+    let inboundToolReverse = {}
+    if (!requestContext && !officialPassthrough) {
+      const standard = toStandardAnthropicBody(ctx.body, {
+        official: officialTraffic === true,
+        rewriteTools: getRouting()?.compatibility?.tool_name_rewrite !== false,
+      })
+      ctx.body = standard.body
+      inboundToolReverse = standard.reverse
+    }
+    try {
+      validateToolChoice(ctx.body)
+    } catch (error) {
+      if (!error.body?.error) throw error
+      stats.errors++
+      logBag.error_code = error.body.error.code
+      logBag.error_message = error.body.error.message
+      return json(res, error.status, error.body)
+    }
+    if (!requestContext && officialPassthrough) {
       try {
         validateCacheBreakpoints(ctx.body)
       } catch (error) {
@@ -1113,7 +1151,7 @@ export function createHandleProtocol(deps) {
     })
     const requestedCacheTtl = pinConversationCacheTtl(
       stickyKey || callerSession || outboundSessionId,
-      resolveCacheTtl({ headers: req.headers, body: inbound, routingFile: routingConfigPath }),
+      resolveCacheTtl({ headers: req.headers, body: inbound, routing: getRouting(), routingFile: routingConfigPath }),
     )
     let cacheTtl = requestedCacheTtl
     let preserveCacheBreakpoints = false
@@ -1134,6 +1172,14 @@ export function createHandleProtocol(deps) {
     // After OpenAI→Anthropic conversion so function tools already have input_schema;
     // leftover OpenAI-shaped tools are still marked (rewrite / mixed inbound).
     ctx.body = applyEagerToolStreaming(ctx.body, getRouting())
+    // #850: every rewritten inbound. A cache marker without a TTL means "not
+    // chosen", for Claude Code and third-party callers alike; resolve it to this
+    // conversation's TTL before rendering, so the template budgets against the
+    // real value and no caller marker reaches Anthropic as implicit 5m. Explicit
+    // TTLs stay. Passthrough keeps the caller body untouched.
+    if (!requestContext && !officialPassthrough) {
+      ctx.body = fillMissingCacheTtl(ctx.body, requestedCacheTtl)
+    }
     const personaIn = ctx.body
     // Capture ownership before rendering supplies gateway markers or projects
     // the caller's automatic cache policy onto a CLI message block.
@@ -1148,7 +1194,8 @@ export function createHandleProtocol(deps) {
         ))
     if (!requestContext)
       ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: officialTraffic,
+        officialClient: officialPassthrough,
+        forceConfigured: !officialPassthrough,
         routingFile: routingConfigPath,
         cacheTtl: requestedCacheTtl,
         headers: req.headers,
@@ -1159,35 +1206,12 @@ export function createHandleProtocol(deps) {
     let personaHideTokens = requestContext
       ? 0
       : personaHideForUnofficial(personaIn, ctx.body, {
-          officialClient: officialTraffic,
+          officialClient: officialPassthrough,
           mode: personaMode,
           hides: personaHidesUsageFromRoutingFile(routingConfigPath),
           standing: standingUsageFromRoutingFile(routingConfigPath),
         })
 
-    if (
-      inferenceBackend === 'api' &&
-      !requestContext &&
-      officialTraffic &&
-      !officialCcPassthroughFromRouting(getRouting() || {})
-    ) {
-      ctx.body = applyCrsUnofficialPersona(ctx.body, {
-        officialClient: false,
-        forceConfigured: true,
-        routingFile: routingConfigPath,
-        cacheTtl: requestedCacheTtl,
-        headers: req.headers,
-        sessionId: outboundSessionId,
-        model: ctx.body?.model,
-        cliVersion: OFFICIAL_CLI_VERSION,
-      })
-      personaHideTokens = personaHideForUnofficial(personaIn, ctx.body, {
-        officialClient: false,
-        mode: personaMode,
-        hides: personaHidesUsageFromRoutingFile(routingConfigPath),
-        standing: standingUsageFromRoutingFile(routingConfigPath),
-      })
-    }
     if (inferenceBackend === 'api') {
       // API 直连走平台端点，不经过槽位；门禁与 api-kernel hop 同位，勿提前于 credential/intercept 链
       if (ownerScopeFromRequest(req, apiKeyStore?.users).type !== 'platform') {
@@ -1240,6 +1264,7 @@ export function createHandleProtocol(deps) {
           personaHideTokens,
           cacheTtl,
           requestContext,
+          passthrough: officialPassthrough,
           converters: {
             createClaudeMessageAssembler,
             applyClaudeSSELineToMessage,
@@ -1395,6 +1420,7 @@ export function createHandleProtocol(deps) {
     // Clear each attempt so a failed retry cannot retain the previous hop's snapshot.
     const noteOutboundEnvelope = (envelope) => {
       if (logCtx.capture_outbound) logBag.outbound_body = envelope?.body ?? null
+      if (envelope?.body) logBag.reasoning_effort = loggedReasoningEffort(envelope.body)
       logBag.worker_envelope_headers = envelope?.headers ? redactHeaders(envelope.headers) : null
       logBag.outbound_headers = null
       logBag.outbound_headers_source = 'unavailable'
@@ -1459,9 +1485,6 @@ export function createHandleProtocol(deps) {
               throw error
             }
           }
-          try {
-            touchTelemetrySession(cfg.paths.project, selected.vmId, selected.exec?.vm, body?.model)
-          } catch {}
           const identity = loadVmIdentity(selected.exec)
           const attemptStartedAt = extra.attemptStartedAt ?? Date.now()
           // The runner snapshots after this session's queue turn, before VM prebinding.
@@ -1498,7 +1521,6 @@ export function createHandleProtocol(deps) {
           // cli-node receives the cleaned body after this boundary. Keep every
           // thinking block on the first hop and only let a repaired retry strip it.
           const preserveCliHopThinkingBlocks = !repaired
-          const officialPassthrough = officialTraffic && officialCcPassthroughFromRouting(routingNow)
           const cliHop = resolveOfficialCcInference(selected.vm, routingNow) === 'cli-hop'
           const resolvedPersona = resolveSlotPersonaPreset(selected.vm, routingNow)
           const preserveCallerEnvironment = !presetFlagEnabled(
@@ -1511,7 +1533,7 @@ export function createHandleProtocol(deps) {
             // The front rewrite already produces the official two-block shape.
             const outboundProfile = profileForPreset(resolvedPersona)
             // Render once from caller input with the selected slot's identity, not the pre-selection environment.
-            if (!requestContext && !officialTraffic) {
+            if (!requestContext && !officialPassthrough) {
               hopBody = applyCrsUnofficialPersona(prepareCliPersonaInput(structuredClone(personaIn), resolvedPersona), {
                 forceConfigured: true,
                 routingFile: routingConfigPath,
@@ -1537,7 +1559,7 @@ export function createHandleProtocol(deps) {
               preserveCallerEnvironment,
               autoCompactWindow: ctx.autoCompactWindow,
               routing: routingNow,
-              personaPreset: !requestContext && !officialTraffic ? resolvedPersona : null,
+              personaPreset: !requestContext && !officialPassthrough ? resolvedPersona : null,
             })
             if (!requestContext) {
               hopBody = ensureBillingAttribution(hopBody, {
@@ -1546,6 +1568,7 @@ export function createHandleProtocol(deps) {
                 cliVersion: outboundProfile.cliVersion,
                 indexes: billingIndexesFromMessages(hopBody.messages),
                 entrypoint: entrypointNow,
+                passthrough: officialPassthrough,
               })
             }
             hopBody = await materializeRemoteImageSources(hopBody)
@@ -1560,6 +1583,15 @@ export function createHandleProtocol(deps) {
                 vmId: selected.vmId,
                 epoch: attemptStartedAt,
               })
+            }
+            let clientToolNames = {}
+            if (!requestContext) {
+              const scrubbed = scrubUpstreamClientBody(hopBody, {
+                official: officialTraffic === true,
+                rewriteTools: routingNow?.compatibility?.tool_name_rewrite !== false,
+              })
+              hopBody = scrubbed.body
+              clientToolNames = scrubbed.reverse
             }
             preserveCacheBreakpoints = true
             // Native wire may mix TTLs or leave caller TTL absent. The menu is
@@ -1587,7 +1619,13 @@ export function createHandleProtocol(deps) {
             logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(hopBody) || attemptSessionId)
             return {
               body: hopBody,
-              meta: { toolNames: {}, sessionId: attemptSessionId, cliHop: true, requestContext, repaired },
+              meta: {
+                toolNames: composeToolNames(inboundToolReverse, clientToolNames),
+                sessionId: attemptSessionId,
+                cliHop: true,
+                requestContext,
+                repaired,
+              },
             }
           }
 
@@ -1664,7 +1702,14 @@ export function createHandleProtocol(deps) {
             requestId: logCtx.request_id,
           })
           logBag.outbound_session_id = sessionIdForLog(sessionIdFromOutboundBody(outbound) || attemptSessionId)
-          return { body: outbound, meta: { toolNames: prepared.toolNames, sessionId: attemptSessionId, repaired } }
+          return {
+            body: outbound,
+            meta: {
+              toolNames: composeToolNames(inboundToolReverse, prepared.toolNames),
+              sessionId: attemptSessionId,
+              repaired,
+            },
+          }
         },
         callAttempt: async ({ candidate, body, attemptMeta, deliveryMode: attemptDelivery, signal, onCommit }) => {
           if (!clientStream) {
@@ -2013,6 +2058,106 @@ export function createHandleProtocol(deps) {
       images: Array.isArray(body.images) ? body.images.length : body.image ? 1 : 0,
       mask: body.mask != null,
     }
+  }
+
+  /**
+   * Chat Completions / Responses turn on an image model: one Images call (generation, or edit
+   * when the last user message carries images) answered in the caller's protocol. The row is
+   * an Images row, so it bills image usage alone like /v1/images.
+   */
+  async function serveImageModelTurn({ req, res, protocol, body, logBag }) {
+    const turn = imagesRequestFromTurn(protocol, body)
+    if (!turn.ok) {
+      stats.errors++
+      logBag.error_code = turn.code
+      logBag.error_message = turn.message
+      return json(
+        res,
+        400,
+        makeError({
+          type: ErrorType.INVALID_REQUEST,
+          code: turn.code,
+          message: turn.message,
+          status: 400,
+          param: turn.param,
+        }).body,
+      )
+    }
+    logBag.protocol = 'openai.images'
+    logBag.inbound_summary = summarizeImagesBody(turn.body)
+    const stream = isClientStream(body, req.headers)
+    const streamKeepaliveMs = Number(
+      getRouting()?.failover?.stream_keepalive_ms ?? cfg.limits.stream_keepalive_ms ?? 15_000,
+    )
+    // Generation takes minutes: past the queue delay a stream commits SSE and pings so a
+    // proxy in front does not time out. Before that, failures keep their HTTP status.
+    const keepalive =
+      stream && streamKeepaliveMs > 0
+        ? createDownstreamKeepalive({
+            intervalMs: streamKeepaliveMs,
+            protocol,
+            write: (chunk) => {
+              if (responseClosed(res)) return
+              if (!res.headersSent) writeSSEHeaders(res)
+              res.write(chunk)
+            },
+          })
+        : null
+    let reply = null
+    try {
+      await runWithCodexKey(req, res, logBag, () => {
+        keepalive?.armAfter(queueKeepaliveDelayMs(getRouting(), cfg.limits?.queue_keepalive_delay_ms))
+        return handleCodexImages({
+          req,
+          res,
+          kind: turn.kind,
+          body: turn.body,
+          logBag,
+          stats,
+          json: (_res, status, payload) => {
+            reply = { status, payload }
+          },
+          routing: getRouting() || {},
+          projectRoot: cfg.paths.project,
+          stickyRouter,
+          ownerScope: ownerScopeFromRequest(req, apiKeyStore?.users),
+          ops: deps.codexOps || {},
+        })
+      })
+    } finally {
+      keepalive?.stop()
+    }
+    if (responseClosed(res)) return
+    if (!reply) {
+      // Client gone (cancelled) or the key gate already answered.
+      if (res.headersSent && !res.writableEnded) res.end()
+      return
+    }
+    let { status, payload } = reply
+    if (status < 400) {
+      const answer = imageModelAnswer(protocol, payload, {
+        model: body.model,
+        stream,
+        includeUsage: body.stream_options?.include_usage === true,
+      })
+      if (answer.ok) {
+        if (!stream) return json(res, 200, answer.body)
+        if (!res.headersSent) writeSSEHeaders(res)
+        res.write(answer.sse)
+        return res.end()
+      }
+      stats.errors++
+      logBag.final_state = 'upstream_error'
+      logBag.error_code = answer.code
+      logBag.error_message = answer.message
+      status = 502
+      payload = { error: { type: 'api_error', code: answer.code, message: answer.message } }
+    } else if (!logBag.error_message) {
+      logBag.error_message = payload?.error?.message || null
+    }
+    if (!res.headersSent) return json(res, status, payload)
+    res.write(imageModelStreamError(protocol, payload))
+    return res.end()
   }
 
   /** POST /v1/images/{generations,edits}: same logging and auth as search; edits also take multipart. */

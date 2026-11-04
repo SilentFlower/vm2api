@@ -30,7 +30,6 @@ import {
 import { createKernelWatchdog, normalizeKernelWatchdogConfig } from './lib/transport/kernel-watchdog.mjs'
 import { ensureSlotSubscriptionType } from './lib/oauth/oauth-credentials.mjs'
 import { createCliNodeGuard } from './lib/vm/cli-node-guard.mjs'
-import { ensureTelemetrySidecar } from './lib/vm/slot-process-status.mjs'
 
 import { createSlotBridgeHealer, powerOnSlot, reviveDownSlots } from './lib/vm/slot-recovery.mjs'
 import { createUsageProbeMonitor, normalizeUsageProbeConfig } from './lib/oauth/usage-probe-monitor.mjs'
@@ -39,7 +38,8 @@ import { normalizeOfficialCcConfig } from './lib/oauth/official-cc-bootstrap.mjs
 import { invalidateLiveCredentialCache } from './lib/admin/panel-live-credentials.mjs'
 import { normalizeHealthProbeConfig, createHealthProbeMonitor, HEALTH_REAL_HEADER } from './lib/admin/health-probe.mjs'
 import { createPeakPrimeMonitor, normalizePeakPrimeConfig } from './lib/admin/peak-prime.mjs'
-import { normalizeNotifyConfig, createNotifyMonitor, dispatchNotify } from './lib/admin/notify.mjs'
+import { normalizeNotifyConfig, createNotifyMonitor } from './lib/admin/notify.mjs'
+import { snapshotVmConnectivity } from './lib/admin/vm-connectivity.mjs'
 import { runVmTestChat } from './lib/admin/vm-test-chat.mjs'
 import { VmTestScheduleRunner } from './lib/admin/vm-test-schedule.mjs'
 import { StickyRouter } from './lib/pool/sticky-router.mjs'
@@ -73,7 +73,8 @@ import { ensureProxyEgress, proxyEgressReady } from './lib/vm/egress.mjs'
 import { syncIpv6ProxyEgress } from './lib/vm/proxy-policy-runtime.mjs'
 import { GATEWAY_CAPABILITIES } from './lib/vm/execution-context.mjs'
 import { isTelemetryPath, telemetryInterceptResponse } from './lib/identity/telemetry-rewrite.mjs'
-import { openDatabase, closeDatabase } from './lib/db/database.mjs'
+import { openDatabase, closeDatabase, getDb } from './lib/db/database.mjs'
+import { armWriteBehind } from './lib/db/write-behind.mjs'
 import { JevUsageRepo } from './lib/db/repos/jev-usage-repo.mjs'
 import { installJevUsageRecorder } from './lib/protocol/jev-usage.mjs'
 import { runLegacyImport } from './lib/db/legacy-import.mjs'
@@ -145,7 +146,8 @@ const allowRate = createRateLimiter({
 
 // --- Persistent store (SQLite, sub2api-inspired) ---
 const dataDir = cfg.paths.data || path.join(cfg.paths.root, 'data')
-openDatabase({ dataDir })
+openDatabase({ dataDir, pooled: true })
+armWriteBehind(getDb())
 const jevUsageRepo = new JevUsageRepo()
 installJevUsageRecorder((event) => jevUsageRepo.record(event))
 try {
@@ -535,17 +537,8 @@ kernelWatchdog = createKernelWatchdog({
   listTargets: () => listVms(cfg.paths.project),
   getRouting: () => routingConfig,
   homeDirFor: (vm) => path.join(cfg.paths.project, 'vms', vm.id, 'cli-home'),
-  ensureTelemetry: (vm) => ensureTelemetrySidecar({ projectRoot: cfg.paths.project, vm }),
   revive: (vm) => bootSlot(vm.id),
   healBridges: createSlotBridgeHealer({ projectRoot: cfg.paths.project }),
-  onFault: (vm, reason) => {
-    const title = `槽内核故障 ${vm.id}`
-    dispatchNotify(routingConfig.notify, {
-      title,
-      text: `【KIN】${title}\n\n${reason}\n已停止调度该槽；内核恢复健康后自动恢复调度。`,
-      subject: `KIN · ${title}`,
-    }).catch((error) => console.warn('[kernel-watchdog] notify failed', error?.message || error))
-  },
 })
 
 usageProbeMonitor = createUsageProbeMonitor({
@@ -578,6 +571,7 @@ catalogMonitor = createCatalogMonitor({
   log: (event) => console.log(JSON.stringify(event)),
 })
 notifyMonitor = createNotifyMonitor({
+  vmSnapshot: () => snapshotVmConnectivity(listVms(cfg.paths.project)),
   config: routingConfig.notify,
   baseUrl: cfg.base_url,
   snapshot: () =>
@@ -842,8 +836,9 @@ function requireAuth(req, res) {
   return true
 }
 
-function fetchWorkerModels(opts) {
-  return gatewayModelCatalog(opts)
+function fetchWorkerModels(opts = {}) {
+  const mappingKeys = Object.keys(routingConfig?.codex?.model_mappings || {})
+  return gatewayModelCatalog({ ...opts, mappingKeys })
 }
 
 const importCommit = createImportCommit({
@@ -1350,6 +1345,9 @@ if (process.env.KIN_CRS_MOCK !== '1') {
   syncLocalSlotRestartPolicies(listVms(cfg.paths.project))
 }
 await bootApiKernel(cfg)
+server.keepAliveTimeout = 120_000
+server.headersTimeout = 125_000
+server.timeout = 0
 
 server.listen(cfg.port, cfg.host, () => {
   try {

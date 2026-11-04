@@ -22,6 +22,7 @@ import {
   buildScopeInventory,
   listPolicyModels as listDecisionModels,
   publicJevConfig,
+  publicJevKeys,
   readJevConfig,
 } from '../protocol/jev-intercept.mjs'
 import { JevUsageRepo } from '../db/repos/jev-usage-repo.mjs'
@@ -185,7 +186,7 @@ import {
   SESSION_SLOT_MIN,
   validateInferenceRoutingPatch,
 } from '../vm/slot-engine.mjs'
-import { validateTelemetryRoutingPatch } from '../vm/worker-telemetry.mjs'
+import { validateTelemetryRoutingPatch } from '../vm/native-telemetry.mjs'
 import { makeError, ErrorType, ErrorCode } from '../core/errors.mjs'
 import * as panel from './panel-api.mjs'
 import { GATEWAY_CAPABILITIES } from '../vm/execution-context.mjs'
@@ -193,6 +194,7 @@ import { withVmLock, atomicWriteJson, isValidVmId, invalidateVmSlotReadCache } f
 import { snapshotDatabaseMetrics } from '../db/database-metrics.mjs'
 import { getUsageCache } from '../oauth/usage-cache.mjs'
 import { getDb, getDbPath } from '../db/database.mjs'
+import { usagePoolEnabled, usageRead } from '../db/sqlite-pool.mjs'
 import {
   readLocalVersion,
   loadChangelog,
@@ -211,7 +213,6 @@ import {
   nextNumericIndex,
   padVm,
   STANDARD_LOCALE,
-  syncWorkerTelemetry,
 } from '../vm/vm-runtime.mjs'
 import {
   startSlotReady,
@@ -280,6 +281,7 @@ import { restartRustKernel, syncClaudeKernelConfigs, writeKernelConfig } from '.
 import { countTokensViaWorker } from '../transport/go-worker-client.mjs'
 import { apiKeyBetaHeader, setupTokenBetaHeader } from '../protocol/claude-code-betas.mjs'
 import { rustKernelHealth, toPublicKernelHealth } from '../transport/rust-kernel-client.mjs'
+import { applyNativeTelemetry } from '../vm/fleet-update.mjs'
 import { codexKernelHealth } from '../transport/codex-kernel-client.mjs'
 import { normalizeHealthProbeConfig } from './health-probe.mjs'
 import { normalizeUsageProbeConfig } from '../oauth/usage-probe-monitor.mjs'
@@ -518,7 +520,7 @@ async function runKernelSync({ project, routingConfig, body = {}, refreshCluster
   const wanted = Array.isArray(body.ids) ? new Set(body.ids.map(String)) : null
   const selected = wanted ? all.filter((vm) => wanted.has(vm.id)) : all
   // Local slots bind the new binaries. Cluster slots bake the same kernel, CLIs
-  // and kin-worker telemetry into a content-hashed image, then recreate onto it.
+  // and OAuth helpers into a content-hashed image, then recreate onto it.
   const localVms = selected.filter((vm) => !slotHost(vm).bakedKernel)
   const clusterVms = selected.filter((vm) => slotHost(vm).bakedKernel)
   const checkOnly = body.restart === false
@@ -978,6 +980,15 @@ export function createPanelHandler(ctx) {
     return { ...config, account_scope: jevScopeInventory(config.account_platform_plans) }
   }
 
+  function deactivateVmSlot(id) {
+    if (getActiveVmId(cfg.paths.project) === id) {
+      clearActiveVmFromDb()
+      clearActiveVm(cfg.paths.project)
+      reloadActiveVm(cfg)
+    }
+    return { ok: true, active_vm: getActiveVmId(cfg.paths.project) }
+  }
+
   function activateVmSlot(id) {
     setActiveVm(cfg.paths.project, id)
     reloadActiveVm(cfg)
@@ -1160,9 +1171,9 @@ export function createPanelHandler(ctx) {
       projectRoot: cfg.paths.project,
       previousEngine: previous,
       targetEngine: target,
-      commit: () => {
+      commit: async () => {
         try {
-          return persistRoutingPatch(body)
+          return await persistRoutingPatch(body)
         } catch (error) {
           restoreRoutingRuntime(previousRoutingConfig)
           if (body.pool || body.failover) initPoolRuntime()
@@ -1184,6 +1195,21 @@ export function createPanelHandler(ctx) {
       proxy_required: true,
       worker: health,
       credential: health.credential || null,
+    }
+  }
+
+  async function readUsage(kind, method, args) {
+    if (!usagePoolEnabled()) return null
+    try {
+      return await usageRead({
+        kind,
+        method,
+        args,
+        mutedErrorClasses: requestLog?.mutedErrorClasses || [],
+      })
+    } catch (err) {
+      console.warn(`[sqlite-pool] ${kind}.${method}: ${err?.message || err}`)
+      return null
     }
   }
 
@@ -1223,7 +1249,7 @@ export function createPanelHandler(ctx) {
       const body = await readBody(req, cfg.limits.max_body_bytes)
       let applied
       try {
-        applied = persistRoutingPatch(body)
+        applied = await persistRoutingPatch(body)
       } catch (error) {
         if (error instanceof TypeError || error instanceof RangeError) {
           return json(res, 400, {
@@ -1271,6 +1297,12 @@ export function createPanelHandler(ctx) {
       const id = p.split('/')[3]
       if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
       return json(res, 200, activateVmSlot(id))
+    }
+    if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/deactivate$/.test(p)) {
+      if (!requireAuth(req, res)) return
+      const id = p.split('/')[3]
+      if (!getVm(cfg.paths.project, id)) return json(res, 404, { error: { message: 'vm not found' } })
+      return json(res, 200, deactivateVmSlot(id))
     }
     if (req.method === 'POST' && /^\/admin\/vms\/[^/]+\/probe$/.test(p)) {
       if (!requireAuth(req, res)) return
@@ -1415,7 +1447,7 @@ export function createPanelHandler(ctx) {
             const state = loadOnboardingState(settings)
             let next
             if (body?.action === 'profile') {
-              applyUsageProfile({
+              await applyUsageProfile({
                 mode: body?.mode,
                 persistRouting: (patch) => persistRoutingPatch(patch),
                 settings,
@@ -2002,9 +2034,10 @@ export function createPanelHandler(ctx) {
           status_code: listed.status_code || (/^\d+$/.test(legacyStatus || '') ? legacyStatus : null),
           errors_only: legacyStatus === 'error',
         }
-        const { items, total, capped } = new UsageLogsView(getDb(), {
-          mutedErrorClasses: requestLog?.mutedErrorClasses,
-        }).exportRows(filters)
+        const exported =
+          (await readUsage('view', 'exportRows', [filters])) ||
+          new UsageLogsView(getDb(), { mutedErrorClasses: requestLog?.mutedErrorClasses }).exportRows(filters)
+        const { items, total, capped } = exported
         const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '')
         const body = format === 'csv' ? logsToCsv(items) : logsToJsonl(items)
         const filename = `vm2api-logs-${stamp}.${format}`
@@ -2031,14 +2064,36 @@ export function createPanelHandler(ctx) {
         const until = u.searchParams.get('until') || null
         const tenant = panelIdentity(req).role === 'user'
         const owner_user_id = tenant ? req.panelUserId : u.searchParams.get('user_id') || null
+        let totals
+        let buckets
+        let window
+        if (usagePoolEnabled()) {
+          try {
+            const jobs = [
+              usageRead({ kind: 'repo', method: 'aggregate', args: [{ since, until, bucket, owner_user_id }] }),
+              usageRead({ kind: 'repo', method: 'windowStats', args: [{ since, until, owner_user_id }] }),
+            ]
+            if (!tenant) jobs.unshift(usageRead({ kind: 'repo', method: 'totals' }))
+            const out = await Promise.all(jobs)
+            if (tenant) [buckets, window] = out
+            else [totals, buckets, window] = out
+          } catch (err) {
+            console.warn(`[sqlite-pool] repo.stats: ${err?.message || err}`)
+          }
+        }
+        if (buckets === undefined) {
+          totals = tenant ? null : requestLog.totals()
+          buckets = requestLog.aggregate({ since, until, bucket, owner_user_id })
+          window = requestLog.windowStats({ since, until, owner_user_id })
+        }
         return json(res, 200, {
           ok: true,
           bucket,
           since,
           until,
-          totals: tenant ? null : requestLog.totals(),
-          buckets: requestLog.aggregate({ since, until, bucket, owner_user_id }),
-          window: requestLog.windowStats({ since, until, owner_user_id }),
+          totals: totals ?? null,
+          buckets,
+          window,
           muted_error_classes: requestLog.snapshot().muted_error_classes,
           config: tenant ? null : requestLog.snapshot(),
         })
@@ -2073,34 +2128,36 @@ export function createPanelHandler(ctx) {
       // Lives beside /request-logs (offset + snake_case, still used by error
       // collection and export); this surface never COUNTs the table.
       const usageLogsView = () => new UsageLogsView(getDb(), { mutedErrorClasses: requestLog?.mutedErrorClasses })
+      const readView = async (method, ...args) =>
+        (await readUsage('view', method, args)) ?? usageLogsView()[method](...args)
       const tenantId = () => (panelIdentity(req).role === 'user' ? req.panelUserId : null)
       if (req.method === 'GET' && p === '/api/panel/usage-logs') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().listBatch(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await readView('listBatch', usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/summary') {
         const u = new URL(req.url, 'http://x')
-        return json(res, 200, panel.ok(usageLogsView().summary(usageLogFilters(req, u))))
+        return json(res, 200, panel.ok(await readView('summary', usageLogFilters(req, u))))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/filter-options') {
-        return json(res, 200, panel.ok(usageLogsView().filterOptions({ owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('filterOptions', { owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/session-suggestions') {
         const u = new URL(req.url, 'http://x')
         const q = u.searchParams.get('q') || ''
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().sessionSuggestions({ q, limit, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('sessionSuggestions', { q, limit, owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/active-sessions') {
         const u = new URL(req.url, 'http://x')
         const minutes = u.searchParams.get('minutes')
         const limit = u.searchParams.get('limit')
-        return json(res, 200, panel.ok(usageLogsView().activeSessions({ minutes, limit, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('activeSessions', { minutes, limit, owner_user_id: tenantId() })))
       }
       if (req.method === 'GET' && p === '/api/panel/usage-logs/overview') {
         const u = new URL(req.url, 'http://x')
         const tz = u.searchParams.get('tz') || 'UTC'
-        return json(res, 200, panel.ok(usageLogsView().overview({ tz, owner_user_id: tenantId() })))
+        return json(res, 200, panel.ok(await readView('overview', { tz, owner_user_id: tenantId() })))
       }
 
       // ---- Statistics page ----
@@ -2342,7 +2399,7 @@ export function createPanelHandler(ctx) {
         const previous = structuredClone(ctx.routingConfig)
         try {
           if (targets.all) {
-            persistRoutingPatch({
+            await persistRoutingPatch({
               inference: {
                 ...(ctx.routingConfig.inference || {}),
                 dataplane: parsed.value,
@@ -3259,6 +3316,21 @@ export function createPanelHandler(ctx) {
         return json(res, 200, panel.ok(activateVmSlot(id)))
       }
 
+      // POST /api/panel/vms/:id/deactivate
+      if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/deactivate$/.test(p)) {
+        const id = p.split('/')[4]
+        if (!getVm(cfg.paths.project, id)) {
+          const e = makeError({
+            type: ErrorType.NOT_FOUND,
+            code: ErrorCode.VM_NOT_FOUND,
+            message: 'vm not found',
+            status: 404,
+          })
+          return json(res, e.status, { ok: false, error: e.body.error })
+        }
+        return json(res, 200, panel.ok(deactivateVmSlot(id)))
+      }
+
       // POST /api/panel/vms/:id/update-claude-code — Claude CLI runtime was removed
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/update-claude-code$/.test(p)) {
         return json(res, 410, {
@@ -3546,37 +3618,23 @@ export function createPanelHandler(ctx) {
         const id = p.split('/')[4]
         const vm = getVm(cfg.paths.project, id)
         if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-        const homeDir = path.join(cfg.paths.project, 'vms', id, 'cli-home')
-        let settings_json = null
-        let claude_setting = null
-        let kin_seed = null
-        try {
-          settings_json = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'settings.json'), 'utf8'))
-        } catch {}
-        try {
-          claude_setting = fs
-            .readFileSync(path.join(homeDir, '.claude', 'claude.setting'), 'utf8')
-            .replace(/\r\n?/g, '\n')
-            .replace(/\n+$/g, '')
-        } catch {
-          // Missing file stays null. The policy default is not this slot's file.
-        }
-        try {
-          kin_seed = JSON.parse(fs.readFileSync(path.join(homeDir, '.claude', 'kin-seed.json'), 'utf8'))
-        } catch {}
+        const observed = await readSeedSettings(cfg.paths.project, vm)
         const seed_policy = defaultSeedPolicy(vm.seed_policy || {})
-        if (claude_setting !== null) seed_policy.claude_setting = claude_setting
         const debug = new URL(req.url || '/', 'http://localhost').searchParams.get('debug') === '1'
         const payload = {
           vm_id: id,
           seed_policy,
           ...seedTelemetryContract(seed_policy),
-          settings_json,
-          claude_setting,
-          kin_seed,
-          cli_home: homeDir,
+          ...observed,
         }
-        if (debug) payload.telemetry_log = readTelemetryUploadLog(cfg.paths.project, id)
+        if (debug) {
+          try {
+            payload.telemetry_log = await readTelemetryUploadLog(cfg.paths.project, vm)
+          } catch {
+            payload.telemetry_log = []
+            payload.telemetry_log_error = 'telemetry_log_unavailable'
+          }
+        }
         return json(res, 200, panel.ok(payload))
       }
       // PUT /api/panel/vms/:id/seed-settings
@@ -3585,101 +3643,168 @@ export function createPanelHandler(ctx) {
         const vmPath = path.join(cfg.paths.project, 'vms', `${id}.json`)
         if (!fs.existsSync(vmPath)) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
         const body = await readBody(req, 256 * 1024)
-        const vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
-        const telemetryWasOff = !isTelemetryEnabled(vm.seed_policy || {})
-        const merged = { ...(vm.seed_policy || {}), ...(body.seed_policy || {}) }
-        for (const k of ['telemetry_disabled', 'reject_client_settings', 'reject_client_metadata_identity']) {
-          if (body[k] !== undefined) merged[k] = !!body[k]
-        }
-        if (body.theme !== undefined) merged.theme = body.theme
-        if (body.extra_env !== undefined) merged.extra_env = body.extra_env
-        if (body.settings_json_override !== undefined) merged.settings_json_override = body.settings_json_override
-        if (body.claude_setting !== undefined) merged.claude_setting = body.claude_setting
-        if (body['claude.setting'] !== undefined) merged.claude_setting = body['claude.setting']
-        const next = defaultSeedPolicy(merged)
-        if (body.settings_json_override !== undefined) next.settings_json_override = body.settings_json_override
-        if (body.extra_env !== undefined) next.extra_env = body.extra_env || {}
-        const followProxyTz = body?.timezone_follow_proxy === true || body?.timezoneFollowProxy === true
-        const hasTimezone = body && Object.prototype.hasOwnProperty.call(body, 'timezone')
-        const hasLocale = body && Object.prototype.hasOwnProperty.call(body, 'locale')
-        let nextLocale = null
-        if (hasLocale) {
-          const requestedLocale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
-          if (!SLOT_LOCALES.includes(requestedLocale)) {
-            return json(res, 400, {
+        return await withVmLock(`seed-settings:${vmPath}`, async () => {
+          let vm = getVm(cfg.paths.project, id)
+          if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+          const patch = { ...(body.seed_policy || {}) }
+          for (const key of [
+            'telemetry_disabled',
+            'reject_client_settings',
+            'reject_client_metadata_identity',
+            'theme',
+            'extra_env',
+            'settings_json_override',
+            'claude_setting',
+          ]) {
+            if (Object.hasOwn(body, key)) patch[key] = body[key]
+          }
+          if (Object.hasOwn(body, 'claude.setting')) patch.claude_setting = body['claude.setting']
+          if (
+            isCodexVm(vm) ||
+            (slotHost(vm).native && isTelemetryEnabled(defaultSeedPolicy({ ...(vm.seed_policy || {}), ...patch })))
+          ) {
+            return json(res, 409, {
               ok: false,
-              error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
+              error: { code: 'telemetry_unsupported', message: '此槽不支持 VM 原生遥测' },
             })
           }
-          nextLocale = requestedLocale
-        }
-        if (hasTimezone) {
-          const zone = validTimezone(body.timezone)
-          if (!zone) {
-            return json(res, 400, {
+          const followProxyTz = body.timezone_follow_proxy === true || body.timezoneFollowProxy === true
+          const hasTimezone = Object.hasOwn(body, 'timezone')
+          const hasLocale = Object.hasOwn(body, 'locale')
+          let timezone = null
+          let locale = null
+          if (hasLocale) {
+            locale = body.locale == null || body.locale === '' ? STANDARD_LOCALE : String(body.locale)
+            if (!SLOT_LOCALES.includes(locale)) {
+              return json(res, 400, {
+                ok: false,
+                error: { code: 'invalid_locale', message: `语言必须是 ${SLOT_LOCALES.join('、')}` },
+              })
+            }
+          }
+          if (hasTimezone) {
+            timezone = validTimezone(body.timezone)
+            if (!timezone) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: 'invalid_timezone',
+                  message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
+                  param: 'timezone',
+                },
+              })
+            }
+          } else if (followProxyTz) {
+            const route = JSON.stringify({ node_id: vm.node_id, proxy: vm.proxy })
+            const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, {
+              force: true,
+              persist: false,
+            })
+            if (!synced.ok) {
+              return json(res, 400, {
+                ok: false,
+                error: {
+                  type: 'invalid_request_error',
+                  code: synced.reason || 'proxy_timezone_unknown',
+                  message: '未能从代理节点取到时区，请先检测代理地理位置',
+                },
+              })
+            }
+            vm = getVm(cfg.paths.project, id)
+            if (!vm) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
+            if (route !== JSON.stringify({ node_id: vm.node_id, proxy: vm.proxy })) {
+              return json(res, 409, {
+                ok: false,
+                error: { code: 'proxy_binding_changed', message: '代理绑定已变化，请重新保存时区设置' },
+              })
+            }
+            timezone = synced.timezone
+          }
+          // Only patch owned fields on the latest record, never an object held across geo/publication awaits.
+          vm = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+          const next = defaultSeedPolicy({ ...(vm.seed_policy || {}), ...patch })
+          const unsupported = slotHost(vm).native || isCodexVm(vm)
+          if (isCodexVm(vm) || (unsupported && isTelemetryEnabled(next))) {
+            return json(res, 409, {
               ok: false,
-              error: {
-                type: 'invalid_request_error',
-                code: 'invalid_timezone',
-                message: '时区必须是有效的 IANA 名称，如 Asia/Tokyo',
-                param: 'timezone',
-              },
+              error: { code: 'telemetry_unsupported', message: '此槽不支持 VM 原生遥测' },
             })
           }
-          const pinned = persistVmTimezone(cfg.paths.project, id, zone, { source: 'manual' })
-          if (!pinned) return json(res, 404, { ok: false, error: { message: 'vm not found' } })
-          Object.assign(vm, pinned)
-        } else if (followProxyTz) {
-          const synced = await syncVmTimezoneFromProxy(cfg.paths.project, proxyPool, id, { force: true })
-          if (!synced.ok) {
-            return json(res, 400, {
-              ok: false,
-              error: {
-                type: 'invalid_request_error',
-                code: synced.reason || 'proxy_timezone_unknown',
-                message: '未能从代理节点取到时区，请先检测代理地理位置',
-              },
+          if (timezone) {
+            vm.timezone = timezone
+            vm.timezone_source = hasTimezone ? 'manual' : 'proxy_geo'
+            if (vm.fingerprint && typeof vm.fingerprint === 'object') vm.fingerprint.timezone = timezone
+          }
+          if (locale) vm.locale = locale
+          vm.seed_policy = next
+          vm.updated_at = new Date().toISOString()
+          atomicWriteJson(vmPath, vm, { mode: 0o600 })
+          let service
+          if (unsupported) {
+            service = await withVmLock(`seed-publication:${vmPath}`, async () => {
+              const outcome = {
+                ok: false,
+                wrote: false,
+                supported: false,
+                state: 'unsupported',
+                published: false,
+                applied: false,
+              }
+              const revision = (record) =>
+                JSON.stringify([record.node_id, record.runtime, record.seed_policy, record.timezone, record.locale])
+              try {
+                const host = slotHost(vm)
+                const existing = await host.seedFiles(vm, path.join(cfg.paths.project, 'vms', id))
+                const fresh = JSON.parse(fs.readFileSync(vmPath, 'utf8'))
+                if (revision(fresh) !== revision(vm)) throw new Error('seed_publication_superseded')
+                outcome.seed = writeSlotSeedFiles(cfg.paths.project, fresh, null, {
+                  existingSettings:
+                    existing.files['settings.json'] === null ? {} : JSON.parse(existing.files['settings.json']),
+                  replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
+                })
+                outcome.wrote = outcome.seed.wrote === true
+                const result = await host.syncSeed(fresh, path.join(cfg.paths.project, 'vms', id))
+                outcome.published = result.published === true
+                if (revision(JSON.parse(fs.readFileSync(vmPath, 'utf8'))) !== revision(fresh))
+                  throw new Error('seed_publication_superseded')
+                outcome.ok = outcome.published
+              } catch {
+                outcome.code = 'seed_publish_failed'
+                outcome.error = '槽位种子配置尚未确认发布'
+              }
+              return outcome
+            })
+          } else {
+            service = await applyNativeTelemetry({
+              projectRoot: cfg.paths.project,
+              vm,
+              routing: ctx.routingConfig,
+              replaceEnv: Object.hasOwn(body, 'extra_env') || Object.hasOwn(body, 'settings_json_override'),
             })
           }
-          if (synced.applied) {
-            const fresh = getVm(cfg.paths.project, id)
-            if (fresh) Object.assign(vm, fresh)
-          } else if (synced.timezone) {
-            vm.timezone = synced.timezone
-            vm.timezone_source = 'proxy_geo'
-          }
-        }
-        if (nextLocale) vm.locale = nextLocale
-        vm.seed_policy = next
-        vm.updated_at = new Date().toISOString()
-        atomicWriteJson(vmPath, vm, { mode: 0o600 })
-        const written = writeSlotSeedFiles(cfg.paths.project, vm, next)
-        let service = null
-        if (
-          vm.status === 'running' &&
-          (next.telemetry_disabled !== telemetryWasOff || body.telemetry_service_restart === true)
-        ) {
-          const report = await runFleetUpdate(cfg.paths.project, {
-            action: 'telemetry',
-            ids: [id],
-            concurrency: 1,
-            routing: ctx.routingConfig,
-          })
-          service = report.items?.[0] || report
-        }
-        return json(
-          res,
-          200,
-          panel.ok({
+          const { seed: written, ...publicService } = service
+          const data = {
             vm_id: id,
             seed_policy: next,
             ...seedTelemetryContract(next),
-            settings_json: written.settings || null,
-            claude_setting: written.claude_setting || '',
-            kin_seed: written.kin_seed || null,
-            service,
-          }),
-        )
+            saved: true,
+            published: service.published === true,
+            applied: service.applied === true,
+            settings_json: written?.settings || null,
+            claude_setting: written?.claude_setting ?? null,
+            kin_seed: written?.kin_seed || null,
+            service: publicService,
+          }
+          if (!service.ok) {
+            return json(res, 502, {
+              ok: false,
+              error: { code: service.code || 'telemetry_not_applied', message: service.error || 'VM 原生配置尚未生效' },
+              data,
+            })
+          }
+          return json(res, 200, panel.ok(data))
+        })
       }
 
       if (req.method === 'POST' && /^\/api\/panel\/vms\/[^/]+\/wrap-cli\/promote$/.test(p)) {
@@ -4316,7 +4441,7 @@ export function createPanelHandler(ctx) {
       }
 
       // POST /api/panel/vms/import
-      // workflow: create VM → allocate proxy → import sessionKey (via SOCKS) → start
+      // workflow: create VM → allocate proxy → start guest/CLI → exchange in guest → import
       if (req.method === 'POST' && p === '/api/panel/vms/import') {
         const body = await readBody(req, 1024 * 1024)
         const sessionKey = body.sessionKey || body.session_key || body.sid || ''
@@ -4391,6 +4516,7 @@ export function createPanelHandler(ctx) {
           }
           const proxyUrl = slotProxy.proxyUrl
           let oauth = null
+          let oauthFromVm = false
           if (wantsApiKey) {
             const apiKey = String(apiKeyRaw || sessionKey || accessToken).trim()
             if (!looksLikeConsoleApiKey(apiKey)) {
@@ -4414,7 +4540,11 @@ export function createPanelHandler(ctx) {
             oauth = await sessionKeyToOAuth(String(sessionKey).trim(), {
               proxyUrl,
               scope: inference ? 'inference' : 'full',
+              exec: slotExec(cfg.paths.project, existing),
+              projectRoot: cfg.paths.project,
+              routing: ctx.routingConfig,
             })
+            oauthFromVm = true
             if (inference) {
               oauth.type = 'setup-token'
               oauth.mode = 'setup-token'
@@ -4452,7 +4582,7 @@ export function createPanelHandler(ctx) {
             return json(res, 400, { ok: false, error: { message: 'sessionKey or access_token required' } })
           }
           if (body.auth_scheme || body.authScheme) oauth.auth_scheme = body.auth_scheme || body.authScheme
-          if (oauth.access_token && !wantsApiKey) {
+          if (oauth.access_token && !wantsApiKey && !oauthFromVm) {
             oauth = await enrichOauthIdentity(oauth, { proxyUrl })
           }
           const committed = await commitImportedOauth({
@@ -4475,6 +4605,7 @@ export function createPanelHandler(ctx) {
               oauth_email: existing.claude.email,
               has_refresh: existing.claude.has_refresh,
               official_cc_bootstrap: committed.official_cc_bootstrap || null,
+              ...(committed.telemetry_error ? { telemetry_error: committed.telemetry_error } : {}),
             }),
           )
         } catch (e) {
@@ -4521,6 +4652,7 @@ export function createPanelHandler(ctx) {
             const generated = await startClaudeAuthLoginSession({
               vm: existing,
               projectRoot: cfg.paths.project,
+              routing: ctx.routingConfig,
               force: body.force === true || body.force === 'true' || body.force === 1,
             })
             const px = existing.proxy || {}
@@ -4628,26 +4760,33 @@ export function createPanelHandler(ctx) {
               !loginSession.expired &&
               loginSession.session_id &&
               loginSession.session_id === sessionKey)
-          let oauth = looksLikeOfficialSetupToken(code)
-            ? await completeClaudeSetupToken({
-                projectRoot: cfg.paths.project,
-                vmId: id,
-                sessionId: sessionKey,
-                code,
-              })
-            : officialLogin
-              ? await completeClaudeAuthLogin({
-                  projectRoot: cfg.paths.project,
-                  vmId: id,
-                  sessionId: sessionKey,
-                  code,
-                })
-              : await exchangeAuthCode({
-                  sessionId: sessionKey,
-                  code,
-                  proxyUrl: slotProxy.proxyUrl,
-                  vmId: id,
-                })
+          let oauth
+          let oauthFromVm = false
+          if (looksLikeOfficialSetupToken(code)) {
+            oauth = await completeClaudeSetupToken({
+              projectRoot: cfg.paths.project,
+              vmId: id,
+              sessionId: sessionKey,
+              code,
+            })
+          } else if (officialLogin) {
+            oauth = await completeClaudeAuthLogin({
+              projectRoot: cfg.paths.project,
+              vmId: id,
+              sessionId: sessionKey,
+              code,
+            })
+          } else {
+            oauthFromVm = true
+            oauth = await exchangeAuthCode({
+              sessionId: sessionKey,
+              code,
+              vmId: id,
+              exec: slotExec(cfg.paths.project, existing),
+              projectRoot: cfg.paths.project,
+              routing: ctx.routingConfig,
+            })
+          }
           if (looksLikeOfficialSetupToken(code) || oauth.flavor === SETUP_TOKEN_FLAVOR) {
             oauth.type = 'official-setup-token'
             oauth.mode = 'official-setup-token'
@@ -4663,7 +4802,7 @@ export function createPanelHandler(ctx) {
             oauth.mode = 'setup-token'
           }
           if (body.auth_scheme || body.authScheme) oauth.auth_scheme = body.auth_scheme || body.authScheme
-          if (oauth.access_token) {
+          if (oauth.access_token && !oauthFromVm) {
             oauth = await enrichOauthIdentity(oauth, { proxyUrl: slotProxy.proxyUrl })
           }
           const committed = await commitImportedOauth({
@@ -4686,6 +4825,7 @@ export function createPanelHandler(ctx) {
               oauth_email: existing.claude?.email,
               has_refresh: existing.claude?.has_refresh,
               official_cc_bootstrap: committed.official_cc_bootstrap || null,
+              ...(committed.telemetry_error ? { telemetry_error: committed.telemetry_error } : {}),
               source: oauth.source || 'oauth-auth-url',
               flavor: oauth.flavor || null,
             }),
@@ -4764,6 +4904,7 @@ export function createPanelHandler(ctx) {
             oauth_email: existing.claude?.email || null,
             has_refresh: existing.claude?.has_refresh,
             official_cc_bootstrap: committed.official_cc_bootstrap || null,
+            ...(committed.telemetry_error ? { telemetry_error: committed.telemetry_error } : {}),
           }),
         )
       }
@@ -4844,6 +4985,7 @@ export function createPanelHandler(ctx) {
             oauth_email: existing.claude?.email || null,
             has_refresh: existing.claude?.has_refresh,
             official_cc_bootstrap: committed.official_cc_bootstrap || null,
+            ...(committed.telemetry_error ? { telemetry_error: committed.telemetry_error } : {}),
           }),
         )
       }
@@ -5269,7 +5411,7 @@ export function createPanelHandler(ctx) {
         const { applied: appliedDuringSwitch, ...publicEngineRuntime } = engineRuntime
         let applied
         try {
-          applied = appliedDuringSwitch ?? persistRoutingPatch(body)
+          applied = appliedDuringSwitch ?? (await persistRoutingPatch(body))
         } catch (error) {
           restoreRoutingRuntime(previousRoutingConfig)
           return json(res, 503, {
@@ -5389,10 +5531,12 @@ export function createPanelHandler(ctx) {
         try {
           const repo = new JevUsageRepo()
           const page = repo.list(Object.fromEntries(url.searchParams))
+          const settings = new SettingsRepo()
+          const keys = repo.configuredKeys(publicJevKeys(readJevConfig((key, fallback) => settings.get(key, fallback))))
           return json(
             res,
             200,
-            panel.ok({ ...repo.overview(), ...page, storage_errors_since_start: jevUsageStorageErrors() }),
+            panel.ok({ ...repo.overview(), ...page, keys, storage_errors_since_start: jevUsageStorageErrors() }),
           )
         } catch (error) {
           if (error instanceof TypeError)
@@ -5969,12 +6113,79 @@ export function createPanelHandler(ctx) {
   }
 }
 
-function readTelemetryUploadLog(projectRoot, id) {
-  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/.test(String(id || ''))) return []
-  try {
-    const text = fs.readFileSync(path.join(projectRoot, 'vms', id, 'run', 'telemetry-upload.log'), 'utf8')
-    return text.split(/\r?\n/).filter(Boolean).slice(-40)
-  } catch {
-    return []
+async function readSeedSettings(projectRoot, vm) {
+  const host = slotHost(vm)
+  const result = {
+    settings_json: null,
+    claude_setting: null,
+    kin_seed: null,
+    cli_home: null,
+    seed_files: {
+      ok: false,
+      source: host.kind,
+      files: { settings_json: 'error', claude_setting: 'error', kin_seed: 'error' },
+    },
   }
+  try {
+    const observed = await host.seedFiles(vm, path.join(projectRoot, 'vms', vm.id))
+    result.cli_home = observed.cli_home
+    let failed = false
+    for (const [key, name] of [
+      ['settings_json', 'settings.json'],
+      ['claude_setting', 'claude.setting'],
+      ['kin_seed', 'kin-seed.json'],
+    ]) {
+      const text = observed.files[name]
+      if (text === null) {
+        result.seed_files.files[key] = 'missing'
+        continue
+      }
+      try {
+        const value = key === 'claude_setting' ? text.replace(/\r\n?/g, '\n').replace(/\n+$/g, '') : JSON.parse(text)
+        if (key !== 'claude_setting' && (!value || typeof value !== 'object' || Array.isArray(value)))
+          throw new Error('seed_file_invalid')
+        result[key] = value
+        result.seed_files.files[key] = 'present'
+      } catch {
+        failed = true
+      }
+    }
+    result.seed_files.ok = !failed
+    if (failed) result.seed_files.error = 'seed_file_invalid'
+  } catch {
+    result.seed_files.error = 'seed_files_unavailable'
+  }
+  return result
+}
+
+async function readTelemetryUploadLog(projectRoot, vm) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,80}$/.test(String(vm?.id || ''))) return []
+  const text = await slotHost(vm).telemetryLog(vm, path.join(projectRoot, 'vms', vm.id))
+  return String(text)
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .slice(-40)
+    .flatMap((line) => {
+      try {
+        const record = JSON.parse(line)
+        if (
+          typeof record?.at !== 'string' ||
+          typeof record?.ok !== 'boolean' ||
+          !Number.isSafeInteger(record?.events) ||
+          record.events < 0
+        )
+          return []
+        return [
+          JSON.stringify({
+            at: record.at,
+            ok: record.ok,
+            events: record.events,
+            error:
+              typeof record.error === 'string' && /^[a-z][a-z0-9_]{0,63}$/.test(record.error) ? record.error : null,
+          }),
+        ]
+      } catch {
+        return []
+      }
+    })
 }

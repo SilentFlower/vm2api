@@ -1176,7 +1176,10 @@ export class PoolScheduler extends EventEmitter {
     }
     let headroom = null
     if (!pinned) {
-      if (account && (account.status !== 'active' || !account.schedulable)) {
+      // Panel switch is vm.schedulable (evaluateSlotGate). accounts.schedulable
+      // is a legacy column nothing writes; a leftover 0 must not hide a slot
+      // the panel still shows as participating.
+      if (account && account.status !== 'active') {
         return { ok: false, reason: 'account_disabled' }
       }
       const modelGate = await slotAllowsModel({ vm, account, model })
@@ -1742,7 +1745,7 @@ export class PoolScheduler extends EventEmitter {
     if (!noRefreshPin && isCredentialRuntimeBlocked(state, now, vm)) return null
     if (!pinned) {
       if (hardBlockOf(state, now)) return null
-      if (account && (account.status !== 'active' || !account.schedulable)) return null
+      if (account && account.status !== 'active') return null
       if (account) {
         const availability = evaluateAccount({
           vm,
@@ -1812,7 +1815,9 @@ export class PoolScheduler extends EventEmitter {
       if (quotaReservation) this.accountQuota?.release?.(candidate.accountId)
       return null
     }
-    this.inflight.set(candidate.accountId, requestInflight + 1)
+    // Admission hooks may release an existing reservation. Use the live count
+    // rather than restoring occupancy from before those hooks ran.
+    this.inflight.set(candidate.accountId, (this.inflight.get(candidate.accountId) || 0) + 1)
     this.bumpFamily(candidate.accountId, family, 1)
     this.bumpVmInflight(candidate.vmId, 1)
     let released = false

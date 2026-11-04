@@ -5,7 +5,7 @@ import path from 'node:path'
 import { resolveStreamIdleTimeoutMs } from '../core/config.mjs'
 import { isClientStream, fromClaudeToOpenAIChat, fromClaudeToOpenAICompletions } from './convert.mjs'
 import { getVm, listVms, persistCodexUsage, syncCodexQuotaSchedule } from '../vm/vm-registry.mjs'
-import { isValidVmId } from '../vm/vm-file.mjs'
+import { isValidVmId, listVmRecordFiles, readJsonCached } from '../vm/vm-file.mjs'
 import { isCodexProtocolAllowed, isCodexVm, normalizeCodexRouting } from './codex-route.mjs'
 import { keyAllowsVm, keyScopeFromRequest, vmPoolDenial } from '../admin/key-scope.mjs'
 import { ownerScopeFromRequest, vmMatchesOwnerScope } from '../admin/resource-owner.mjs'
@@ -236,11 +236,17 @@ export function pickCodexCandidates(
     })
     return { ...ordered, pin, sticky: false, sessionKey: null, stickyKeys: [] }
   }
-  for (const item of listVms(projectRoot, { codex: { quota: routingPolicy } })) {
-    if (!isCodexVm(item)) continue
-    syncCodexQuotaSchedule(projectRoot, getVm(projectRoot, item.id) || item, {
-      policy: routingPolicy,
-    })
+  // Quota sync only needs the raw records; the summarized list is built once, after it.
+  const vmDir = path.join(projectRoot, 'vms')
+  for (const file of listVmRecordFiles(vmDir)) {
+    let vm
+    try {
+      vm = readJsonCached(path.join(vmDir, file))
+    } catch {
+      continue
+    }
+    if (!vm?.id || !isCodexVm(vm)) continue
+    syncCodexQuotaSchedule(projectRoot, vm, { policy: routingPolicy })
   }
   const stickyKeys = stickyRouter?.collectPoolKeys?.(req, body || {}, { platform: 'openai' }) || []
   const sessionKey = stickyRouter?.extractPoolKey?.(req, body || {}, { platform: 'openai' }) || stickyKeys[0] || null
@@ -431,11 +437,11 @@ function clientGoneSignal(req, res) {
 /**
  * Admission = fresh candidates + one synchronous seat claim. Candidates are
  * re-read every round, so a seat taken while another request awaited kernel
- * init is never double-sold. All full: FIFO wait for a release or the RPM
- * window, up to the pool wait deadline.
+ * init is never double-sold. All full: FIFO wait for a release on one of
+ * this request's accounts or the RPM window, up to the pool wait deadline.
  */
 async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal }) {
-  let woken = false
+  let woken = null
   for (;;) {
     const picked = pickCodexCandidates(projectRoot, req, opts)
     const livePolicy = normalizeCodexRouting(opts.routing?.codex || opts.routing).quota
@@ -448,21 +454,31 @@ async function admitCodexCandidate(projectRoot, req, opts, { deadline, signal })
       })
       if (lease) return { picked, vmId: candidate.id, lease }
     }
-    // A woken waiter that still missed hands the wake to the next in line.
-    if (woken) wakeOpenAIWaiter()
+    const waitIds = picked.candidates?.length ? picked.candidates.map((candidate) => candidate.id) : picked.waitIds
+    // A woken waiter that missed a seat it can use lost it to a newer request;
+    // passing the wake on would only re-run selection for every waiter behind
+    // it. Hand it on only when the freed account is not one this request takes.
+    if (woken && (woken.accountId == null || !waitIds?.includes(woken.accountId))) {
+      wakeOpenAIWaiter(woken.accountId)
+    }
     const now = Date.now()
     if (now >= deadline) return { picked: { ...picked, error: 'capacity_unavailable', ids: [] } }
     const retryAt = Number(picked.retryAt)
     const sliceDeadline = Number.isFinite(retryAt) && retryAt > now ? Math.min(deadline, retryAt) : deadline
     let waited
     try {
-      waited = await waitForOpenAICapacity({ deadline: sliceDeadline, signal })
+      waited = await waitForOpenAICapacity({
+        deadline: sliceDeadline,
+        signal,
+        accounts: Array.isArray(waitIds) ? waitIds : null,
+        front: !!woken,
+      })
     } catch (error) {
       if (error?.code === 'pool_wait_queue_full') return { picked: { error: 'pool_wait_queue_full', ids: [] } }
       throw error
     }
     if (waited.aborted) return { picked: { error: 'client_cancelled', ids: [] } }
-    woken = !!waited.woken
+    woken = waited.woken ? { accountId: waited.accountId ?? null } : null
   }
 }
 
@@ -1041,7 +1057,7 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
     // Queue-full has no retryAt. Every Codex pool_overloaded 429 still advertises >= 1s.
     const waitMs = Number(picked.retryAt) - Date.now()
     const retryAfterSec = Math.max(1, waitMs > 0 ? Math.ceil(waitMs / 1000) : 0)
-    res.setHeader?.('retry-after', String(retryAfterSec))
+    if (!res.headersSent) res.setHeader?.('retry-after', String(retryAfterSec))
     return json(res, 429, {
       error: {
         type: 'rate_limit_error',
@@ -1054,7 +1070,7 @@ function rejectCodexAdmission({ res, json, stats, logBag, picked, model }) {
   if (picked.error === 'pool_resting') {
     // Every slot is off-shift: 503 like the Claude pool, timed to the first window open.
     const waitMs = Number(picked.retryAt) - Date.now()
-    res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
+    if (!res.headersSent) res.setHeader?.('retry-after', String(Math.max(1, Math.ceil(waitMs / 1000) || 1)))
     return json(res, 503, {
       error: {
         type: 'api_error',
